@@ -144,7 +144,17 @@ class Bottleneck(nn.Module):
         return x
 
 class ConditionalUNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, base_channels=32, channel_mults=(1, 2, 4, 8), num_res_blocks=2, emb_dim=256, num_heads=4):
+    def __init__(
+        self, 
+        in_channels=1, 
+        out_channels=1, 
+        base_channels=32, 
+        # ZMĚNA: Ubrali jsme jeden krok (8x násobitel). Nyní: 32 -> 64 -> 128 -> bottleneck
+        channel_mults=(1, 2, 4), 
+        num_res_blocks=2, 
+        emb_dim=256, 
+        num_heads=4
+    ):
         super().__init__()
         
         self.t_embed = ScalarEmbedding(emb_dim)
@@ -181,6 +191,7 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.bias)
     
     def forward(self, x, t, pH):
+        # ... forward pass zůstává úplně STEJNÝ ...
         t_emb = self.t_embed(t)
         
         is_null = torch.isnan(pH)

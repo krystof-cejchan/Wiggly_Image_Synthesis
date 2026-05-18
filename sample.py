@@ -17,8 +17,7 @@ def sample(model, pH_query, num_samples=16, num_steps=50, cfg_scale=3.0, seed=42
     pH_norm = normalize_pH(torch.tensor([pH_query] * num_samples)).to(DEVICE)
     pH_null = torch.full((num_samples,), float("nan"), device=DEVICE)
     
-    x = torch.randn(num_samples, 1, 256, 256, device=DEVICE)
-    
+    x = torch.randn(num_samples, 1, 128, 128, device=DEVICE)   
     for i in range(num_steps):
         t = torch.full((num_samples,), i / num_steps, device=DEVICE)
         
