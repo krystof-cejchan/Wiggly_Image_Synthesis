@@ -31,7 +31,7 @@ def sample(model, pH_query, num_samples=16, num_steps=50, cfg_scale=3.0, seed=42
     return (x.clamp(-1, 1) + 1) / 2
 
 def main():
-    checkpoint_path = "checkpoints/cfm_final_ema.pt"
+    checkpoint_path = "checkpoints/cfm_best_ema.pt"
     if not os.path.exists(checkpoint_path):
         print(f"Checkpoint {checkpoint_path} nenalezen!")
         return
