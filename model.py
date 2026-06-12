@@ -149,7 +149,6 @@ class ConditionalUNet(nn.Module):
         in_channels=1, 
         out_channels=1, 
         base_channels=32, 
-        # ZMĚNA: Ubrali jsme jeden krok (8x násobitel). Nyní: 32 -> 64 -> 128 -> bottleneck
         channel_mults=(1, 2, 4), 
         num_res_blocks=2, 
         emb_dim=256, 
