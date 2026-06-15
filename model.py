@@ -1,19 +1,42 @@
+"""Model components for conditional U-Net with FiLM and Fourier embeddings.
+
+This module implements small building blocks used by the project:
+- `FourierFeatures` and `ScalarEmbedding` for time / scalar embeddings
+- `FiLMResBlock` for FiLM-conditioned residual blocks
+- `SelfAttention2d` for per-resolution attention
+- `DownStage`, `UpStage`, `Bottleneck`, and `ConditionalUNet` to
+    assemble the encoder-decoder architecture.
+
+Comments are concise and explain purpose and tensor shapes where helpful.
+"""
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class FourierFeatures(nn.Module):
+    """
+    Fourier feature mapping is applied to the input coordinates before they are fed into the MLP.
+    This mapping involves transforming each input coordinate pair (x, y)
+    using a series of sinusoidal functions (sine and cosine) with varying frequencies.
+    used to better capture high-frequency signals in data
+    """
     def __init__(self, num_freqs=64, max_freq=10.0):
         super().__init__()
         freqs = torch.logspace(0.0, math.log10(max_freq), num_freqs)
         self.register_buffer("freqs", freqs)
     
     def forward(self, x):
+        # x: (...,) scalar inputs (e.g. time or pH)
+        # produces concatenated sin/cos features of shape (..., 2 * num_freqs)
         angles = x.unsqueeze(-1) * self.freqs * math.pi
         return torch.cat([angles.sin(), angles.cos()], dim=-1)
 
 class ScalarEmbedding(nn.Module):
+    """
+    takes the output from FourierFeatures and passes it through a small MLP to produce a dense embedding vector.
+    """
     def __init__(self, emb_dim=256, num_freqs=64, max_freq=10.0):
         super().__init__()
         self.fourier = FourierFeatures(num_freqs, max_freq)
@@ -24,9 +47,13 @@ class ScalarEmbedding(nn.Module):
         )
     
     def forward(self, x):
+        # Map scalar -> high-dimensional embedding used for FiLM
         return self.mlp(self.fourier(x))
 
 class FiLMResBlock(nn.Module):
+    """
+    takes a vector of conditioning information (the embedding) and applies it to modulate the activations of the residual block.
+    """
     def __init__(self, in_ch, out_ch, emb_dim, num_groups=32, dropout=0.1):
         super().__init__()
         self.norm1 = nn.GroupNorm(min(num_groups, in_ch), in_ch)
@@ -52,19 +79,24 @@ class FiLMResBlock(nn.Module):
             self.skip = nn.Identity()
     
     def forward(self, x, emb):
+        # Standard pre-activation residual with FiLM modulation.
+        # - x: (B, C, H, W)
+        # - emb: (B, emb_dim)
         h = F.silu(self.norm1(x))
         h = self.conv1(h)
-        
+
+        # produce scale and shift per-channel from embedding
         scale, shift = self.emb_proj(emb).chunk(2, dim=-1)
         scale = scale.unsqueeze(-1).unsqueeze(-1)
         shift = shift.unsqueeze(-1).unsqueeze(-1)
-        
+
+        # apply FiLM: h * (1 + scale) + shift
         h = self.norm2(h)
-        h = h * (1 + scale) + shift
+        h = h * (1 + scale) + shift # Nová_Hodnota = Stará_Hodnota × (1 + Scale) + Shift
         h = F.silu(h)
         h = self.dropout(h)
         h = self.conv2(h)
-        
+
         return self.skip(x) + h
 
 class SelfAttention2d(nn.Module):
@@ -74,7 +106,7 @@ class SelfAttention2d(nn.Module):
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         
-        self.norm = nn.GroupNorm(min(num_groups, channels), channels)
+        self.norm = nn.GroupNorm(min(num_groups, channels), channels)#normalizací hodnot napříč kanály
         self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         self.proj = nn.Conv2d(channels, channels, 1)
         
@@ -82,13 +114,17 @@ class SelfAttention2d(nn.Module):
         nn.init.zeros_(self.proj.bias)
     
     def forward(self, x):
+        # Multi-head self-attention over spatial positions.
         B, C, H, W = x.shape
         h = self.norm(x)
+
+        # get q,k,v with shape (B, 3, num_heads, head_dim, H*W)
         qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim, H * W)
         q, k, v = qkv.unbind(dim=1)
-        
+
+        # scaled_dot_product_attention expects (..., seq_len, head_dim)
         q, k, v = (t.transpose(-1, -2) for t in (q, k, v))
-        
+
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(-1, -2).reshape(B, C, H, W)
         return x + self.proj(out)
@@ -104,10 +140,13 @@ class DownStage(nn.Module):
         self.downsample = nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1) if downsample else nn.Identity()
     
     def forward(self, x, emb):
+        # Apply sequence of FiLM residual blocks, collect skip connections
         skips = []
         for block in self.blocks:
             x = block(x, emb)
             skips.append(x)
+
+        # optionally downsample spatial resolution by 2
         x = self.downsample(x)
         return x, skips
 
@@ -123,6 +162,7 @@ class UpStage(nn.Module):
         self.blocks_skip_concat = num_blocks
     
     def forward(self, x, skips, emb):
+        # Upsample and sequentially concatenate corresponding skip connections
         x = self.upsample(x)
         for block in self.blocks:
             skip = skips.pop()
@@ -138,6 +178,7 @@ class Bottleneck(nn.Module):
         self.res2 = FiLMResBlock(channels, channels, emb_dim)
     
     def forward(self, x, emb):
+        # Bottleneck: res -> attention -> res
         x = self.res1(x, emb)
         x = self.attn(x)
         x = self.res2(x, emb)
@@ -190,9 +231,21 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.bias)
     
     def forward(self, x, t, pH):
-        # ... forward pass zůstává úplně STEJNÝ ...
+        """
+        Forward pass for conditional U-Net.
+
+        Args:
+            x: image tensor (B, C_in, H, W)
+            t: scalar tensor for time/step (B,)
+            pH: scalar tensor for conditional pH (B,) or NaN for null condition
+
+        Returns:
+            output tensor (B, C_out, H, W)
+        """
+        # embed time and pH scalars
         t_emb = self.t_embed(t)
-        
+
+        # replace NaN with a learned null embedding
         is_null = torch.isnan(pH)
         pH_safe = torch.where(is_null, torch.zeros_like(pH), pH)
         pH_emb_real = self.pH_embed(pH_safe)
@@ -201,20 +254,26 @@ class ConditionalUNet(nn.Module):
             self.null_pH_emb.expand_as(pH_emb_real),
             pH_emb_real,
         )
-        
+
         emb = t_emb + pH_emb
-        
+
+        # input conv
         x = self.conv_in(x)
         all_skips = []
+
+        # collect skips from each downstage
         for stage in self.down_stages:
             x, skips = stage(x, emb)
             all_skips.extend(skips)
-        
+
+        # bottleneck
         x = self.bottleneck(x, emb)
-        
+
+        # consume skip connections in reverse order
         for stage in self.up_stages:
             x = stage(x, all_skips, emb)
-        
+
+        # final normalization and conv
         x = F.silu(self.norm_out(x))
         x = self.conv_out(x)
         return x

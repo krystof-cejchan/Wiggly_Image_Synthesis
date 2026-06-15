@@ -30,13 +30,8 @@ class MicrotubuleDataset(Dataset):
         if is_train:
             self.transform = T.Compose([
                 T.ToImage(),
-                # KLÍČOVÁ ZMĚNA: Zajišťuje, že obrázek je dostatečně velký před cropem
                 # Změní kratší stranu minimálně na 136 px, zachová poměr stran
-                T.Resize(136, antialias=True), 
-                T.RandomHorizontalFlip(p=0.5),
-                T.RandomVerticalFlip(p=0.5),
-                T.RandomChoice([T.RandomRotation(d) for d in [0, 90, 180, 270]]),
-                # Teď už RandomCrop neselže, ani když byl původní obrázek menší
+                T.Resize(136, antialias=True),
                 T.RandomCrop(112),
                 # Finální resize na cílových 128x128
                 T.Resize((128, 128), antialias=True),

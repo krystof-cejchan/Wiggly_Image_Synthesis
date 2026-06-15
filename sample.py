@@ -10,7 +10,7 @@ def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
 @torch.no_grad()
-def sample(model, pH_query, num_samples=16, num_steps=50, cfg_scale=3.0, seed=42):
+def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
         
@@ -24,7 +24,7 @@ def sample(model, pH_query, num_samples=16, num_steps=50, cfg_scale=3.0, seed=42
         v_cond = model(x, t, pH_norm)
         v_uncond = model(x, t, pH_null)
         v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
-        
+        v_cfg = torch.clamp(v_cfg, min=-5,max=5)
         x = x + v_cfg * (1.0 / num_steps)
     
     # Denormalizace [-1, 1] → [0, 1]
@@ -47,7 +47,7 @@ def main():
     
     for ph in target_phs:
         print(f"Generuji vzorky pro pH = {ph} ...")
-        samples = sample(model, pH_query=ph, num_samples=16, cfg_scale=3.0)
+        samples = sample(model, pH_query=ph)
         
         # Uložení jako mřížka 4x4
         save_path = f"outputs/sample_pH_{ph}.png"

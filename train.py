@@ -16,9 +16,9 @@ BATCH_SIZE = 32
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.1
-EVAL_INTERVAL = 1000  # Jak často (v krocích) chceme počítat validační loss
-PATIENCE = 10         # Kolikrát po sobě se validační loss nesmí zlepšit, než trénink ukončíme
-MIN_DELTA = 1e-5      # Minimální změna, kterou považujeme za zlepšení
+EVAL_INTERVAL = 1000  
+PATIENCE = 10        
+MIN_DELTA = 1e-5     
 
 # Normalizace na základě tvých dat
 PH_MIN, PH_MAX = 5.8, 8.8
@@ -44,7 +44,6 @@ def evaluate(model, dataloader):
         xt = (1 - t_expand) * x0 + t_expand * x1
         target = x1 - x0
         
-        # Při validaci nepoužíváme CFG dropout (chceme přesnou predikci pro dané pH)
         pred = model(xt, t, pH)
         loss = F.mse_loss(pred, target)
         total_loss += loss.item()
@@ -55,12 +54,10 @@ def evaluate(model, dataloader):
 def main():
     os.makedirs("checkpoints", exist_ok=True)
     
-    # --- NAČTENÍ TRÉNOVACÍCH I VALIDAČNÍCH DAT ---
     train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True)
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, drop_last=True)
     
     val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
-    # Pro validaci můžeme dát větší batch_size, protože nepotřebujeme gradienty
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
     model = ConditionalUNet().to(DEVICE)
@@ -71,14 +68,13 @@ def main():
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=ITERATIONS)
 
-    # --- PROMĚNNÉ PRO EARLY STOPPING ---
     best_val_loss = float('inf')
     epochs_without_improvement = 0
     
     model.train()
     step = 0
     
-    print(f"Zahajuji trénink na {DEVICE}.")
+    print(f"{DEVICE}.")
     print(f"Trénovacích obrázků: {len(train_dataset)}, Validačních: {len(val_dataset)}")
 
     while step < ITERATIONS:
@@ -112,7 +108,7 @@ def main():
                 for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                     p_ema.mul_(0.9999).add_(p, alpha=0.0001)
             
-            # --- EARLY STOPPING LOGIKA ---
+            # early stopping
             if step > 0 and step % EVAL_INTERVAL == 0:
                 val_loss = evaluate(ema_model, val_dataloader)
                 print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss: {loss.item():.4f} | Val Loss: {val_loss:.4f}")
@@ -120,7 +116,7 @@ def main():
                 if val_loss < (best_val_loss - MIN_DELTA):
                     best_val_loss = val_loss
                     epochs_without_improvement = 0
-                    # Uložíme best model
+                    # Uložíme nejlepší model
                     torch.save(ema_model.state_dict(), "checkpoints/cfm_best_ema.pt")
                     print("  -> Nový nejlepší model uložen!")
                 else:
@@ -132,12 +128,10 @@ def main():
                     return  # Ukončí funkci main() a tím i skript
                     
             elif step % 100 == 0:
-                # Menší logování mezi validacemi
                 print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss: {loss.item():.4f}")
                 
             step += 1
 
-    # Uložení finálního modelu, pokud doběhne až do konce
     torch.save(ema_model.state_dict(), "checkpoints/cfm_final_ema.pt")
     print("Trénink dokončen.")
 

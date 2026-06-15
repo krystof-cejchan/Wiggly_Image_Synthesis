@@ -105,7 +105,6 @@ def process_data(data_dir, output_dir, annotations):
         else:
             ph_value = "unknown_pH"
             
-        print(f"\nZpracovávám složku: {ph_folder.name} -> Ukládám do pH: {ph_value}")
         ph_out_dir = out_path / ph_value
         ph_out_dir.mkdir(exist_ok=True)
         
@@ -173,10 +172,8 @@ def process_data(data_dir, output_dir, annotations):
                     cv2.imwrite(str(out_filepath), crop)
 
 if __name__ == "__main__":
-    print("1/2 Načítám a rovnám indexy v XML anotacích...")
     cvat_annotations = parse_cvat_xml(XML_PATH)
     
-    print("\n2/2 Začínám řezat obrázky...")
     process_data(DATA_DIR, OUTPUT_DIR, cvat_annotations)
     
-    print("\nHotovo! Vyříznuté snímky organizované podle pH najdeš ve složce:", OUTPUT_DIR)
+    print("\n",OUTPUT_DIR)
