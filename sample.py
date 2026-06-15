@@ -42,7 +42,6 @@ def main():
     
     os.makedirs("outputs", exist_ok=True)
     
-    # Testujeme inferenci pro několik různých pH vč. neviděných mezihodnot
     target_phs = [5.8, 6.4, 7.0, 7.4, 8.2, 8.8]
     
     for ph in target_phs:
