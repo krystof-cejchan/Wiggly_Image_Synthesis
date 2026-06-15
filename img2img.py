@@ -44,7 +44,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     if seed is not None:
         torch.manual_seed(seed)
         
-    # Nyní normalizujeme OBĚ hodnoty pH
+    # Nyní normalizujeme obě hodnoty pH
     pH_source_norm = normalize_pH(torch.tensor([source_pH])).to(DEVICE)
     pH_target_norm = normalize_pH(torch.tensor([target_pH])).to(DEVICE)
     

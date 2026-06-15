@@ -1,15 +1,3 @@
-"""Model components for conditional U-Net with FiLM and Fourier embeddings.
-
-This module implements small building blocks used by the project:
-- `FourierFeatures` and `ScalarEmbedding` for time / scalar embeddings
-- `FiLMResBlock` for FiLM-conditioned residual blocks
-- `SelfAttention2d` for per-resolution attention
-- `DownStage`, `UpStage`, `Bottleneck`, and `ConditionalUNet` to
-    assemble the encoder-decoder architecture.
-
-Comments are concise and explain purpose and tensor shapes where helpful.
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -20,7 +8,7 @@ class FourierFeatures(nn.Module):
     Fourier feature mapping is applied to the input coordinates before they are fed into the MLP.
     This mapping involves transforming each input coordinate pair (x, y)
     using a series of sinusoidal functions (sine and cosine) with varying frequencies.
-    used to better capture high-frequency signals in data
+    used to better capture high-frequency signals in data (https://medium.com/@aadityaza/understanding-fourier-feature-mapping-through-simple-image-regression-examples-570731f95e4a)
     """
     def __init__(self, num_freqs=64, max_freq=10.0):
         super().__init__()
@@ -50,26 +38,29 @@ class ScalarEmbedding(nn.Module):
         # Map scalar -> high-dimensional embedding used for FiLM
         return self.mlp(self.fourier(x))
 
-class FiLMResBlock(nn.Module):
-    """
-    takes a vector of conditioning information (the embedding) and applies it to modulate the activations of the residual block.
-    """
+class FiLMResBlock(nn.Module):        
     def __init__(self, in_ch, out_ch, emb_dim, num_groups=32, dropout=0.1):
         super().__init__()
+        # first normalization operates over `in_ch` channels
         self.norm1 = nn.GroupNorm(min(num_groups, in_ch), in_ch)
+        # first convolution changes channel dimension in_ch -> out_ch
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         
         self.emb_proj = nn.Sequential(
             nn.SiLU(),
             nn.Linear(emb_dim, 2 * out_ch),
         )
+        # initialize projection to produce near-zero scale/shift at start
         nn.init.zeros_(self.emb_proj[-1].weight)
         nn.init.zeros_(self.emb_proj[-1].bias)
         
+        # second normalization is applied before FiLM modulation
         self.norm2 = nn.GroupNorm(min(num_groups, out_ch), out_ch)
+        # small dropout between activations and final conv
         self.dropout = nn.Dropout(dropout)
+        # final conv preserves channel count (out_ch -> out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        
+        # zero-init final conv so block initially behaves like identity
         nn.init.zeros_(self.conv2.weight)
         nn.init.zeros_(self.conv2.bias)
         
@@ -79,24 +70,31 @@ class FiLMResBlock(nn.Module):
             self.skip = nn.Identity()
     
     def forward(self, x, emb):
-        # Standard pre-activation residual with FiLM modulation.
-        # - x: (B, C, H, W)
-        # - emb: (B, emb_dim)
+        # Pre-activation: normalize then SiLU non-linearity
+        # x shape: (B, in_ch, H, W); emb shape: (B, emb_dim)
         h = F.silu(self.norm1(x))
+        # first conv produces (B, out_ch, H, W)
         h = self.conv1(h)
 
-        # produce scale and shift per-channel from embedding
+        # Project conditioning embedding to FiLM params.
+        # emb_proj -> (B, 2 * out_ch). We split into `scale` and `shift`.
         scale, shift = self.emb_proj(emb).chunk(2, dim=-1)
+        # reshape to (B, out_ch, 1, 1) so they broadcast across spatial dims
         scale = scale.unsqueeze(-1).unsqueeze(-1)
         shift = shift.unsqueeze(-1).unsqueeze(-1)
 
-        # apply FiLM: h * (1 + scale) + shift
+        # Normalize features before modulation
         h = self.norm2(h)
-        h = h * (1 + scale) + shift # Nová_Hodnota = Stará_Hodnota × (1 + Scale) + Shift
+        # Apply FiLM: elementwise scaling and shifting per-channel.
+        # Using (1 + scale) keeps modulation identity-centered (scale~0 -> factor~1).
+        h = h * (1 + scale) + shift
+
+        # Activation -> dropout -> final conv
         h = F.silu(h)
         h = self.dropout(h)
         h = self.conv2(h)
 
+        # Add residual (skip path may be a 1x1 conv when channels differ)
         return self.skip(x) + h
 
 class SelfAttention2d(nn.Module):
@@ -104,12 +102,17 @@ class SelfAttention2d(nn.Module):
         super().__init__()
         assert channels % num_heads == 0
         self.num_heads = num_heads
+        # dimension per attention head
         self.head_dim = channels // num_heads
-        
-        self.norm = nn.GroupNorm(min(num_groups, channels), channels)#normalizací hodnot napříč kanály
+
+        # GroupNorm over channels to stabilize activations
+        self.norm = nn.GroupNorm(min(num_groups, channels), channels)
+        # compute q, k, v in a single 1x1 conv; outputs 3 * channels
         self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        # final linear projection after attention (per-channel)
         self.proj = nn.Conv2d(channels, channels, 1)
-        
+
+        # initialize proj to near-zero so block starts as identity
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
     
@@ -117,16 +120,23 @@ class SelfAttention2d(nn.Module):
         # Multi-head self-attention over spatial positions.
         B, C, H, W = x.shape
         h = self.norm(x)
-
-        # get q,k,v with shape (B, 3, num_heads, head_dim, H*W)
+        # produce q, k, v and reshape for multi-head attention.
+        # after qkv conv: (B, 3*C, H, W) -> reshape to (B, 3, num_heads, head_dim, H*W)
         qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim, H * W)
-        q, k, v = qkv.unbind(dim=1)
+        q, k, v = qkv.unbind(dim=1)  # each is (B, num_heads, head_dim, H*W)
 
-        # scaled_dot_product_attention expects (..., seq_len, head_dim)
+        # scaled_dot_product_attention expects (..., seq_len, head_dim).
+        # transpose to (B, num_heads, H*W, head_dim)
         q, k, v = (t.transpose(-1, -2) for t in (q, k, v))
 
+        # compute attention over spatial positions: output shape
+        # (B, num_heads, H*W, head_dim)
         out = F.scaled_dot_product_attention(q, k, v)
+
+        # transpose back and reshape to (B, C, H, W)
         out = out.transpose(-1, -2).reshape(B, C, H, W)
+
+        # final linear projection and residual connection
         return x + self.proj(out)
 
 class DownStage(nn.Module):
@@ -201,7 +211,7 @@ class ConditionalUNet(nn.Module):
         self.pH_embed = ScalarEmbedding(emb_dim)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
         
-        self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
         self.down_stages = nn.ModuleList()
         ch_list = [base_channels]
