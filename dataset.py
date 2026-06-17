@@ -17,6 +17,18 @@ class MicrotubuleDataset(Dataset):
                     all_images = [img for img in os.listdir(ph_dir) if img.endswith('.png')]
                     all_images.sort()
                     
+                    # ┌─ REVIEW ─────────────────────────────────────────────
+                    #   split train/val se dělá podle ABECEDNÍHO indexu
+                    #   výřezu. Výřezy z téhož zorného pole mají sousední názvy
+                    #   (..._frame0000_crop00, crop01, ...), takže část jednoho
+                    #   snímku skončí v train a část ve val - ÚNIK INFORMACE a
+                    #   nadhodnocená validační chyba. Navíc val = jen abecedně
+                    #   první zdroj, není reprezentativní.
+                    #   asi bych rozdělil podle ZDROJOVÉHO snímku/videa, ne podle
+                    #   výřezu. Seskupil bych výřezy podle prefixu názvu (vše do
+                    #   "_frameXXXX_cropYY") a celé skupiny dej buď do train, nebo
+                    #   do val (deterministicky, např. hash(group) % k) - dá se to nějak udělat?
+                    # └──────────────────────────────────────────────────────
                     if is_train:
                         selected_images = all_images[val_samples_per_class:]
                     else:
@@ -29,6 +41,8 @@ class MicrotubuleDataset(Dataset):
 
         if is_train:
             self.transform = T.Compose([
+                # tohle jsou super augmentace - líbí se mi, že jsi vynechal rotate a flip.
+                # můžeš zvážit ještě další radiometrický CutMix a RandomErase atd.
                 T.ToImage(),
                 # Změní kratší stranu minimálně na 136 px, zachová poměr stran
                 T.Resize(136, antialias=True),
