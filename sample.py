@@ -4,12 +4,17 @@ import torchvision.utils as vutils
 from model import ConditionalUNet
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# importoval bych je z jednoho config.py (viz REVIEW v train.py).
 PH_MIN, PH_MAX = 5.8, 8.8
 
 def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
 @torch.no_grad()
+# ┌─ REVIEW ─────────────────────────────────────────────
+#   začal bych na 20–50 krocích; když je kvalita nižší, použij přesnější
+#   solver (Heun/midpoint) místo 20× víc kroků.
+# └──────────────────────────────────────────────────────
 def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
@@ -24,6 +29,14 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
         v_cond = model(x, t, pH_norm)
         v_uncond = model(x, t, pH_null)
         v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
+        # ┌─ REVIEW ─────────────────────────────────────────────
+        #   clamp rychlosti na [-5,5] maskuje nestabilitu, kterou
+        #   typicky způsobuje příliš vysoké cfg_scale nebo málo kroků. Ořezání
+        #   rychlostního pole zkresluje trajektorii ODE.
+        #   odstraňil bych clamp a řešil příčinu — sniž cfg_scale, použil bych
+        #   logit-normal sampling t při tréninku, příp. lepší solver. Clamp
+        #   nech až úplně nakonec na OBRÁZKU (x), ne na rychlosti.
+        # └──────────────────────────────────────────────────────
         v_cfg = torch.clamp(v_cfg, min=-5,max=5)
         x = x + v_cfg * (1.0 / num_steps)
     

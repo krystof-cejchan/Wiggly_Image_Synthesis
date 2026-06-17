@@ -11,6 +11,8 @@ from model import ConditionalUNet
 
 #matplotlib.use('Qt5Agg')
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# PH_MIN/PH_MAX a normalize_pH jsou zkopírované i v train.py a sample.py.
+# asi bych imprtoval z jednoho config.py. - ale to je jen detail
 PH_MIN, PH_MAX = 5.8, 8.8
 
 def normalize_pH(pH):
@@ -63,6 +65,16 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
         #  Predikce pro cílové pH (kam se chceme dostat)
         v_target = model(x, t, pH_target_norm)
         
+        # ┌─ REVIEW ─────────────────────────────────────────────
+        #   tahle "contrastive guidance" interpoluje mezi dvěma
+        #   PODMÍNĚNÝMI rychlostmi (source vs. target pH) a říká tomu cfg_scale.
+        #   To zaměňuje guidance (cond vs. NULL) s interpolací mezi podmínkami —
+        #   funguje, ale těžko se ladí a nedá se srovnat s literaturou.
+        #   porovnej s klasickým SDEdit — zašum referenci na úroveň
+        #   danou denoising_strength a denoise rovnou na CÍLOVÉ pH s běžným CFG
+        #   (cond vs. null). Pokud chceš tenhle přístup zachovat, pojmenuj
+        #   parametr jinak než cfg_scale, ať je jasné, že to není CFG.
+        # └──────────────────────────────────────────────────────
         # Vektorový rozdíl izoluje čistě vliv pH na morfologii
         v_cfg = v_source + cfg_scale * (v_target - v_source)
         
@@ -70,6 +82,11 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
         x = x + v_cfg * (1.0 / num_steps)
     
     out= (x.clamp(-1, 1) + 1) / 2
+    # ┌─ REVIEW ─────────────────────────────────────────────
+    # ✗ ZÁPLATA: napevno zesílený kontrast 1.5 je kosmetika, která maskuje, že
+    #   model vrací málo kontrastní/rozmazaný výstup. Navíc zkresluje "mapu
+    #   rozdílů" níže (rozdíl pak měří i tvůj kontrastní filtr, ne jen efekt pH).
+    # └──────────────────────────────────────────────────────
     out = TF.adjust_contrast(out, 1.5)  # Zesílení kontrastu pro lepší vizualizaci
     return out.clamp(0, 1)
 
@@ -112,6 +129,10 @@ def visualize_difference(original_tensor, edited_tensor, original_size):
 
 def main():
     checkpoint_path = "checkpoints/cfm_best_ema.pt"
+    # ┌─ REVIEW ─────────────────────────────────────────────
+    #   parametry běhu se čtou přes input(). Skript nejde spustit
+    #   dávkově, v cronu ani reprodukovat (nikde se neuloží, co bylo zadáno) - to je ale jen detail
+    # └──────────────────────────────────────────────────────
     ref_image_path = input("Zadej cestu k referenčnímu obrázku (např. 'data/ref_image.png'): ")
     source_pH = float(input(f"Zadej výchozí pH referenčního obrázku (mezi {PH_MIN} a {PH_MAX}): "))
     target_pH = float(input(f"Zadej cílové pH pro úpravu (mezi {PH_MIN} a {PH_MAX}): "))

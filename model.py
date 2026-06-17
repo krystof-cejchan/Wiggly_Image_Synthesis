@@ -163,6 +163,7 @@ class DownStage(nn.Module):
 class UpStage(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch, emb_dim, num_blocks=2, upsample=True):
         super().__init__()
+        # tady bych dal "bilinear" - "nearest" dělá checkerboard effect
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest") if upsample else nn.Identity()
         self.blocks = nn.ModuleList()
         ch = in_ch + skip_ch
@@ -199,8 +200,8 @@ class ConditionalUNet(nn.Module):
         self, 
         in_channels=1, 
         out_channels=1, 
-        base_channels=32, 
-        channel_mults=(1, 2, 4), 
+        base_channels=32, # 48 nebo 64 bych zkusil - snad se to nebude přeučovat
+        channel_mults=(1, 2, 4), # (1,2,4,8) - to udělá bottleneck 8x8 a lépe to vidí celou MT. zároveň bych dělal attention jen v bottlenecku
         num_res_blocks=2, 
         emb_dim=256, 
         num_heads=4
@@ -235,6 +236,10 @@ class ConditionalUNet(nn.Module):
             self.up_stages.append(UpStage(in_ch, skip_ch, out_ch, emb_dim, num_res_blocks, upsample=not is_first))
             ch = out_ch
         
+        # ┌─ REVIEW (drobnost — jinak je model.py architektonicky v pořádku) ─
+        #   tady bych dal nn.GroupNorm(min(32, base_channels), base_channels) - 
+        #   aby to nespadlo když je base channels menší než 32
+        # └──────────────────────────────────────────────────────
         self.norm_out = nn.GroupNorm(32, base_channels)
         self.conv_out = nn.Conv2d(base_channels, out_channels, 3, padding=1)
         nn.init.zeros_(self.conv_out.weight)
@@ -265,7 +270,8 @@ class ConditionalUNet(nn.Module):
             pH_emb_real,
         )
 
-        emb = t_emb + pH_emb
+        # tohle nemodeluje interakci mezi t a pH - časteji se dává: emb = mlp(torch.cat([t_emb, pH_emb], dim=-1)
+        emb = t_emb + pH_emb 
 
         # input conv
         x = self.conv_in(x)
