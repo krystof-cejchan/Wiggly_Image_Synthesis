@@ -42,7 +42,8 @@ class FiLMResBlock(nn.Module):
     def __init__(self, in_ch, out_ch, emb_dim, num_groups=32, dropout=0.1):
         super().__init__()
         # first normalization operates over `in_ch` channels
-        self.norm1 = nn.GroupNorm(min(num_groups, in_ch), in_ch)
+        # Using math.gcd to prevent crashes if in_ch is not divisible by num_groups
+        self.norm1 = nn.GroupNorm(math.gcd(num_groups, in_ch), in_ch)
         # first convolution changes channel dimension in_ch -> out_ch
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         
@@ -55,7 +56,7 @@ class FiLMResBlock(nn.Module):
         nn.init.zeros_(self.emb_proj[-1].bias)
         
         # second normalization is applied before FiLM modulation
-        self.norm2 = nn.GroupNorm(min(num_groups, out_ch), out_ch)
+        self.norm2 = nn.GroupNorm(math.gcd(num_groups, out_ch), out_ch)
         # small dropout between activations and final conv
         self.dropout = nn.Dropout(dropout)
         # final conv preserves channel count (out_ch -> out_ch)
@@ -106,7 +107,7 @@ class SelfAttention2d(nn.Module):
         self.head_dim = channels // num_heads
 
         # GroupNorm over channels to stabilize activations
-        self.norm = nn.GroupNorm(min(num_groups, channels), channels)
+        self.norm = nn.GroupNorm(math.gcd(num_groups, channels), channels)
         # compute q, k, v in a single 1x1 conv; outputs 3 * channels
         self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         # final linear projection after attention (per-channel)
@@ -200,8 +201,8 @@ class ConditionalUNet(nn.Module):
         self, 
         in_channels=1, 
         out_channels=1, 
-        base_channels=48,           # Zvýšeno pro lepší kapacitu modelu
-        channel_mults=(1, 2, 4, 8), # Prohloubeno, vytvoří 8x8 bottleneck pro lepší globální kontext
+        base_channels=64,              # Safer default
+        channel_mults=(1, 2, 4, 8, 8), # Extended to 5 stages -> 128 to 64, 32, 16, 8, 8 (Bottleneck at 8x8)
         num_res_blocks=2, 
         emb_dim=256, 
         num_heads=4
@@ -243,8 +244,8 @@ class ConditionalUNet(nn.Module):
             self.up_stages.append(UpStage(in_ch, skip_ch, out_ch, emb_dim, num_res_blocks, upsample=not is_first))
             ch = out_ch
         
-        # Zajištěno, aby norm_out nepadala, pokud by base_channels bylo < 32
-        self.norm_out = nn.GroupNorm(min(32, base_channels), base_channels)
+        # Zajištěno, aby norm_out nepadala
+        self.norm_out = nn.GroupNorm(math.gcd(32, base_channels), base_channels)
         self.conv_out = nn.Conv2d(base_channels, out_channels, 3, padding=1)
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
