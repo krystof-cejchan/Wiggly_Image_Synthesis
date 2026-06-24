@@ -163,7 +163,8 @@ class DownStage(nn.Module):
 class UpStage(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch, emb_dim, num_blocks=2, upsample=True):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest") if upsample else nn.Identity()
+        # Změna z nearest na bilinear pro zamezení checkerboard efektu
+        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if upsample else nn.Identity()
         self.blocks = nn.ModuleList()
         ch = in_ch + skip_ch
         for _ in range(num_blocks):
@@ -199,8 +200,8 @@ class ConditionalUNet(nn.Module):
         self, 
         in_channels=1, 
         out_channels=1, 
-        base_channels=32, 
-        channel_mults=(1, 2, 4), 
+        base_channels=48,           # Zvýšeno pro lepší kapacitu modelu
+        channel_mults=(1, 2, 4, 8), # Prohloubeno, vytvoří 8x8 bottleneck pro lepší globální kontext
         num_res_blocks=2, 
         emb_dim=256, 
         num_heads=4
@@ -210,6 +211,13 @@ class ConditionalUNet(nn.Module):
         self.t_embed = ScalarEmbedding(emb_dim)
         self.pH_embed = ScalarEmbedding(emb_dim)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
+        
+        # Přidáno MLP pro modelování komplexnější interakce mezi časem a pH
+        self.emb_mlp = nn.Sequential(
+            nn.Linear(emb_dim * 2, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim)
+        )
         
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
@@ -235,7 +243,8 @@ class ConditionalUNet(nn.Module):
             self.up_stages.append(UpStage(in_ch, skip_ch, out_ch, emb_dim, num_res_blocks, upsample=not is_first))
             ch = out_ch
         
-        self.norm_out = nn.GroupNorm(32, base_channels)
+        # Zajištěno, aby norm_out nepadala, pokud by base_channels bylo < 32
+        self.norm_out = nn.GroupNorm(min(32, base_channels), base_channels)
         self.conv_out = nn.Conv2d(base_channels, out_channels, 3, padding=1)
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
@@ -265,7 +274,8 @@ class ConditionalUNet(nn.Module):
             pH_emb_real,
         )
 
-        emb = t_emb + pH_emb
+        # Sloučení přes MLP pro modelování vzájemné závislosti podmínek
+        emb = self.emb_mlp(torch.cat([t_emb, pH_emb], dim=-1))
 
         # input conv
         x = self.conv_in(x)

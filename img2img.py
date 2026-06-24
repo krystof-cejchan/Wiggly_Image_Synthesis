@@ -1,17 +1,17 @@
 import os
+import argparse
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
 import torchvision.utils as vutils
 from PIL import Image
 import matplotlib.pyplot as plt
-import matplotlib
 import torchvision.transforms.v2.functional as TF
+from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 
 #matplotlib.use('Qt5Agg')
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-PH_MIN, PH_MAX = 5.8, 8.8
+
 
 def normalize_pH(pH):
     """Normalizuje pH na interval [-1, 1]."""
@@ -39,7 +39,7 @@ def load_and_preprocess_image(image_path):
     return img_tensor, original_size
 
 @torch.no_grad()
-def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, cfg_scale=3.0, seed=None):
+def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, contrastive_scale=3.0, seed=None):
     """Upraví referenční obrázek pomocí Contrastive Guidance."""
     if seed is not None:
         torch.manual_seed(seed)
@@ -57,20 +57,19 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     for i in range(start_step, num_steps):
         t = torch.full((1,), i / num_steps, device=DEVICE)
         
-        #  Predikce pro původní pH (udržuje vlákno na místě)
+        # Predikce pro původní pH (udržuje vlákno na místě)
         v_source = model(x, t, pH_source_norm)
         
-        #  Predikce pro cílové pH (kam se chceme dostat)
+        # Predikce pro cílové pH (kam se chceme dostat)
         v_target = model(x, t, pH_target_norm)
         
-        # Vektorový rozdíl izoluje čistě vliv pH na morfologii
-        v_cfg = v_source + cfg_scale * (v_target - v_source)
+        # Contrastive Guidance: vektorový rozdíl izoluje vliv pH na morfologii
+        v_dir = v_source + contrastive_scale * (v_target - v_source)
         
         # Eulerův krok
-        x = x + v_cfg * (1.0 / num_steps)
+        x = x + v_dir * (1.0 / num_steps)
     
-    out= (x.clamp(-1, 1) + 1) / 2
-    out = TF.adjust_contrast(out, 1.5)  # Zesílení kontrastu pro lepší vizualizaci
+    out = (x.clamp(-1, 1) + 1) / 2
     return out.clamp(0, 1)
 
 def visualize_difference(original_tensor, edited_tensor, original_size):
@@ -90,12 +89,12 @@ def visualize_difference(original_tensor, edited_tensor, original_size):
     # Vytvoření vizualizace (grafu)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    #  Originál
+    # Originál
     axes[0].imshow(orig_img, cmap='gray', vmin=0, vmax=1)
     axes[0].set_title("Původní obrázek")
     axes[0].axis('off')
     
-    #  Výsledek
+    # Výsledek
     axes[1].imshow(edit_img, cmap='gray', vmin=0, vmax=1)
     axes[1].set_title("Upraveno modelem")
     axes[1].axis('off')
@@ -111,43 +110,44 @@ def visualize_difference(original_tensor, edited_tensor, original_size):
     plt.show()
 
 def main():
-    checkpoint_path = "checkpoints/cfm_best_ema.pt"
-    ref_image_path = input("Zadej cestu k referenčnímu obrázku (např. 'data/ref_image.png'): ")
-    source_pH = float(input(f"Zadej výchozí pH referenčního obrázku (mezi {PH_MIN} a {PH_MAX}): "))
-    target_pH = float(input(f"Zadej cílové pH pro úpravu (mezi {PH_MIN} a {PH_MAX}): "))
+    parser = argparse.ArgumentParser(description="Image-to-Image úprava obrázku pomocí Flow Matching modelu.")
+    parser.add_argument("--ref_image", type=str, required=True, help="Cesta k referenčnímu obrázku (např. 'data/ref_image.png')")
+    parser.add_argument("--source_pH", type=float, required=True, help=f"Výchozí pH referenčního obrázku (mezi {PH_MIN} a {PH_MAX})")
+    parser.add_argument("--target_pH", type=float, required=True, help=f"Cílové pH pro úpravu (mezi {PH_MIN} a {PH_MAX})")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Cesta k checkpointu modelu")
+    parser.add_argument("--strength", type=float, default=0.65, help="Síla úpravy [0.0 - 1.0] (odpovídá zašumění)")
+    parser.add_argument("--contrastive_scale", type=float, default=4.0, help="Síla Contrastive Guidance (dříve cfg_scale)")
+    parser.add_argument("--num_steps", type=int, default=100, help="Počet kroků pro úpravu")
+    parser.add_argument("--seed", type=int, default=None, help="Náhodný seed pro reprodukovatelnost (volitelné)")
     
-    # Necháme uživatele zadat i sílu (výchozí dáme na 0.65 pro změnu tvaru)
-    strength_input = input("Zadej sílu úpravy [0.1 - 0.9] (Enter pro 0.65): ")
-    denoising_strength = float(strength_input) if strength_input.strip() else 0.65
-    cfg = float(input("Classifier-Free Guidance (např. 4.0): ") or 4.0)
-    num_steps = int(input("Počet kroků pro úpravu (např. 100): ") or 100)
+    args = parser.parse_args()
     
-    if not os.path.exists(checkpoint_path):
-        print(f"Chyba: Checkpoint {checkpoint_path} neexistuje.")
+    if not os.path.exists(args.checkpoint):
+        print(f"Chyba: Checkpoint {args.checkpoint} neexistuje.")
         return
         
-    if not os.path.exists(ref_image_path):
-        print(f"Referenční obrázek {ref_image_path} nebyl nalezen. Uprav cestu ve skriptu.")
+    if not os.path.exists(args.ref_image):
+        print(f"Referenční obrázek {args.ref_image} nebyl nalezen. Zkontroluj zadanou cestu.")
         return
 
     model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
     model.eval()
     
     os.makedirs("outputs_img2img", exist_ok=True)
     
-    ref_image, original_size = load_and_preprocess_image(ref_image_path)
+    ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Načten obrázek s původním rozlišením: {original_size[0]}x{original_size[1]}")
     
     edited_img = edit_image(
         model, 
         ref_image, 
-        source_pH=source_pH,  
-        target_pH=target_pH, 
-        denoising_strength=denoising_strength, 
-        num_steps=num_steps,
-        cfg_scale=cfg,         
-        seed=None
+        source_pH=args.source_pH,  
+        target_pH=args.target_pH, 
+        denoising_strength=args.strength, 
+        num_steps=args.num_steps,
+        contrastive_scale=args.contrastive_scale,         
+        seed=args.seed
     )
     
     visualize_difference(ref_image, edited_img, original_size)
@@ -155,7 +155,7 @@ def main():
     orig_w, orig_h = original_size
     edited_crop_for_save = edited_img[:, :, :orig_h, :orig_w]
     
-    save_path = f"outputs_img2img/edited_pH_{target_pH}_str_{denoising_strength}.png"
+    save_path = f"outputs_img2img/edited_pH_{args.target_pH}_str_{args.strength}.png"
     vutils.save_image(edited_crop_for_save, save_path, nrow=1)
     print(f"Výsledek uložen do: {save_path}")
 
