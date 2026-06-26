@@ -51,7 +51,7 @@ class MicrotubuleDataset(Dataset):
                 T.ToDtype(torch.float32, scale=True),
                 T.Normalize(mean=[0.5], std=[0.5]),
                 # RandomErase funguje na tenzorech, aplikujeme s 50% pravděpodobností
-                T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0.0)
+                #T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0.0)
             ])
         else:
             self.transform = T.Compose([
