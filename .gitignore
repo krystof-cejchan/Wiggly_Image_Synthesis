@@ -1,3 +1,4 @@
 wiggly_venv/**
 venv/**
 __pycache__/**
+checkpoints/**

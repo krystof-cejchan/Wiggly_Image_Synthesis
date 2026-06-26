@@ -64,8 +64,13 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
         v_target = model(x, t, pH_target_norm)
         
         # Contrastive Guidance: vektorový rozdíl izoluje vliv pH na morfologii
-        v_dir = v_source + contrastive_scale * (v_target - v_source)
-        
+        # Pass NaN to trigger the unconditional embedding
+        pH_uncond = torch.tensor([float('nan')]).to(DEVICE)
+        v_uncond = model(x, t, pH_uncond)
+        v_target = model(x, t, pH_target_norm)
+
+        # Standard CFG formulation
+        v_dir = v_uncond + contrastive_scale * (v_target - v_uncond)        
         # Eulerův krok
         x = x + v_dir * (1.0 / num_steps)
     

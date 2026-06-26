@@ -15,11 +15,11 @@ from dataset import MicrotubuleDataset
 
 # Nastavení a konstanty
 DATA_DIR = "data/cropped/cropped_output"
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LR = 1e-4
 ITERATIONS = 100_000
-CFG_DROPOUT = 0.1
-EVAL_INTERVAL = 1000  
+CFG_DROPOUT = 0.2
+EVAL_INTERVAL = 500  
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42 # Pevný seed pro reprodukovatelnost

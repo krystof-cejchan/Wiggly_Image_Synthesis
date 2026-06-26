@@ -214,11 +214,8 @@ class ConditionalUNet(nn.Module):
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
         
         # Přidáno MLP pro modelování komplexnější interakce mezi časem a pH
-        self.emb_mlp = nn.Sequential(
-            nn.Linear(emb_dim * 2, emb_dim),
-            nn.SiLU(),
-            nn.Linear(emb_dim, emb_dim)
-        )
+        self.t_proj = nn.Linear(emb_dim, emb_dim)
+        self.pH_proj = nn.Linear(emb_dim, emb_dim)
         
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
@@ -276,8 +273,7 @@ class ConditionalUNet(nn.Module):
         )
 
         # Sloučení přes MLP pro modelování vzájemné závislosti podmínek
-        emb = self.emb_mlp(torch.cat([t_emb, pH_emb], dim=-1))
-
+        emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb))
         # input conv
         x = self.conv_in(x)
         all_skips = []
