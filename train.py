@@ -9,7 +9,7 @@ import random
 import numpy as np
 
 from config import PH_MIN, PH_MAX, DEVICE
-
+import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 
@@ -23,6 +23,7 @@ EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42 # Pevný seed pro reprodukovatelnost
+TRAIN_SIZES = [(128, 128), (64, 256), (256, 64), (48, 384), (80, 192)]
 
 def set_seed(seed):
     """Zajistí reprodukovatelnost napříč PyTorch i Pythonem."""
@@ -35,6 +36,31 @@ def set_seed(seed):
 
 def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
+
+def dynamic_collate_fn(batch):
+    """Pro každý batch náhodně vybere poměr stran a ořízne/vycpe obrázky."""
+    target_h, target_w = random.choice(TRAIN_SIZES)
+    
+    transform = T.Compose([
+        # Používáme reflect padding, aby se při ořezu nevytvořily umělé hrany
+        T.RandomCrop((target_h, target_w), pad_if_needed=True, padding_mode='reflect'),
+        T.ColorJitter(brightness=0.1, contrast=0.1)
+    ])
+    
+    images = [item[0] for item in batch]
+    phs = [item[1] for item in batch]
+    
+    images_stacked = torch.stack(images)
+    images_transformed = transform(images_stacked)
+    
+    return images_transformed, torch.stack(phs)
+
+def val_collate_fn(batch):
+    """Validace běží na stabilním rozlišení pro konzistentní výpočet loss."""
+    transform = T.RandomCrop((128, 128), pad_if_needed=True, padding_mode='reflect')
+    images = [transform(item[0]) for item in batch]
+    phs = [item[1] for item in batch]
+    return torch.stack(images), torch.stack(phs)
 
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
@@ -93,17 +119,21 @@ def main():
     g.manual_seed(SEED)
     
     train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True)
+    val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
+    
     train_dataloader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
         num_workers=4, drop_last=True,
-        worker_init_fn=seed_worker, generator=g
+        worker_init_fn=seed_worker, generator=g,
+        collate_fn=dynamic_collate_fn  # Přidán collate_fn
     )
     
-    val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
     val_dataloader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
-        num_workers=4, worker_init_fn=seed_worker
+        num_workers=4, worker_init_fn=seed_worker,
+        collate_fn=val_collate_fn      # Přidán collate_fn
     )
+
     
     model = ConditionalUNet().to(DEVICE)
     ema_model = deepcopy(model).eval()

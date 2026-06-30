@@ -38,43 +38,93 @@ def load_and_preprocess_image(image_path):
     
     return img_tensor, original_size
 
+def load_and_preprocess_image(image_path):
+    """Načte referenční obrázek a převede jej na tenzor v rozsahu [-1, 1]."""
+    image = Image.open(image_path).convert('L')
+    original_size = image.size  # (width, height)
+    
+    transform = T.Compose([
+        T.ToImage(),
+        T.ToDtype(torch.float32, scale=True),
+        T.Normalize(mean=[0.5], std=[0.5]),
+    ])
+    
+    img_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    return img_tensor, original_size
+
+def create_blending_mask(window_size, device):
+    """Vytvoří 2D masku (Hann window) pro plynulé prolnutí překrývajících se oken."""
+    window_1d = torch.hann_window(window_size, periodic=False, device=device)
+    mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
+    return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+
 @torch.no_grad()
-def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, contrastive_scale=3.0, seed=None):
-    """Upraví referenční obrázek pomocí Contrastive Guidance."""
+def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64):
+    """
+    Upraví obrázek libovolné velikosti pomocí globálního Flow Matching integrátoru 
+    kombinovaného s lokálním výpočtem vektorového pole (Sliding Window).
+    """
     if seed is not None:
         torch.manual_seed(seed)
         
-    # Nyní normalizujeme obě hodnoty pH
     pH_source_norm = normalize_pH(torch.tensor([source_pH])).to(DEVICE)
     pH_target_norm = normalize_pH(torch.tensor([target_pH])).to(DEVICE)
     
+    _, _, h, w = ref_image.shape
+    
+    # Výpočet paddingu pro okno a stride
+    target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
+    target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
+    
+    total_pad_h = target_h - h
+    total_pad_w = target_w - w
+    
+    pad_top = total_pad_h // 2
+    pad_bottom = total_pad_h - pad_top
+    pad_left = total_pad_w // 2
+    pad_right = total_pad_w - pad_left
+    
+    # Použití 'replicate' pro zabránění padnutí u extrémně úzkých obrázků
+    padded_ref = F.pad(ref_image, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
+    
     t_start = 1.0 - denoising_strength
-    noise = torch.randn_like(ref_image)
-    x = (1 - t_start) * noise + t_start * ref_image 
+    noise = torch.randn_like(padded_ref)
+    x = (1 - t_start) * noise + t_start * padded_ref  
     
     start_step = int(t_start * num_steps)
-
+    mask = create_blending_mask(window_size, ref_image.device)
+    
     for i in range(start_step, num_steps):
         t = torch.full((1,), i / num_steps, device=DEVICE)
         
-        # Predikce pro původní pH (udržuje vlákno na místě)
-        v_source = model(x, t, pH_source_norm)
+        progress = (i - start_step) / max(1, num_steps - start_step)
+        current_scale = contrastive_scale * (1.0 - progress) + 1.0 * progress
         
-        # Predikce pro cílové pH (kam se chceme dostat)
-        v_target = model(x, t, pH_target_norm)
+        v_source_global = torch.zeros_like(x)
+        v_target_global = torch.zeros_like(x)
+        weight_global = torch.zeros_like(x)
         
-        # Contrastive Guidance: vektorový rozdíl izoluje vliv pH na morfologii
-        # Pass NaN to trigger the unconditional embedding
-        pH_uncond = torch.tensor([float('nan')]).to(DEVICE)
-        v_uncond = model(x, t, pH_uncond)
-        v_target = model(x, t, pH_target_norm)
-
-        # Standard CFG formulation
-        v_dir = v_uncond + contrastive_scale * (v_target - v_uncond)        
-        # Eulerův krok
+        for y in range(0, target_h - window_size + 1, stride):
+            for x_idx in range(0, target_w - window_size + 1, stride):
+                x_patch = x[:, :, y:y+window_size, x_idx:x_idx+window_size]
+                
+                v_src_patch = model(x_patch, t, pH_source_norm)
+                v_tgt_patch = model(x_patch, t, pH_target_norm)
+                
+                v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
+                v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
+                weight_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += mask
+        
+        v_source = v_source_global / weight_global.clamp(min=1e-8)
+        v_target = v_target_global / weight_global.clamp(min=1e-8)
+        
+        v_dir = v_source + current_scale * (v_target - v_source)        
         x = x + v_dir * (1.0 / num_steps)
     
-    out = (x.clamp(-1, 1) + 1) / 2
+    # Oříznutí paddingu a denormalizace
+    x_cropped = x[:, :, pad_top:pad_top+h, pad_left:pad_left+w]
+    out = (x_cropped.clamp(-1, 1) + 1) / 2
+    
     return out.clamp(0, 1)
 
 def visualize_difference(original_tensor, edited_tensor, original_size):
@@ -144,9 +194,10 @@ def main():
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Načten obrázek s původním rozlišením: {original_size[0]}x{original_size[1]}")
     
+    # Použití Sliding Window Inference
     edited_img = edit_image(
-        model, 
-        ref_image, 
+        model=model, 
+        ref_image=ref_image, 
         source_pH=args.source_pH,  
         target_pH=args.target_pH, 
         denoising_strength=args.strength, 

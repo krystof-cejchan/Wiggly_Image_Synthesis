@@ -39,28 +39,13 @@ class MicrotubuleDataset(Dataset):
                 except ValueError:
                     continue
 
-        if is_train:
-            self.transform = T.Compose([
-                T.ToImage(),
-                # Změní kratší stranu minimálně na 136 px, zachová poměr stran
-                T.Resize(136, antialias=True),
-                T.RandomCrop(112),
-                # Finální resize na cílových 128x128
-                T.Resize((128, 128), antialias=True),
-                T.ColorJitter(brightness=0.1, contrast=0.1),
-                T.ToDtype(torch.float32, scale=True),
-                T.Normalize(mean=[0.5], std=[0.5]),
-                # RandomErase funguje na tenzorech, aplikujeme s 50% pravděpodobností
-                #T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0.0)
-            ])
-        else:
-            self.transform = T.Compose([
-                T.ToImage(),
-                # Pro validaci jen bezpečně změníme velikost na přesných 128x128
-                T.Resize((128, 128), antialias=True),
-                T.ToDtype(torch.float32, scale=True),
-                T.Normalize(mean=[0.5], std=[0.5]),
-            ])
+        self.is_train = is_train
+        
+        self.base_transform = T.Compose([
+            T.ToImage(),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=[0.5], std=[0.5]),
+        ])
 
     def __len__(self):
         return len(self.samples)
@@ -68,5 +53,5 @@ class MicrotubuleDataset(Dataset):
     def __getitem__(self, idx):
         img_path, ph = self.samples[idx]
         image = Image.open(img_path).convert('L')
-        image = self.transform(image)
-        return image, torch.tensor(ph, dtype=torch.float32)
+        image_tensor = self.base_transform(image)
+        return image_tensor, torch.tensor(ph, dtype=torch.float32)
