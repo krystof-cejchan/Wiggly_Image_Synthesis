@@ -38,7 +38,7 @@ def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
 def dynamic_collate_fn(batch):
-    """Pro každý batch náhodně vybere poměr stran a ořízne/vycpe obrázky."""
+    """Pro každý batch náhodně vybere poměr stran a ořízne/vycpe obrázky před spojením."""
     target_h, target_w = random.choice(TRAIN_SIZES)
     
     transform = T.Compose([
@@ -47,13 +47,11 @@ def dynamic_collate_fn(batch):
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
     
-    images = [item[0] for item in batch]
+    images = [transform(item[0]) for item in batch]
     phs = [item[1] for item in batch]
     
-    images_stacked = torch.stack(images)
-    images_transformed = transform(images_stacked)
-    
-    return images_transformed, torch.stack(phs)
+    # Nyní mají všechny obrázky v listu 'images' stejný tvar (1, target_h, target_w)
+    return torch.stack(images), torch.stack(phs)
 
 def val_collate_fn(batch):
     """Validace běží na stabilním rozlišení pro konzistentní výpočet loss."""
