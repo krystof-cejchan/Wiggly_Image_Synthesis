@@ -42,22 +42,21 @@ def dynamic_collate_fn(batch):
     target_h, target_w = random.choice(TRAIN_SIZES)
     
     transform = T.Compose([
-        # Používáme reflect padding, aby se při ořezu nevytvořily umělé hrany
-        T.RandomCrop((target_h, target_w), pad_if_needed=True, padding_mode='reflect'),
+        T.RandomCrop((target_h, target_w), pad_if_needed=True, padding_mode='edge'),
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
     
     images = [transform(item[0]) for item in batch]
     phs = [item[1] for item in batch]
     
-    # Nyní mají všechny obrázky v listu 'images' stejný tvar (1, target_h, target_w)
     return torch.stack(images), torch.stack(phs)
 
 def val_collate_fn(batch):
     """Validace běží na stabilním rozlišení pro konzistentní výpočet loss."""
-    transform = T.RandomCrop((128, 128), pad_if_needed=True, padding_mode='reflect')
+    transform = T.RandomCrop((128, 128), pad_if_needed=True, padding_mode='edge')
     images = [transform(item[0]) for item in batch]
     phs = [item[1] for item in batch]
+    
     return torch.stack(images), torch.stack(phs)
 
 @torch.no_grad()
