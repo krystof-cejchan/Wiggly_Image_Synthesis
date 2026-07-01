@@ -58,6 +58,22 @@ def create_blending_mask(window_size, device):
     mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
     return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
 
+def safe_mirror_pad_4d(img_tensor, target_h, target_w):
+    """
+    Zrcadlově množí 4D tenzor (B, C, H, W) doprava a dolů, 
+    dokud nedosáhne cílové velikosti. Nevytváří umělé hrany.
+    """
+    # Zrcadlení na výšku (dimenze 2)
+    while img_tensor.shape[2] < target_h:
+        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
+        
+    # Zrcadlení na šířku (dimenze 3)
+    while img_tensor.shape[3] < target_w:
+        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[3])], dim=3)
+        
+    # Zrcadlení mohlo cílový rozměr mírně přesáhnout, proto přesně ořízneme
+    return img_tensor[:, :, :target_h, :target_w]
+
 @torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64):
     """
@@ -72,20 +88,12 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     
     _, _, h, w = ref_image.shape
     
-    # Výpočet paddingu pro okno a stride
+    # Výpočet cílové velikosti pro posuvné okno
     target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
     target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
     
-    total_pad_h = target_h - h
-    total_pad_w = target_w - w
-    
-    pad_top = total_pad_h // 2
-    pad_bottom = total_pad_h - pad_top
-    pad_left = total_pad_w // 2
-    pad_right = total_pad_w - pad_left
-    
-    # Použití 'replicate' pro zabránění padnutí u extrémně úzkých obrázků
-    padded_ref = F.pad(ref_image, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
+    # NOVÉ: Použití bezpečné zrcadlové funkce (stejná logika jako v novém tréninku)
+    padded_ref = safe_mirror_pad_4d(ref_image, target_h, target_w)
     
     t_start = 1.0 - denoising_strength
     noise = torch.randn_like(padded_ref)
@@ -121,10 +129,10 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
         v_dir = v_source + current_scale * (v_target - v_source)        
         x = x + v_dir * (1.0 / num_steps)
     
-    # Oříznutí paddingu a denormalizace
-    x_cropped = x[:, :, pad_top:pad_top+h, pad_left:pad_left+w]
-    out = (x_cropped.clamp(-1, 1) + 1) / 2
+    # Oříznutí zrcadleného balastu (originál je přesně vlevo nahoře)
+    x_cropped = x[:, :, :h, :w]
     
+    out = (x_cropped.clamp(-1, 1) + 1) / 2
     return out.clamp(0, 1)
 
 def visualize_difference(original_tensor, edited_tensor, original_size):

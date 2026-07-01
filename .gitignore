@@ -2,3 +2,4 @@ wiggly_venv/**
 venv/**
 __pycache__/**
 checkpoints/**
+checkpoints/cfm_best_ema.pt
