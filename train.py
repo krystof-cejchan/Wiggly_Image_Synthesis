@@ -37,26 +37,58 @@ def set_seed(seed):
 def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
+def safe_mirror_pad(img_tensor, target_h, target_w):
+    """
+    Zrcadlově množí obrázek, dokud není dostatečně velký.
+    Vyhne se tím limitům PyTorche a nevytváří umělé pruhy.
+    """
+    _, h, w = img_tensor.shape
+    
+    # Zrcadlení na výšku
+    while h < target_h:
+        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[1])], dim=1)
+        h = img_tensor.shape[1]
+        
+    # Zrcadlení na šířku
+    while w < target_w:
+        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
+        w = img_tensor.shape[2]
+        
+    return img_tensor
+
 def dynamic_collate_fn(batch):
-    """Pro každý batch náhodně vybere poměr stran a ořízne/vycpe obrázky před spojením."""
+    """Pro každý batch náhodně vybere poměr stran a ořízne předpřipravené obrázky."""
     target_h, target_w = random.choice(TRAIN_SIZES)
     
+    # Odebráno pad_if_needed a padding_mode
     transform = T.Compose([
-        T.RandomCrop((target_h, target_w), pad_if_needed=True, padding_mode='edge'),
+        T.RandomCrop((target_h, target_w)),
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
     
-    images = [transform(item[0]) for item in batch]
+    images = []
+    for item in batch:
+        img = item[0]
+        # Nejprve obrázek bezpečně nafoukneme zrcadlením
+        img_padded = safe_mirror_pad(img, target_h, target_w)
+        # Následně z něj vyřízneme dynamický rozměr
+        images.append(transform(img_padded))
+        
     phs = [item[1] for item in batch]
-    
     return torch.stack(images), torch.stack(phs)
 
 def val_collate_fn(batch):
     """Validace běží na stabilním rozlišení pro konzistentní výpočet loss."""
-    transform = T.RandomCrop((128, 128), pad_if_needed=True, padding_mode='edge')
-    images = [transform(item[0]) for item in batch]
-    phs = [item[1] for item in batch]
+    target_h, target_w = 128, 128
+    transform = T.RandomCrop((target_h, target_w))
     
+    images = []
+    for item in batch:
+        img = item[0]
+        img_padded = safe_mirror_pad(img, target_h, target_w)
+        images.append(transform(img_padded))
+        
+    phs = [item[1] for item in batch]
     return torch.stack(images), torch.stack(phs)
 
 @torch.no_grad()
