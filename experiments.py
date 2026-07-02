@@ -46,7 +46,7 @@ def main():
             "--num_steps", str(NUM_STEPS),
             "--strength", str(strength),
             "--contrastive_scale", str(scale),
-            "--contrast", 2.0
+            "--contrast", str(2.0)
         ]
         
         # Spuštění inference
