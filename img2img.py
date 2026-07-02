@@ -211,7 +211,8 @@ def main():
         denoising_strength=args.strength, 
         num_steps=args.num_steps,
         contrastive_scale=args.contrastive_scale,         
-        seed=args.seed
+        seed=args.seed,
+        contrast=args.contrast
     )
     
     visualize_difference(ref_image, edited_img, original_size)
