@@ -10,8 +10,6 @@ import torchvision.transforms.v2.functional as TF
 from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 
-#matplotlib.use('Qt5Agg')
-
 
 def normalize_pH(pH):
     """Normalizuje pH na interval [-1, 1]."""
@@ -88,11 +86,9 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     
     _, _, h, w = ref_image.shape
     
-    # Výpočet cílové velikosti pro posuvné okno
     target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
     target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
     
-    # NOVÉ: Použití bezpečné zrcadlové funkce (stejná logika jako v novém tréninku)
     padded_ref = safe_mirror_pad_4d(ref_image, target_h, target_w)
     
     t_start = 1.0 - denoising_strength
@@ -129,7 +125,6 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
         v_dir = v_source + current_scale * (v_target - v_source)        
         x = x + v_dir * (1.0 / num_steps)
     
-    # Oříznutí zrcadleného balastu (originál je přesně vlevo nahoře)
     x_cropped = x[:, :, :h, :w]
     
     out = (x_cropped.clamp(-1, 1) + 1) / 2
