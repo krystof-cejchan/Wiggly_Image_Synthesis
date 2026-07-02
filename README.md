@@ -1,31 +1,27 @@
 Wiggly Image Synthesis
 ======================
 
-Overview
---------
-This repository contains code for training and running a microscopy-image synthesis model (CFM-style). It includes training scripts, model definitions, dataset utilities, and example inference/image-to-image workflows.
 
-Quick start
------------
 
-- Typical steps:
-  - Prepare/verify your dataset under `data/` (see `dataset.py`).
-  - Train with `train.py` (see script flags for hyperparameters).
-  - Generate samples with `sample.py` or run image-to-image with `img2img.py` / `img2img_attention.py`.
+The main inference script allows you to take an existing microtubule image, define its current pH, and synthesize how it would look at a target pH. It uses a global ODE integrator combined with a sliding window approach for the vector field to handle arbitrarily large and wide aspect ratios.
 
-Repository layout (important files)
----------------------------------
-- `train.py` — training loop and checkpointing
-- `sample.py` — generate sample images from the model
-- `img2img.py`, `img2img_attention.py` — image-to-image utilities (with/without full attention)
-- `model.py`, `model_attention.py` — model definitions
-- `dataset.py` — dataset loader and preprocessing helpers
-- `model_attention.py` — full-attention-enabled model variant
-- `checkpoints/` — saved checkpoint files (e.g., `cfm_best_ema.pt`, `cfm_best_ema_attention.pt`)
-- `outputs/`, `outputs_img2img/` — default output folders for results
+Basic Command:
+```bash
+python3 img2img.py \
+    --ref_image "data/cropped/cropped_output/5.8/sample.png" \
+    --source_pH 5.8 \
+    --target_pH 8.8
+```
 
-Data layout
------------
-- Source images are organized under `data/input/` and `data/cropped/` in subfolders by condition.
-- `checkpoints/` stores model weights used for inference and resuming training.
+Important Arguments:
+```bash
+    --strength (default: 0.65): Controls the denoising strength (0.0 to 1.0). For thin microtubule structures, lower values (e.g., 0.35 - 0.45) are highly recommended to prevent the structure from breaking into disconnected segments.
 
+    --contrastive_scale (default: 4.0): Controls how aggressively the target pH morphology (curviness) is applied.
+
+    --num_steps (default: 100): Number of Euler integration steps. Higher = better quality but slower.
+
+    --contrast (default: 1.0): Post-processing histogram stretch to restore deep blacks that might wash out during Flow Matching. (Values like 1.5 or 2.0 will darken the cells).
+```
+
+The script automatically generates a visual comparison plot (Original vs. Edited vs. Absolute Difference Map) and saves the final edited crop into the outputs_img2img/ directory.
