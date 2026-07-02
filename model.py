@@ -164,7 +164,7 @@ class DownStage(nn.Module):
 class UpStage(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch, emb_dim, num_blocks=2, upsample=True):
         super().__init__()
-        # Změna z nearest na bilinear pro zamezení checkerboard efektu
+        
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if upsample else nn.Identity()
         self.blocks = nn.ModuleList()
         ch = in_ch + skip_ch
@@ -201,8 +201,8 @@ class ConditionalUNet(nn.Module):
         self, 
         in_channels=1, 
         out_channels=1, 
-        base_channels=64,              # Safer default
-        channel_mults=(1, 2, 4, 8, 8), # Extended to 5 stages -> 128 to 64, 32, 16, 8, 8 (Bottleneck at 8x8)
+        base_channels=64,              
+        channel_mults=(1, 2, 4, 8, 8), # 5 stages -> 128 to 64, 32, 16, 8, 8 (Bottleneck at 8x8)
         num_res_blocks=2, 
         emb_dim=256, 
         num_heads=4
@@ -213,7 +213,7 @@ class ConditionalUNet(nn.Module):
         self.pH_embed = ScalarEmbedding(emb_dim)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
         
-        # Přidáno MLP pro modelování komplexnější interakce mezi časem a pH
+        # mlp projections for time and pH embeddings to produce FiLM parameters
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.pH_proj = nn.Linear(emb_dim, emb_dim)
         
@@ -241,7 +241,6 @@ class ConditionalUNet(nn.Module):
             self.up_stages.append(UpStage(in_ch, skip_ch, out_ch, emb_dim, num_res_blocks, upsample=not is_first))
             ch = out_ch
         
-        # Zajištěno, aby norm_out nepadala
         self.norm_out = nn.GroupNorm(math.gcd(32, base_channels), base_channels)
         self.conv_out = nn.Conv2d(base_channels, out_channels, 3, padding=1)
         nn.init.zeros_(self.conv_out.weight)
@@ -272,7 +271,7 @@ class ConditionalUNet(nn.Module):
             pH_emb_real,
         )
 
-        # Sloučení přes MLP pro modelování vzájemné závislosti podmínek
+        # The merged embedding is then used to modulate the feature maps in the U-Net via FiLM layers.
         emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb))
         # input conv
         x = self.conv_in(x)

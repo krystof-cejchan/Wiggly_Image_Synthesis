@@ -19,16 +19,12 @@ class MicrotubuleDataset(Dataset):
                     all_images.sort()
                     
                     for img_name in all_images:
-                        # 1. Extrakce identifikátoru zdrojového snímku (odstraníme _cropXX)
-                        # Předpokládá formát např. "exp1_frame0000_crop01.png"
                         base_name = img_name.split('_crop')[0]
                         
-                        # 2. Deterministický hash (hash() se v Pythonu mění s každým spuštěním)
                         hash_hex = hashlib.md5(base_name.encode('utf-8')).hexdigest()
-                        # Převedení posledních znaků hashe na int pro % 100
                         hash_val = int(hash_hex, 16) % 100
                         
-                        # 3. Deterministické rozdělení do val/train
+                        # val/train split based on hash value
                         is_val_sample = hash_val < (val_split_ratio * 100)
                         
                         if is_train and not is_val_sample:

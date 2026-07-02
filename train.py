@@ -13,7 +13,7 @@ import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 
-# Nastavení a konstanty
+# hyperparameters
 DATA_DIR = "data/cropped/cropped_output"
 BATCH_SIZE = 64
 LR = 1e-4
@@ -22,7 +22,7 @@ CFG_DROPOUT = 0.2
 EVAL_INTERVAL = 500  
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
-SEED = 42 # Pevný seed pro reprodukovatelnost
+SEED = 42
 TRAIN_SIZES = [(128, 128), (64, 256), (256, 64), (48, 384), (80, 192)]
 
 def set_seed(seed):
@@ -39,17 +39,17 @@ def normalize_pH(pH):
 
 def safe_mirror_pad(img_tensor, target_h, target_w):
     """
-    Zrcadlově množí obrázek, dokud není dostatečně velký.
-    Vyhne se tím limitům PyTorche a nevytváří umělé pruhy.
+   multiple mirror padding to ensure the image tensor is at least target_h x target_w in size.
+    If the image is already larger than the target dimensions, it will be returned unchanged.
     """
     _, h, w = img_tensor.shape
     
-    # Zrcadlení na výšku
+    # Mirror padding to ensure the image tensor is at least target_h x target_w in size
     while h < target_h:
         img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[1])], dim=1)
         h = img_tensor.shape[1]
         
-    # Zrcadlení na šířku
+    # Mirror padding to ensure the image tensor is at least target_h x target_w in size
     while w < target_w:
         img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
         w = img_tensor.shape[2]
@@ -57,10 +57,9 @@ def safe_mirror_pad(img_tensor, target_h, target_w):
     return img_tensor
 
 def dynamic_collate_fn(batch):
-    """Pro každý batch náhodně vybere poměr stran a ořízne předpřipravené obrázky."""
+    """For each batch, randomly select an aspect ratio and crop the pre-prepared images."""
     target_h, target_w = random.choice(TRAIN_SIZES)
     
-    # Odebráno pad_if_needed a padding_mode
     transform = T.Compose([
         T.RandomCrop((target_h, target_w)),
         T.ColorJitter(brightness=0.1, contrast=0.1)
@@ -69,16 +68,16 @@ def dynamic_collate_fn(batch):
     images = []
     for item in batch:
         img = item[0]
-        # Nejprve obrázek bezpečně nafoukneme zrcadlením
+        # Pad the image to ensure it is at least target_h x target_w in size
         img_padded = safe_mirror_pad(img, target_h, target_w)
-        # Následně z něj vyřízneme dynamický rozměr
+        # Apply the random crop and color jitter
         images.append(transform(img_padded))
         
     phs = [item[1] for item in batch]
     return torch.stack(images), torch.stack(phs)
 
 def val_collate_fn(batch):
-    """Validace běží na stabilním rozlišení pro konzistentní výpočet loss."""
+    """For validation, we will use a fixed crop size (128x128) and no color jittering."""
     target_h, target_w = 128, 128
     transform = T.RandomCrop((target_h, target_w))
     
@@ -94,15 +93,15 @@ def val_collate_fn(batch):
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
     """
-    Spočítá Flow Matching MSE na validačním datasetu.
-    Validace je nyní deterministická (používá pevný generátor) a 
-    pro každý batch průměruje loss přes více náhodných losování (num_noise_samples),
-    aby byla validační křivka hladká a spolehlivá pro early stopping.
+    Calculates Flow Matching MSE on the validation dataset.
+    Validation is now deterministic (uses a fixed generator) and
+    for each batch averages the loss over multiple random samplings (num_noise_samples),
+    to make the validation curve smooth and reliable for early stopping.
     """
     model.eval()
     total_loss = 0.0
     
-    # Lokální generátor zajišťuje, že pro stejný batch vygenerujeme stejný šum každou epochu
+    # Set a fixed generator for deterministic validation
     eval_gen = torch.Generator(device=DEVICE)
     eval_gen.manual_seed(12345) 
     
@@ -112,7 +111,7 @@ def evaluate(model, dataloader, num_noise_samples=3):
         
         batch_loss = 0.0
         
-        # Zprůměrování přes K losování pro stabilnější odhad ztráty
+        # Average the loss over multiple random samplings for each batch
         for _ in range(num_noise_samples):
             x0 = torch.randn(x1.shape, generator=eval_gen, device=DEVICE)
             t = torch.rand(x1.shape[0], generator=eval_gen, device=DEVICE)
@@ -121,8 +120,8 @@ def evaluate(model, dataloader, num_noise_samples=3):
             xt = (1 - t_expand) * x0 + t_expand * x1
             target = x1 - x0
             
-            # Pro jistotu použijeme autocast i u validace
-            with torch.autocast(device_type="cuda" if "cuda" in DEVICE else "cpu", dtype=torch.bfloat16):
+            
+            with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
                 pred = model(xt, t, pH)
                 loss = F.mse_loss(pred, target)
                 
@@ -133,17 +132,16 @@ def evaluate(model, dataloader, num_noise_samples=3):
     model.train()
     return total_loss / len(dataloader)
 
-def seed_worker(worker_id):
-    """Seed pro jednotlivé workery DataLoaderu."""
+def seed_worker():
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 def main():
-    set_seed(SEED) # 1. Globální seed
+    set_seed(SEED) 
     os.makedirs("checkpoints", exist_ok=True)
     
-    # Nastavení generátoru pro DataLoader, aby bylo míchání reprodukovatelné
+    # Set up DataLoaders with dynamic collate functions for training and validation
     g = torch.Generator()
     g.manual_seed(SEED)
     
@@ -154,13 +152,13 @@ def main():
         train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
         num_workers=4, drop_last=True,
         worker_init_fn=seed_worker, generator=g,
-        collate_fn=dynamic_collate_fn  # Přidán collate_fn
+        collate_fn=dynamic_collate_fn  
     )
     
     val_dataloader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
         num_workers=4, worker_init_fn=seed_worker,
-        collate_fn=val_collate_fn      # Přidán collate_fn
+        collate_fn=val_collate_fn     
     )
 
     
@@ -178,8 +176,8 @@ def main():
     model.train()
     step = 0
     
-    print(f"Zařízení: {DEVICE}.")
-    print(f"Trénovacích obrázků: {len(train_dataset)}, Validačních: {len(val_dataset)}")
+    print(f"{DEVICE}.")
+    print(f"training images: {len(train_dataset)}, Validation images: {len(val_dataset)}")
 
     while step < ITERATIONS:
         for x_batch, pH_batch in train_dataloader:
@@ -201,14 +199,12 @@ def main():
             
             optimizer.zero_grad()
             
-            # 2. Mixed Precision (Autocast do bfloat16) pro obrovské zrychlení
-            # Pokud na tvém hardwaru nefunguje bfloat16, změň na torch.float16 a přidej GradScaler.
+          
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
                 pred = model(xt, t, pH_input)
                 loss = F.mse_loss(pred, target)
             
-            # U bfloat16 voláme zpětný průchod normálně (bez scaleru)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -241,7 +237,8 @@ def main():
             step += 1
 
     torch.save(ema_model.state_dict(), "checkpoints/cfm_final_ema.pt")
-    print("Trénink dokončen.")
+    print("Training completed. Final model saved as 'checkpoints/cfm_final_ema.pt'.")
+    print(f"Best validation loss: {best_val_loss:.4f} at step {step}. Model saved as 'checkpoints/cfm_best_ema.pt'.")
 
 if __name__ == "__main__":
     main()

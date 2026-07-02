@@ -12,32 +12,11 @@ from model import ConditionalUNet
 
 
 def normalize_pH(pH):
-    """Normalizuje pH na interval [-1, 1]."""
+    """normalize pH value to [-1, 1] range based on PH_MIN and PH_MAX"""
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
 def load_and_preprocess_image(image_path):
-    """Načte referenční obrázek, vycpe ho na násobek 16 a vrátí původní velikost."""
-    image = Image.open(image_path).convert('L')
-    original_size = image.size  # (width, height)
-    
-    transform = T.Compose([
-        T.ToImage(),
-        T.ToDtype(torch.float32, scale=True),
-        T.Normalize(mean=[0.5], std=[0.5]),
-    ])
-    
-    img_tensor = transform(image).unsqueeze(0).to(DEVICE)
-    
-    _, _, h, w = img_tensor.shape
-    pad_h = (16 - (h % 16)) % 16
-    pad_w = (16 - (w % 16)) % 16
-    
-    img_tensor = F.pad(img_tensor, (0, pad_w, 0, pad_h), mode='constant', value=-1.0)
-    
-    return img_tensor, original_size
-
-def load_and_preprocess_image(image_path):
-    """Načte referenční obrázek a převede jej na tenzor v rozsahu [-1, 1]."""
+    """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
     image = Image.open(image_path).convert('L')
     original_size = image.size  # (width, height)
     
@@ -51,25 +30,25 @@ def load_and_preprocess_image(image_path):
     return img_tensor, original_size
 
 def create_blending_mask(window_size, device):
-    """Vytvoří 2D masku (Hann window) pro plynulé prolnutí překrývajících se oken."""
+    """create a 2D blending mask using a Hann window for smooth transitions between overlapping patches"""
     window_1d = torch.hann_window(window_size, periodic=False, device=device)
     mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
     return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
 
 def safe_mirror_pad_4d(img_tensor, target_h, target_w):
     """
-    Zrcadlově množí 4D tenzor (B, C, H, W) doprava a dolů, 
-    dokud nedosáhne cílové velikosti. Nevytváří umělé hrany.
+    Pads a 4D tensor (N, C, H, W) to at least target_h and target_w using mirror padding.
+    If the tensor is already larger than the target dimensions, it will be returned unchanged.
     """
-    # Zrcadlení na výšku (dimenze 2)
+    # height mirror padding (2nd dimension)
     while img_tensor.shape[2] < target_h:
         img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
         
-    # Zrcadlení na šířku (dimenze 3)
+    # width mirror padding (3rd dimension)
     while img_tensor.shape[3] < target_w:
         img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[3])], dim=3)
         
-    # Zrcadlení mohlo cílový rozměr mírně přesáhnout, proto přesně ořízneme
+    # Crop to the exact target size if it exceeds
     return img_tensor[:, :, :target_h, :target_w]
 
 @torch.no_grad()
@@ -77,8 +56,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
                contrast=1.2):
     """
-    Upraví obrázek libovolné velikosti pomocí globálního Flow Matching integrátoru 
-    kombinovaného s lokálním výpočtem vektorového pole (Sliding Window).
+    Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -135,62 +113,56 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     return out_contrasted
 
 def visualize_difference(original_tensor, edited_tensor, original_size):
-    """Zobrazí matplotlib okno s originálem, výsledkem a mapou rozdílů."""
-    # Odříznutí vycpávky (paddingu) z obou tenzorů
+    """Visualizes the difference between the original and edited images."""
     orig_w, orig_h = original_size
     orig_crop = original_tensor[:, :, :orig_h, :orig_w]
     edit_crop = edited_tensor[:, :, :orig_h, :orig_w]
     
-    # Převod na CPU a denormalizace originálu (z [-1, 1] na [0, 1]) pro zobrazení
     orig_img = (orig_crop.squeeze().cpu() + 1) / 2
     edit_img = edit_crop.squeeze().cpu()
     
-    # Výpočet absolutního rozdílu
     diff_map = torch.abs(orig_img - edit_img)
     
-    # Vytvoření vizualizace (grafu)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    # Originál
+    # original
     axes[0].imshow(orig_img, cmap='gray', vmin=0, vmax=1)
-    axes[0].set_title("Původní obrázek")
+    axes[0].set_title("Original Image")
     axes[0].axis('off')
     
-    # Výsledek
+    # result
     axes[1].imshow(edit_img, cmap='gray', vmin=0, vmax=1)
-    axes[1].set_title("Upraveno modelem")
+    axes[1].set_title("Edited with Model")
     axes[1].axis('off')
 
     im_diff = axes[2].imshow(diff_map, cmap='inferno', vmin=0, vmax=1)
-    axes[2].set_title("Mapa rozdílů (Absolutní změna)")
+    axes[2].set_title("Difference Map (Absolute Change)")
     axes[2].axis('off')
     
-    # Přidání barevné škály
     fig.colorbar(im_diff, ax=axes[2], fraction=0.046, pad=0.04)
     
     plt.tight_layout()
     plt.show()
 
 def main():
-    parser = argparse.ArgumentParser(description="Image-to-Image úprava obrázku pomocí Flow Matching modelu.")
-    parser.add_argument("--ref_image", type=str, required=True, help="Cesta k referenčnímu obrázku (např. 'data/ref_image.png')")
-    parser.add_argument("--source_pH", type=float, required=True, help=f"Výchozí pH referenčního obrázku (mezi {PH_MIN} a {PH_MAX})")
-    parser.add_argument("--target_pH", type=float, required=True, help=f"Cílové pH pro úpravu (mezi {PH_MIN} a {PH_MAX})")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Cesta k checkpointu modelu")
-    parser.add_argument("--strength", type=float, default=0.65, help="Síla úpravy [0.0 - 1.0] (odpovídá zašumění)")
-    parser.add_argument("--contrastive_scale", type=float, default=4.0, help="Síla Contrastive Guidance (dříve cfg_scale)")
-    parser.add_argument("--num_steps", type=int, default=100, help="Počet kroků pro úpravu")
-    parser.add_argument("--seed", type=int, default=None, help="Náhodný seed pro reprodukovatelnost (volitelné)")
-    parser.add_argument("--contrast", type=float, default=1.0, help="Síla kontrastu (volitelné)")
+    parser = argparse.ArgumentParser(description="Image-to-Image pH Editing using Conditional UNet")
+    parser.add_argument("--ref_image", type=str, required=True, help="Path to the reference image (e.g., 'data/ref_image.png')")
+    parser.add_argument("--source_pH", type=float, required=True, help=f"Initial pH of the reference image (between {PH_MIN} and {PH_MAX})")
+    parser.add_argument("--target_pH", type=float, required=True, help=f"Target pH for editing (between {PH_MIN} and {PH_MAX})")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
+    parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
+    parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (optional)")
+    parser.add_argument("--contrast", type=float, default=1.0, help="Contrast strength (optional)")
     
     args = parser.parse_args()
     
     if not os.path.exists(args.checkpoint):
-        print(f"Chyba: Checkpoint {args.checkpoint} neexistuje.")
+        print(f"Error: Checkpoint {args.checkpoint} does not exist.")
         return
         
     if not os.path.exists(args.ref_image):
-        print(f"Referenční obrázek {args.ref_image} nebyl nalezen. Zkontroluj zadanou cestu.")
+        print(f"Reference image {args.ref_image} not found. Please check the provided path.")
         return
 
     model = ConditionalUNet().to(DEVICE)
@@ -200,9 +172,8 @@ def main():
     os.makedirs("outputs_img2img", exist_ok=True)
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
-    print(f"Načten obrázek s původním rozlišením: {original_size[0]}x{original_size[1]}")
+    print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
     
-    # Použití Sliding Window Inference
     edited_img = edit_image(
         model=model, 
         ref_image=ref_image, 
@@ -222,7 +193,7 @@ def main():
     
     save_path = f"outputs_img2img/edited_pH_{args.target_pH}_str_{args.strength}.png"
     vutils.save_image(edited_crop_for_save, save_path, nrow=1)
-    print(f"Výsledek uložen do: {save_path}")
+    print(f"Result saved to: {save_path}")
 
 if __name__ == "__main__":
     main()
