@@ -73,7 +73,9 @@ def safe_mirror_pad_4d(img_tensor, target_h, target_w):
     return img_tensor[:, :, :target_h, :target_w]
 
 @torch.no_grad()
-def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64):
+def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
+               num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
+               contrast=1.2):
     """
     Upraví obrázek libovolné velikosti pomocí globálního Flow Matching integrátoru 
     kombinovaného s lokálním výpočtem vektorového pole (Sliding Window).
@@ -128,7 +130,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     x_cropped = x[:, :, :h, :w]
     
     out = (x_cropped.clamp(-1, 1) + 1) / 2
-    out_contrasted = torch.pow(out, 1.5) 
+    out_contrasted = torch.pow(out, contrast) 
     
     return out_contrasted
 
@@ -179,6 +181,7 @@ def main():
     parser.add_argument("--contrastive_scale", type=float, default=4.0, help="Síla Contrastive Guidance (dříve cfg_scale)")
     parser.add_argument("--num_steps", type=int, default=100, help="Počet kroků pro úpravu")
     parser.add_argument("--seed", type=int, default=None, help="Náhodný seed pro reprodukovatelnost (volitelné)")
+    parser.add_argument("--contrast", type=float, default=1.0, help="Síla kontrastu (volitelné)")
     
     args = parser.parse_args()
     
