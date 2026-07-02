@@ -128,7 +128,9 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5, n
     x_cropped = x[:, :, :h, :w]
     
     out = (x_cropped.clamp(-1, 1) + 1) / 2
-    return out.clamp(0, 1)
+    out_contrasted = torch.pow(out, 1.5) 
+    
+    return out_contrasted
 
 def visualize_difference(original_tensor, edited_tensor, original_size):
     """Zobrazí matplotlib okno s originálem, výsledkem a mapou rozdílů."""
