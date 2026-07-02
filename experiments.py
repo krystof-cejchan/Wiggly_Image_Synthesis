@@ -16,7 +16,7 @@ NUM_STEPS = 150
 # 2. MŘÍŽKA PARAMETRŮ
 # ==========================================
 TARGET_PHS = np.arange(4.0, 10.0, 0.2, dtype=np.float64).tolist()
-STRENGTHS = [0.30, 0.35, 0.40, 0.45] 
+STRENGTHS = np.arange(0.4, 0.9, 0.1, dtype=np.float64).tolist()
 SCALES = [3.0, 5.0, 7.0, 9.0, 11.0]
 
 def main():
