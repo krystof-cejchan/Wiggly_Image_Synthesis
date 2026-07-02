@@ -151,6 +151,7 @@ def main():
     parser.add_argument("--target_pH", type=float, required=True, help=f"Target pH for editing (between {PH_MIN} and {PH_MAX})")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
     parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
+    parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (optional)")
     parser.add_argument("--contrast", type=float, default=1.0, help="Contrast strength (optional)")
