@@ -56,8 +56,8 @@ def main():
     BATCH_SIZE = 16
     
     # Fixed edit parameters (must remain locked for objective evaluation)
-    STRENGTH = 0.40
-    SCALE = 5.0
+    STRENGTH = 0.8
+    SCALE = 3.0
     NUM_STEPS = 100
 
     if not os.path.exists(CHECKPOINT_PATH):
