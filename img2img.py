@@ -112,7 +112,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     
     return out_contrasted
 
-def visualize_difference(original_tensor, edited_tensor, original_size):
+def visualize_difference(original_tensor, edited_tensor, original_size, source_pH, target_pH):
     """Visualizes the difference between the original and edited images."""
     orig_w, orig_h = original_size
     orig_crop = original_tensor[:, :, :orig_h, :orig_w]
@@ -127,12 +127,12 @@ def visualize_difference(original_tensor, edited_tensor, original_size):
     
     # original
     axes[0].imshow(orig_img, cmap='gray', vmin=0, vmax=1)
-    axes[0].set_title("Original Image")
+    axes[0].set_title(f"Original Image (pH: {source_pH:.2f})")
     axes[0].axis('off')
     
     # result
     axes[1].imshow(edit_img, cmap='gray', vmin=0, vmax=1)
-    axes[1].set_title("Edited with Model")
+    axes[1].set_title(f"Edited Image (pH: {target_pH:.2f})")
     axes[1].axis('off')
 
     im_diff = axes[2].imshow(diff_map, cmap='inferno', vmin=0, vmax=1)
@@ -187,7 +187,7 @@ def main():
         contrast=args.contrast
     )
     
-    visualize_difference(ref_image, edited_img, original_size)
+    visualize_difference(ref_image, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
     
     orig_w, orig_h = original_size
     edited_crop_for_save = edited_img[:, :, :orig_h, :orig_w]
