@@ -1,0 +1,2 @@
+download the model at https://uschovna.cz/zasilka/WEUWCRG5AIFFDIH6-ESK/S6XD96Z7ME
+and place it in this directory
