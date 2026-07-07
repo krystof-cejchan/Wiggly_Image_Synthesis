@@ -133,7 +133,7 @@ def main():
             denoising_strength=STRENGTH,
             num_steps=NUM_STEPS,
             contrastive_scale=SCALE,
-            contrast=1.0  # VYPÍNÁ ZTMAVENÍ OBRAZU
+            contrast=1.0  
         )
         
         fake_images_metric = prepare_images_for_metric(edited_batch)
@@ -144,7 +144,6 @@ def main():
     
     print("=" * 60)
     print(f"Výsledné KID skóre (Překlad {SOURCE_PH} -> {TARGET_PH})")
-    # Skóre se obvykle násobí 100 pro lepší čitelnost, protože nabývá velmi malých hodnot
     print(f"KID (x100): {kid_mean.item() * 100:.4f} ± {kid_std.item() * 100:.4f}")
     print(f"Fixed parameters used: Strength={STRENGTH}, Scale={SCALE}, Steps={NUM_STEPS}, Contrast=1.0")
     print("=" * 60)
