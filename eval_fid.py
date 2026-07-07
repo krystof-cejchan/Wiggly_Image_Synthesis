@@ -74,14 +74,18 @@ def main():
     # 2. Process REAL images
     print(f"\n--- Extracting features from real images (pH {TARGET_PH}) ---")
     # Use the dataset that loads all images (is_train does not matter, we do not need augmentations)
-    dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
+    dataset = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
     
-    # Filter the dataset to the requested pH value only
     filtered_samples = [item for item in dataset.samples if abs(item[1] - TARGET_PH) < 0.1]
-    dataset.samples = filtered_samples[:NUM_SAMPLES]  # Limit to the desired number
+    dataset.samples = filtered_samples[:NUM_SAMPLES]
     
     actual_num_samples = len(dataset.samples)
-    print(f"Found {actual_num_samples} real images for pH {TARGET_PH}.")
+    print(f"Nalezeno {actual_num_samples} reálných obrázků pro pH {TARGET_PH}.")
+    
+    if actual_num_samples < 2:
+        print(f"Kritická chyba: Pro výpočet FID je potřeba minimálně 2 obrázků. "
+              f"Zkontrolujte cestu {DATA_DIR} a složku pro pH {TARGET_PH}.")
+        return
     
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
