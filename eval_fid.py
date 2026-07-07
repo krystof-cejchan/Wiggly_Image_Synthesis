@@ -81,11 +81,10 @@ def main():
     dataset.samples = filtered_samples[:NUM_SAMPLES]
     
     actual_num_samples = len(dataset.samples)
-    print(f"Nalezeno {actual_num_samples} reálných obrázků pro pH {TARGET_PH}.")
+    print(f"Found {actual_num_samples} real images for pH {TARGET_PH} (requested {NUM_SAMPLES}).")
     
     if actual_num_samples < 2:
-        print(f"Kritická chyba: Pro výpočet FID je potřeba minimálně 2 obrázků. "
-              f"Zkontrolujte cestu {DATA_DIR} a složku pro pH {TARGET_PH}.")
+        print(f"Error: Not enough real images found for pH {TARGET_PH} to compute FID. At least 2 are required.")
         return
     
     dataloader = DataLoader(
