@@ -5,6 +5,11 @@ Wiggly Image Synthesis
 
 The main inference script allows you to take an existing microtubule image, define its current pH, and synthesize how it would look at a target pH. It uses a global ODE integrator combined with a sliding window approach for the vector field to handle arbitrarily large and wide aspect ratios.
 
+Before running, download the trained model:
+```txt
+checkpoints/download_trained_model.txt
+```
+
 cmd:
 ```bash
 python3 img2img.py --ref_image data/cropped/cropped_output/5.8/20260219_005_Ch3_pos2_MES_pH5_frame0000_crop00.png --source_pH 5.8 --target_pH 9.8 --num_steps 100 --strength 0.85 --contrast 2 --contrastive_scale 3.0
