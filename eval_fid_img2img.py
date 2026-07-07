@@ -10,7 +10,7 @@ from dataset import MicrotubuleDataset
 
 # imports from local files
 from train import val_collate_fn
-from img2img import edit_image  # use edit_image instead of sample
+from img2img import edit_image  
 from sample import normalize_pH
 
 def prepare_images_for_fid(img_tensor):
@@ -43,7 +43,9 @@ def warmup_gpu(model, num_runs=5):
 
 @torch.no_grad()
 def main():
+    # ==========================================
     # 1. Configuration
+    # ==========================================
     CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
     DATA_DIR = "data/cropped/cropped_output"
     
@@ -53,10 +55,12 @@ def main():
     NUM_SAMPLES = 1000 
     BATCH_SIZE = 16
     
-    # Fixed edit settings for consistent evaluation
-    STRENGTH = 0.8
-    SCALE = 3.0
-    NUM_STEPS = 100
+    # ==========================================
+    # OPTIMALIZOVANÉ PARAMETRY PRO LEPŠÍ FID
+    # ==========================================
+    STRENGTH = 0.40   # Sníženo pro zachování reálné textury pozadí
+    SCALE = 2.0       # Sníženo pro omezení přesaturace pixelů
+    NUM_STEPS = 250   # Zvýšeno pro hladší integraci a méně mikro-šumu
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Error: Checkpoint {CHECKPOINT_PATH} was not found.")
@@ -69,7 +73,9 @@ def main():
     fid = FrechetInceptionDistance(feature=2048, normalize=False).to(DEVICE)
     warmup_gpu(model, num_runs=5)
 
+    # ==========================================
     # 2. Process real target images
+    # ==========================================
     print(f"\n--- Extracting features from real images (pH {TARGET_PH}) ---")
     
     dataset_target = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
@@ -93,7 +99,9 @@ def main():
         real_images_fid = prepare_images_for_fid(real_batch)
         fid.update(real_images_fid, real=True)
 
+    # ==========================================
     # 3. Process generated images from source pH to target pH
+    # ==========================================
     print(f"\n--- Extracting features from synthetic images (translation from pH {SOURCE_PH} to {TARGET_PH}) ---")
     
     dataset_source = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
@@ -131,12 +139,14 @@ def main():
         fake_images_fid = prepare_images_for_fid(edited_batch)
         fid.update(fake_images_fid, real=False)
 
+    # ==========================================
     # 4. Compute FID score
+    # ==========================================
     print("\nComputing translation Fréchet Inception Distance...")
     fid_score = fid.compute()
     print("=" * 60)
     print(f"Final FID score (Translation {SOURCE_PH} -> {TARGET_PH}): {fid_score.item():.4f}")
-    print(f"Fixed parameters used: Strength={STRENGTH}, Scale={SCALE}")
+    print(f"Fixed parameters used: Strength={STRENGTH}, Scale={SCALE}, Steps={NUM_STEPS}")
     print("=" * 60)
 
 if __name__ == "__main__":
