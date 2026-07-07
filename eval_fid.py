@@ -9,6 +9,7 @@ from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 from sample import sample, normalize_pH  # Uses your existing noise generation function
+from train import val_collate_fn
 
 def prepare_images_for_fid(img_tensor):
     """
@@ -87,7 +88,13 @@ def main():
               f"Zkontrolujte cestu {DATA_DIR} a složku pro pH {TARGET_PH}.")
         return
     
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4, 
+        collate_fn=val_collate_fn
+    )
 
     for real_batch, _ in tqdm(dataloader, desc="Real data"):
         real_batch = real_batch.to(DEVICE)
