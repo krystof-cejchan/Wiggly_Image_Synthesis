@@ -50,8 +50,8 @@ def warmup_gpu(model, num_runs=5):
 @torch.no_grad()
 def main():
     # 1. Configuration
-    CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
-    DATA_DIR = "data/cropped/cropped_output"
+    CHECKPOINT_PATH = "./checkpoints/cfm_best_ema.pt"
+    DATA_DIR = "./data/cropped/cropped_output"
     TARGET_PH = 8.8  # Evaluate at a specific pH value
     BATCH_SIZE = 16
     NUM_SAMPLES = 1000  # For a meaningful FID, use at least 1000+ images
