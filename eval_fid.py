@@ -8,35 +8,27 @@ from tqdm import tqdm
 from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
-from sample import sample, normalize_pH  # Uses your existing noise generation function
+from sample import sample, normalize_pH  # normalize_pH is used by the model inputs
 from train import val_collate_fn
 
 def prepare_images_for_fid(img_tensor):
-    """
-    Prepare tensors for the InceptionV3 network.
-    InceptionV3 requires:
-    1. 3 color channels (RGB) - duplicate the single grayscale channel
-    2. torch.uint8 format in the [0, 255] range
-    """
-    # If the image is in [-1, 1] range (dataset output), convert it to [0, 1]
+    """Convert image tensors to the format used by InceptionV3."""
+    # If the image is in [-1, 1], rescale it to [0, 1]
     if img_tensor.min() < 0:
         img_tensor = (img_tensor.clamp(-1, 1) + 1) / 2
         
-    # Convert to [0, 255] and uint8
+    # Map values to 0-255 and switch to uint8
     img_tensor = (img_tensor * 255).to(torch.uint8)
     
-    # Duplicate the single channel to 3 channels (B, 3, H, W)
+    # If the image is grayscale, duplicate it across RGB channels
     if img_tensor.shape[1] == 1:
         img_tensor = img_tensor.repeat(1, 3, 1, 1)
         
     return img_tensor
 
 def warmup_gpu(model, num_runs=5):
-    """
-    Ensures a rigorous evaluation procedure.
-    Runs warm-up iterations to stabilize GPU clocks and memory before measurement and generation.
-    """
-    print(f"Running {num_runs} warm-up iterations to stabilize hardware...")
+    """Run a few warm-up passes so the GPU settles before timed operations."""
+    print(f"Running {num_runs} warm-up iterations...")
     model.eval()
     dummy_x = torch.randn(2, 1, 128, 128, device=DEVICE)
     dummy_t = torch.rand(2, device=DEVICE)
@@ -53,9 +45,9 @@ def main():
     # 1. Configuration
     CHECKPOINT_PATH = "./checkpoints/cfm_best_ema.pt"
     DATA_DIR = "./data/cropped/cropped_output"
-    TARGET_PH = 8.8  # Evaluate at a specific pH value
+    TARGET_PH = 8.8  # pH value to evaluate
     BATCH_SIZE = 16
-    NUM_SAMPLES = 1000  # For a meaningful FID, use at least 1000+ images
+    NUM_SAMPLES = 1000  # aim for 1000+ images for a reliable FID
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Error: Checkpoint {CHECKPOINT_PATH} was not found.")
@@ -66,15 +58,15 @@ def main():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval()
 
-    # Initialize FID metric (feature=2048 is the standard Inception output layer)
+    # Initialize FID metric
     fid = FrechetInceptionDistance(feature=2048, normalize=False).to(DEVICE)
 
-    # Warm up hardware for rigorous benchmarking
+    # Warm up the model and GPU before we start collecting stats
     warmup_gpu(model, num_runs=5)
 
-    # 2. Process REAL images
+    # 2. Process real images
     print(f"\n--- Extracting features from real images (pH {TARGET_PH}) ---")
-    # Use the dataset that loads all images (is_train does not matter, we do not need augmentations)
+    # Load the evaluation set without training augmentations
     dataset = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
     
     filtered_samples = [item for item in dataset.samples if abs(item[1] - TARGET_PH) < 0.1]
@@ -100,7 +92,7 @@ def main():
         real_images_fid = prepare_images_for_fid(real_batch)
         fid.update(real_images_fid, real=True)
 
-    # Process SYNTHETIC images
+    # Process synthetic images
     print(f"\n--- Generating and extracting features from synthetic images (pH {TARGET_PH}) ---")
     num_batches = (actual_num_samples + BATCH_SIZE - 1) // BATCH_SIZE
 

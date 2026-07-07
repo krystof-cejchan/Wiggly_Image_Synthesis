@@ -8,13 +8,13 @@ from config import DEVICE
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 
-# IMPORTS FROM YOUR FILES
+# imports from local files
 from train import val_collate_fn
-from img2img import edit_image  # Now using edit_image instead of sample
+from img2img import edit_image  # use edit_image instead of sample
 from sample import normalize_pH
 
 def prepare_images_for_fid(img_tensor):
-    """Prepare tensors for InceptionV3 (convert to RGB and uint8)."""
+    """Prepare images for FID: convert grayscale to RGB and map to uint8."""
     if img_tensor.min() < 0:
         img_tensor = (img_tensor.clamp(-1, 1) + 1) / 2
         
@@ -26,7 +26,7 @@ def prepare_images_for_fid(img_tensor):
     return img_tensor
 
 def warmup_gpu(model, num_runs=5):
-    """Warm-up iterations to stabilize hardware before measurement."""
+    """Run a few warm-up passes so GPU timing and memory stabilize."""
     print(f"Running {num_runs} warm-up iterations...")
     model.eval()
     dummy_x = torch.randn(2, 1, 128, 128, device=DEVICE)
@@ -43,19 +43,17 @@ def warmup_gpu(model, num_runs=5):
 
 @torch.no_grad()
 def main():
-    # ==========================================
-    # 1. CONFIGURATION (LOCKED PARAMETERS)
-    # ==========================================
+    # 1. Configuration
     CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
     DATA_DIR = "data/cropped/cropped_output"
     
-    # Settings for Translation FID
-    SOURCE_PH = 5.8   # Source pH value
-    TARGET_PH = 8.8   # Target pH value
+    # Translation FID settings
+    SOURCE_PH = 5.8   # starting pH
+    TARGET_PH = 8.8   # target pH
     NUM_SAMPLES = 1000 
     BATCH_SIZE = 16
     
-    # Fixed edit parameters (must remain locked for objective evaluation)
+    # Fixed edit settings for consistent evaluation
     STRENGTH = 0.8
     SCALE = 3.0
     NUM_STEPS = 100
@@ -71,10 +69,8 @@ def main():
     fid = FrechetInceptionDistance(feature=2048, normalize=False).to(DEVICE)
     warmup_gpu(model, num_runs=5)
 
-    # ==========================================
-    # 2. PROCESS REAL IMAGES (TARGET pH)
-    # ==========================================
-    print(f"\n--- Extracting features from REAL images (pH {TARGET_PH}) ---")
+    # 2. Process real target images
+    print(f"\n--- Extracting features from real images (pH {TARGET_PH}) ---")
     
     dataset_target = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
     target_samples = [item for item in dataset_target.samples if abs(item[1] - TARGET_PH) < 0.1]
@@ -97,15 +93,13 @@ def main():
         real_images_fid = prepare_images_for_fid(real_batch)
         fid.update(real_images_fid, real=True)
 
-    # ==========================================
-    # 3. PROCESS GENERATED IMAGES (I2I TRANSLATION)
-    # ==========================================
-    print(f"\n--- Extracting features from SYNTHETIC images (Translation from pH {SOURCE_PH} to {TARGET_PH}) ---")
+    # 3. Process generated images from source pH to target pH
+    print(f"\n--- Extracting features from synthetic images (translation from pH {SOURCE_PH} to {TARGET_PH}) ---")
     
     dataset_source = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
     source_samples = [item for item in dataset_source.samples if abs(item[1] - SOURCE_PH) < 0.1]
     
-    # Limit the source dataset to match the target set size for a fair comparison
+    # limit the source set to the same size as the target set for a fair comparison
     dataset_source.samples = source_samples[:actual_target_samples]
     
     actual_source_samples = len(dataset_source.samples)
@@ -123,7 +117,7 @@ def main():
     for source_batch, _ in tqdm(dataloader_source, desc="Synthetic data (Translation)"):
         source_batch = source_batch.to(DEVICE)
         
-        # Perform editing using your function from img2img.py
+        # run the image edit step from img2img.py
         edited_batch = edit_image(
             model=model,
             ref_image=source_batch,
@@ -137,9 +131,7 @@ def main():
         fake_images_fid = prepare_images_for_fid(edited_batch)
         fid.update(fake_images_fid, real=False)
 
-    # ==========================================
-    # 4. COMPUTE SCORE
-    # ==========================================
+    # 4. Compute FID score
     print("\nComputing translation Fréchet Inception Distance...")
     fid_score = fid.compute()
     print("=" * 60)
