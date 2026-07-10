@@ -89,7 +89,8 @@ def main():
     # KID běžně počítá v dávkách (subsetech) po 50 nebo 100.
     # Pokud máme méně fotek než 50, musíme subset omezit na jejich celkový počet, jinak by metrika spadla.
     subset_size = min(actual_target_samples, 50)
-    kid = KernelInceptionDistance(feature=2048, subset_size=subset_size, normalize=False).to(DEVICE)
+    # A) feature=64 místo 2048: nižší dimenze = nižší rozptyl KID (viz DOPORUCENI_METRIKY.md)
+    kid = KernelInceptionDistance(feature=64, subset_size=subset_size, normalize=False).to(DEVICE)
 
     dataloader_target = DataLoader(
         dataset_target, batch_size=BATCH_SIZE, shuffle=False, 

@@ -70,7 +70,8 @@ def main():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval()
 
-    fid = FrechetInceptionDistance(feature=2048, normalize=False).to(DEVICE)
+    # A) feature=64 místo 2048 (viz DOPORUCENI_METRIKY.md)
+    fid = FrechetInceptionDistance(feature=64, normalize=False).to(DEVICE)
     warmup_gpu(model, num_runs=5)
 
     # ==========================================
@@ -133,7 +134,8 @@ def main():
             target_pH=TARGET_PH,
             denoising_strength=STRENGTH,
             num_steps=NUM_STEPS,
-            contrastive_scale=SCALE
+            contrastive_scale=SCALE,
+            contrast=1.0,  # bugfix: reálné obrázky kontrast nedostávají, default 1.2 zkresloval FID
         )
         
         fake_images_fid = prepare_images_for_fid(edited_batch)
