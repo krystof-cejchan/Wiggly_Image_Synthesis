@@ -11,9 +11,9 @@ SOURCE_PH = 5.8
 NUM_STEPS = 150  
 
 
-TARGET_PHS = np.arange(4.0, 10.0, 0.2, dtype=np.float64).tolist()
-STRENGTHS = np.arange(0.4, 0.9, 0.1, dtype=np.float64).tolist()
-SCALES = [3.0, 5.0, 7.0, 9.0, 11.0]
+TARGET_PHS = {5.8,6.8,7.8,8.8}
+STRENGTHS = {0.8}
+SCALES = [1.0]
 
 def main():
     exp_dir = "outputs_img2img/experiments"
