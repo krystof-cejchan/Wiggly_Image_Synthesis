@@ -134,7 +134,7 @@ def evaluate(model, dataloader, num_noise_samples=3):
     model.train()
     return total_loss / len(dataloader)
 
-def seed_worker():
+def seed_worker(worker_id): 
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
