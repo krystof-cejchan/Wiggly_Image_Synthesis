@@ -15,7 +15,8 @@ from dataset import MicrotubuleDataset
 
 # hyperparameters
 DATA_DIR = "data/cropped/cropped_output"
-BATCH_SIZE = 64
+BATCH_SIZE = 16          
+ACCUMULATION_STEPS = 4  
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.2
@@ -206,16 +207,21 @@ def main():
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
                 pred = model(xt, t, pH_input)
                 loss = F.mse_loss(pred, target)
+                
+            loss = loss / ACCUMULATION_STEPS
             
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-                    p_ema.mul_(0.9999).add_(p, alpha=0.0001)
+            if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == ITERATIONS:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad() 
+                
+                with torch.no_grad():
+                    for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                        p_ema.mul_(0.9999).add_(p, alpha=0.0001)
             
             # early stopping
             if step > 0 and step % EVAL_INTERVAL == 0:
