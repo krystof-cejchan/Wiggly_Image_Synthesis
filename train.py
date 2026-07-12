@@ -23,7 +23,7 @@ EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42
-TRAIN_SIZES = [(128, 128), (64, 256), (256, 64), (48, 384), (80, 192)]
+TRAIN_SIZES = [(128, 128), (256, 256), (384, 384), (256, 384), (384, 256)]
 
 def set_seed(seed):
     """Zajistí reprodukovatelnost napříč PyTorch i Pythonem."""
@@ -62,6 +62,8 @@ def dynamic_collate_fn(batch):
     
     transform = T.Compose([
         T.RandomCrop((target_h, target_w)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.5),
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
     
