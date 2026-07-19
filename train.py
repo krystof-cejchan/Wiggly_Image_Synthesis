@@ -199,9 +199,7 @@ def main():
             
             drop_mask = torch.rand(x1.shape[0], device=DEVICE) < CFG_DROPOUT
             pH_input = torch.where(drop_mask, torch.full_like(pH, float("nan")), pH)
-            
-            optimizer.zero_grad()
-            
+                        
           
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
