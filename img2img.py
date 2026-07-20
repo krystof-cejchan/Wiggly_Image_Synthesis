@@ -54,62 +54,79 @@ def safe_mirror_pad_4d(img_tensor, target_h, target_w):
 @torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
-               contrast=1.2):
+               contrast=1.2, solver="heun"):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
+
+    solver: "euler" (1st order) or "heun" (2nd order predictor-corrector). Heun evaluates
+    the velocity field twice per step (2x model calls) but has O(dt^2) local error instead
+    of O(dt), which reduces integration drift over the num_steps trajectory.
     """
     if seed is not None:
         torch.manual_seed(seed)
-        
+
     pH_source_norm = normalize_pH(torch.tensor([source_pH])).to(DEVICE)
     pH_target_norm = normalize_pH(torch.tensor([target_pH])).to(DEVICE)
-    
+
     _, _, h, w = ref_image.shape
-    
+
     target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
     target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
-    
+
     padded_ref = safe_mirror_pad_4d(ref_image, target_h, target_w)
-    
+
     t_start = 1.0 - denoising_strength
     noise = torch.randn_like(padded_ref)
-    x = (1 - t_start) * noise + t_start * padded_ref  
-    
+    x = (1 - t_start) * noise + t_start * padded_ref
+
     start_step = int(t_start * num_steps)
     mask = create_blending_mask(window_size, ref_image.device)
-    
-    for i in range(start_step, num_steps):
-        t = torch.full((1,), i / num_steps, device=DEVICE)
-        
-        progress = (i - start_step) / max(1, num_steps - start_step)
+
+    def compute_v_dir(x_in, step_idx):
+        """Velocity field at (x_in, t=step_idx/num_steps), blended across sliding windows."""
+        t = torch.full((1,), step_idx / num_steps, device=DEVICE)
+
+        progress = (step_idx - start_step) / max(1, num_steps - start_step)
         current_scale = contrastive_scale * (1.0 - progress) + 1.0 * progress
-        
-        v_source_global = torch.zeros_like(x)
-        v_target_global = torch.zeros_like(x)
-        weight_global = torch.zeros_like(x)
-        
+
+        v_source_global = torch.zeros_like(x_in)
+        v_target_global = torch.zeros_like(x_in)
+        weight_global = torch.zeros_like(x_in)
+
         for y in range(0, target_h - window_size + 1, stride):
             for x_idx in range(0, target_w - window_size + 1, stride):
-                x_patch = x[:, :, y:y+window_size, x_idx:x_idx+window_size]
-                
+                x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
+
                 v_src_patch = model(x_patch, t, pH_source_norm)
                 v_tgt_patch = model(x_patch, t, pH_target_norm)
-                
+
                 v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
                 v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
                 weight_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += mask
-        
+
         v_source = v_source_global / weight_global.clamp(min=1e-8)
         v_target = v_target_global / weight_global.clamp(min=1e-8)
-        
-        v_dir = v_source + current_scale * (v_target - v_source)        
-        x = x + v_dir * (1.0 / num_steps)
-    
+
+        return v_source + current_scale * (v_target - v_source)
+
+    dt = 1.0 / num_steps
+    for i in range(start_step, num_steps):
+        v1 = compute_v_dir(x, i)
+
+        if solver == "euler":
+            x = x + v1 * dt
+        elif solver == "heun":
+            x_pred = x + v1 * dt
+            v2 = compute_v_dir(x_pred, i + 1)
+            x = x + 0.5 * (v1 + v2) * dt
+        else:
+            raise ValueError(f"Unknown solver: {solver!r} (expected 'euler' or 'heun')")
+
     x_cropped = x[:, :, :h, :w]
-    
+
     out = (x_cropped.clamp(-1, 1) + 1) / 2
-    out_contrasted = torch.pow(out, contrast) 
-    
+    out_contrasted = torch.pow(out, contrast)
+
     return out_contrasted
 
 def visualize_difference(original_tensor, edited_tensor, original_size, source_pH, target_pH):
@@ -155,7 +172,8 @@ def main():
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (optional)")
     parser.add_argument("--contrast", type=float, default=1.0, help="Contrast strength (optional)")
-    
+    parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
+
     args = parser.parse_args()
     
     if not os.path.exists(args.checkpoint):
@@ -184,7 +202,8 @@ def main():
         num_steps=args.num_steps,
         contrastive_scale=args.contrastive_scale,         
         seed=args.seed,
-        contrast=args.contrast
+        contrast=args.contrast,
+        solver=args.solver
     )
     
     visualize_difference(ref_image, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)

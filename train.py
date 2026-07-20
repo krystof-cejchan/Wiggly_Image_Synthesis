@@ -1,7 +1,8 @@
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from collections import Counter
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from copy import deepcopy
@@ -147,12 +148,21 @@ def main():
     
     train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True)
     val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
-    
+
+    # pH buckets are heavily imbalanced (e.g. 36 vs 136 images) - weight samples by
+    # inverse pH-bucket frequency so each pH gets roughly equal gradient signal.
+    train_phs = [ph for _, ph in train_dataset.samples]
+    ph_counts = Counter(train_phs)
+    train_sample_weights = [1.0 / ph_counts[ph] for ph in train_phs]
+    train_sampler = WeightedRandomSampler(
+        train_sample_weights, num_samples=len(train_dataset), replacement=True, generator=g
+    )
+
     train_dataloader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+        train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
         num_workers=4, drop_last=True,
         worker_init_fn=seed_worker, generator=g,
-        collate_fn=dynamic_collate_fn  
+        collate_fn=dynamic_collate_fn
     )
     
     val_dataloader = DataLoader(
