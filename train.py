@@ -20,7 +20,10 @@ BATCH_SIZE = 64
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.2
-EVAL_INTERVAL = 500  
+PH_JITTER_STD = 0.15  # pH buckets are sparse and unevenly spaced (0.2-1.0 apart) - jittering
+                      # the label each step teaches the model that nearby pH values should look
+                      # similar, which is the interpolation signal the discrete buckets alone don't provide
+EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42
@@ -195,8 +198,10 @@ def main():
                 break
                 
             x1 = x_batch.to(DEVICE)
-            pH = normalize_pH(pH_batch.to(DEVICE).float())
-            
+            pH_raw = pH_batch.to(DEVICE).float()
+            pH_jittered = (pH_raw + torch.randn_like(pH_raw) * PH_JITTER_STD).clamp(PH_MIN, PH_MAX)
+            pH = normalize_pH(pH_jittered)
+
             x0 = torch.randn_like(x1)
             t = torch.rand(x1.shape[0], device=DEVICE)
             
