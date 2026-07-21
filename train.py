@@ -16,7 +16,8 @@ from dataset import MicrotubuleDataset
 
 # hyperparameters
 DATA_DIR = "data/cropped/cropped_output"
-BATCH_SIZE = 64
+BATCH_SIZE = 16          
+ACCUMULATION_STEPS = 4  
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.2
@@ -27,7 +28,7 @@ EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42
-TRAIN_SIZES = [(128, 128), (64, 256), (256, 64), (48, 384), (80, 192)]
+TRAIN_SIZES = [(128, 128), (256, 256), (384, 384), (256, 384), (384, 256)]
 
 def set_seed(seed):
     """Zajistí reprodukovatelnost napříč PyTorch i Pythonem."""
@@ -66,6 +67,8 @@ def dynamic_collate_fn(batch):
     
     transform = T.Compose([
         T.RandomCrop((target_h, target_w)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.5),
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
     
@@ -211,24 +214,27 @@ def main():
             
             drop_mask = torch.rand(x1.shape[0], device=DEVICE) < CFG_DROPOUT
             pH_input = torch.where(drop_mask, torch.full_like(pH, float("nan")), pH)
-            
-            optimizer.zero_grad()
-            
+                        
           
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
                 pred = model(xt, t, pH_input)
                 loss = F.mse_loss(pred, target)
+                
+            loss = loss / ACCUMULATION_STEPS
             
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-                    p_ema.mul_(0.9999).add_(p, alpha=0.0001)
+            if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == ITERATIONS:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad() 
+                
+                with torch.no_grad():
+                    for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                        p_ema.mul_(0.9999).add_(p, alpha=0.0001)
             
             # early stopping
             if step > 0 and step % EVAL_INTERVAL == 0:

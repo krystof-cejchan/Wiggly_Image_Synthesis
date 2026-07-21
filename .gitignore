@@ -4,3 +4,4 @@ __pycache__/**
 checkpoints/cfm_best_ema.pt
 checkpoints/unused/**
 CLAUDE.md
+cfm_best_ema.pt
