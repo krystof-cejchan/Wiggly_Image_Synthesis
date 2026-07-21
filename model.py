@@ -210,7 +210,14 @@ class ConditionalUNet(nn.Module):
         super().__init__()
         
         self.t_embed = ScalarEmbedding(emb_dim)
-        self.pH_embed = ScalarEmbedding(emb_dim)
+        # Lower frequency range than t_embed: t is sampled densely and continuously
+        # over [0,1] during training, but pH only ever takes one of 7 discrete,
+        # unevenly-spaced values. With t_embed's default max_freq=10, even the
+        # smallest real gap between pH buckets (0.2 pH, ~0.13 normalized) is
+        # narrower than the highest frequency's own period (0.2 normalized) - the
+        # embedding is free to oscillate arbitrarily between every pair of buckets,
+        # not just the widest one, with nothing in training to constrain it there.
+        self.pH_embed = ScalarEmbedding(emb_dim, num_freqs=16, max_freq=2.0)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
         
         # mlp projections for time and pH embeddings to produce FiLM parameters

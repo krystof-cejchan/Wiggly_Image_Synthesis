@@ -1,7 +1,8 @@
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from collections import Counter
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from copy import deepcopy
@@ -20,7 +21,10 @@ ACCUMULATION_STEPS = 4
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.2
-EVAL_INTERVAL = 500  
+PH_JITTER_STD = 0.15  # pH buckets are sparse and unevenly spaced (0.2-1.0 apart) - jittering
+                      # the label each step teaches the model that nearby pH values should look
+                      # similar, which is the interpolation signal the discrete buckets alone don't provide
+EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
 SEED = 42
@@ -135,7 +139,7 @@ def evaluate(model, dataloader, num_noise_samples=3):
     model.train()
     return total_loss / len(dataloader)
 
-def seed_worker(worker_id): 
+def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -150,12 +154,21 @@ def main():
     
     train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True)
     val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
-    
+
+    # pH buckets are heavily imbalanced (e.g. 36 vs 136 images) - weight samples by
+    # inverse pH-bucket frequency so each pH gets roughly equal gradient signal.
+    train_phs = [ph for _, ph in train_dataset.samples]
+    ph_counts = Counter(train_phs)
+    train_sample_weights = [1.0 / ph_counts[ph] for ph in train_phs]
+    train_sampler = WeightedRandomSampler(
+        train_sample_weights, num_samples=len(train_dataset), replacement=True, generator=g
+    )
+
     train_dataloader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+        train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
         num_workers=4, drop_last=True,
         worker_init_fn=seed_worker, generator=g,
-        collate_fn=dynamic_collate_fn  
+        collate_fn=dynamic_collate_fn
     )
     
     val_dataloader = DataLoader(
@@ -188,8 +201,10 @@ def main():
                 break
                 
             x1 = x_batch.to(DEVICE)
-            pH = normalize_pH(pH_batch.to(DEVICE).float())
-            
+            pH_raw = pH_batch.to(DEVICE).float()
+            pH_jittered = (pH_raw + torch.randn_like(pH_raw) * PH_JITTER_STD).clamp(PH_MIN, PH_MAX)
+            pH = normalize_pH(pH_jittered)
+
             x0 = torch.randn_like(x1)
             t = torch.rand(x1.shape[0], device=DEVICE)
             
