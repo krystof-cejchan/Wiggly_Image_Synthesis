@@ -75,9 +75,9 @@ def main():
     # ==========================================
     # OPTIMALIZOVANÉ PARAMETRY PRO LEPŠÍ FID
     # ==========================================
-    STRENGTH = 0.40   # Sníženo pro zachování reálné textury pozadí
-    SCALE = 2.0       # Sníženo pro omezení přesaturace pixelů
-    NUM_STEPS = 250   # Zvýšeno pro hladší integraci a méně mikro-šumu
+    STRENGTH = 0.80   # Sníženo pro zachování reálné textury pozadí
+    SCALE = 5.0       # Sníženo pro omezení přesaturace pixelů
+    NUM_STEPS = 100   # Zvýšeno pro hladší integraci a méně mikro-šumu
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Error: Checkpoint {CHECKPOINT_PATH} was not found.")

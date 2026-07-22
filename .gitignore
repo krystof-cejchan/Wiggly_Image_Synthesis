@@ -1,6 +1,6 @@
 wiggly_venv/**
 venv/**
-__pycache__/**
+__pycache__/
 checkpoints/cfm_best_ema.pt
 checkpoints/unused/**
 CLAUDE.md

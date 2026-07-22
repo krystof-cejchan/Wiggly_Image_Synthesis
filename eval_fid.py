@@ -1,15 +1,33 @@
 import os
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import PH_MIN, PH_MAX, DEVICE
+from config import DEVICE
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 from sample import sample, normalize_pH  # normalize_pH is used by the model inputs
-from train import val_collate_fn
+from img2img import load_and_preprocess_image
+
+# Crops this thin need to be almost entirely mirror-hallucinated to reach any
+# usable size, so they'd dominate a small-sample metric with synthetic content
+# rather than real structure. Drop them, matching eval_fid_img2img.py.
+MIN_SIDE = 32
+
+def filter_paths(samples, ph, limit=None):
+    """Collect image paths for one pH bucket, dropping crops too small to
+    evaluate without being mostly synthetic mirror-padding."""
+    paths = [path for path, s_ph in samples if abs(s_ph - ph) < 0.1]
+    kept, skipped = [], 0
+    for path in paths:
+        _, (w, h) = load_and_preprocess_image(path)
+        if min(w, h) < MIN_SIDE:
+            skipped += 1
+        else:
+            kept.append(path)
+    if skipped:
+        print(f"Skipped {skipped} crop(s) below MIN_SIDE={MIN_SIDE}px for pH {ph}.")
+    return kept[:limit] if limit else kept
 
 def prepare_images_for_fid(img_tensor):
     """Convert image tensors to the format used by InceptionV3."""
@@ -73,28 +91,26 @@ def main():
     print(f"\n--- Extracting features from real images (pH {TARGET_PH}) ---")
     # Load the evaluation set without training augmentations
     dataset = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
-    
-    filtered_samples = [item for item in dataset.samples if abs(item[1] - TARGET_PH) < 0.1]
-    dataset.samples = filtered_samples[:NUM_SAMPLES]
-    
-    actual_num_samples = len(dataset.samples)
-    print(f"Found {actual_num_samples} real images for pH {TARGET_PH} (requested {NUM_SAMPLES}).")
-    
+
+    real_paths = filter_paths(dataset.samples, TARGET_PH, limit=NUM_SAMPLES)
+    actual_num_samples = len(real_paths)
+    print(f"Found {actual_num_samples} real images for pH {TARGET_PH} (requested up to {NUM_SAMPLES}).")
+
     if actual_num_samples < 2:
         print(f"Error: Not enough real images found for pH {TARGET_PH} to compute FID. At least 2 are required.")
         return
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=4, 
-        collate_fn=val_collate_fn
-    )
 
-    for real_batch, _ in tqdm(dataloader, desc="Real data"):
-        real_batch = real_batch.to(DEVICE)
-        real_images_fid = prepare_images_for_fid(real_batch)
+    # NOTE: evaluated at NATIVE resolution, one image at a time - not squashed
+    # through train.py's val_collate_fn. Real crops are thin strips (median
+    # ~40px tall), so mirror-padding them up to a 128x128 square meant most of
+    # each "real" sample was an exact mirrored duplicate of itself, an artifact
+    # the synthetic samples below (generated natively at 128x128, no padding)
+    # never have. FID's built-in Inception extractor resizes every update()
+    # call to 299x299 internally regardless of input shape, so per-image native
+    # sizes here are fine even though the synthetic batch below is fixed-size.
+    for path in tqdm(real_paths, desc="Real data"):
+        real_img, _ = load_and_preprocess_image(path)
+        real_images_fid = prepare_images_for_fid(real_img)
         fid.update(real_images_fid, real=True)
 
     # Process synthetic images
