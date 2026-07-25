@@ -21,9 +21,13 @@ ACCUMULATION_STEPS = 4
 LR = 1e-4
 ITERATIONS = 100_000
 CFG_DROPOUT = 0.2
-PH_JITTER_STD = 0.15  # pH buckets are sparse and unevenly spaced (0.2-1.0 apart) - jittering
-                      # the label each step teaches the model that nearby pH values should look
-                      # similar, which is the interpolation signal the discrete buckets alone don't provide
+PH_JITTER_STD = 0.08  # pH buckets are unevenly spaced (0.2-1.0 apart) - jittering the label
+                      # each step teaches the model that nearby pH values should look similar,
+                      # the interpolation signal the discrete buckets alone don't provide. Keep
+                      # this small relative to the TIGHTEST real gap (7.2->7.4 is only 0.2): a
+                      # wider std (previously 0.15) bleeds across adjacent buckets in the densely
+                      # packed 5.8-7.8 range and flattens the pH->waviness response there, while
+                      # barely reaching into the one big outlier gap (7.8->8.8) anyway.
 EVAL_INTERVAL = 500
 PATIENCE = 5        
 MIN_DELTA = 1e-5     
