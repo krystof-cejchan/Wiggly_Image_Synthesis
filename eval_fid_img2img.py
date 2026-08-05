@@ -64,7 +64,7 @@ def main():
     # ==========================================
     # 1. Configuration
     # ==========================================
-    CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
+    CHECKPOINT_PATH = "checkpoints/cfm_best_emav2.pt"
     DATA_DIR = "data/cropped/cropped_output"
 
     # Translation FID settings
@@ -75,9 +75,9 @@ def main():
     # ==========================================
     # OPTIMALIZOVANÉ PARAMETRY PRO LEPŠÍ FID
     # ==========================================
-    STRENGTH = 0.40   # Sníženo pro zachování reálné textury pozadí
-    SCALE = 2.0       # Sníženo pro omezení přesaturace pixelů
-    NUM_STEPS = 250   # Zvýšeno pro hladší integraci a méně mikro-šumu
+    STRENGTH = 0.70   # Sníženo pro zachování reálné textury pozadí
+    SCALE = 4.0       # Sníženo pro omezení přesaturace pixelů
+    NUM_STEPS = 100   # Zvýšeno pro hladší integraci a méně mikro-šumu
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Error: Checkpoint {CHECKPOINT_PATH} was not found.")
