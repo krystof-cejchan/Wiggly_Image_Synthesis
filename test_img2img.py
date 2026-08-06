@@ -25,7 +25,8 @@ import torchvision.utils as vutils
 from PIL import Image
 
 from config import PH_MIN, PH_MAX, DEVICE
-from img2img import edit_image, load_and_preprocess_image
+from img2img import (edit_image, load_and_preprocess_image, repair_fibre_gaps,
+                     save_repair_diagnostic)
 from model import ConditionalUNet
 
 DATA_DIR = "data/cropped/cropped_output"
@@ -105,7 +106,8 @@ def save_comparison(orig_img, results, out_path, source_pH, target_pH, src_name,
 
     fig.suptitle(
         f"img2img sweep - strength={args.strength:g}, steps={args.num_steps}, "
-        f"contrast={args.contrast:g}, solver={args.solver}, seed={args.seed}",
+        f"contrast={args.contrast:g} ({args.contrast_mode}), solver={args.solver}, "
+        f"seed={args.seed}{', gaps repaired' if args.repair_gaps else ''}",
         fontsize=10,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.985))
@@ -134,6 +136,11 @@ def main():
                         help="Skip crops shorter than this (they get mirror-tiled into noise)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"])
+    parser.add_argument("--contrast_mode", type=str, default="linear", choices=["linear", "gamma"],
+                        help="'linear' preserves mean brightness; 'gamma' reproduces older runs")
+    parser.add_argument("--repair_gaps", action="store_true",
+                        help="Bridge short bright breaks in the fibre before editing (off by "
+                             "default; writes a before/after diagnostic per source)")
     parser.add_argument("--save_raw", action="store_true",
                         help="Also write each generated image as a standalone PNG")
     args = parser.parse_args()
@@ -165,7 +172,18 @@ def main():
         target_pH = args.target_pH if args.target_pH is not None else pick_target_pH(source_pH)
         ref_image, original_size = load_and_preprocess_image(src_path)
         orig_w, orig_h = original_size
+        # the figure always shows the untouched source, even when the anchor was repaired
         orig_img = ((ref_image[0, 0, :orig_h, :orig_w].cpu() + 1) / 2)
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+
+        if args.repair_gaps:
+            repaired, gaps = repair_fibre_gaps(ref_image)
+            if gaps:
+                spans = ", ".join(f"{g['start']}-{g['end']}" for g in gaps)
+                print(f"  repaired {len(gaps)} gap(s) in {stem}: cols {spans}")
+                save_repair_diagnostic(ref_image, repaired, gaps,
+                                       os.path.join(args.out_dir, f"repair_{stem}.png"))
+                ref_image = repaired
 
         results = []
         for scale in args.contrastive_scales:
@@ -181,19 +199,18 @@ def main():
                 seed=args.seed,  # same noise for every scale -> differences are the scale alone
                 contrast=args.contrast,
                 solver=args.solver,
+                contrast_mode=args.contrast_mode,
             )
             gen_img = edited[0, 0, :orig_h, :orig_w].cpu()
             mad = torch.abs(gen_img - orig_img).mean().item()
             results.append((scale, gen_img, mad))
 
-            stem = os.path.splitext(os.path.basename(src_path))[0]
             if args.save_raw:
                 vutils.save_image(edited[:, :, :orig_h, :orig_w],
                                   os.path.join(raw_dir, f"{stem}_cs{scale:g}.png"))
             print(f"  [{run:3d}/{total}] {stem} | pH {source_pH:g}->{target_pH:g} | "
                   f"cs={scale:<4g} | mean|diff|={mad:.4f}")
 
-        stem = os.path.splitext(os.path.basename(src_path))[0]
         out_path = os.path.join(
             args.out_dir, f"cmp_pH{source_pH:g}to{target_pH:g}_{stem}.png")
         save_comparison(orig_img, results, out_path, source_pH, target_pH, stem, args)
