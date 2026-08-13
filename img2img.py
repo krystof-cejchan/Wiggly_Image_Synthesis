@@ -9,11 +9,8 @@ import matplotlib.pyplot as plt
 import torchvision.transforms.v2.functional as TF
 from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
-
-
-def normalize_pH(pH):
-    """normalize pH value to [-1, 1] range based on PH_MIN and PH_MAX"""
-    return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
+from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
+from waviness import box_blur
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -79,12 +76,6 @@ def safe_mirror_pad_4d(img_tensor, target_h, target_w):
     # Crop to the exact target size if it exceeds
     return img_tensor[:, :, :target_h, :target_w]
 
-def _box_blur(img, k=3):
-    """Small box blur used only to locate the fibre - keeps noise from dominating argmin."""
-    pad = k // 2
-    return F.avg_pool2d(F.pad(img, (pad, pad, pad, pad), mode="reflect"), k, stride=1)
-
-
 @torch.no_grad()
 def repair_fibre_gaps(ref_image, max_gap=30, min_side=6, max_slope=1.5, blur=3):
     """Bridge short bright breaks in the fibre, returning (repaired_image, list_of_gaps).
@@ -103,7 +94,7 @@ def repair_fibre_gaps(ref_image, max_gap=30, min_side=6, max_slope=1.5, blur=3):
     survives and only the fibre core darkens.
     """
     device = ref_image.device
-    smooth = _box_blur(ref_image, blur)[0, 0]
+    smooth = box_blur(ref_image, blur)[0, 0]
     height, width = smooth.shape
 
     # per-column background: the fibre is thin relative to the strip, so the column median
@@ -199,19 +190,22 @@ def save_repair_diagnostic(original, repaired, gaps, out_path):
 @torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
-               contrast=1.2, solver="heun", contrast_mode="linear"):
+               contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
+               ph_rescale=False):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
     solver: "euler" (1st order) or "heun" (2nd order predictor-corrector). Heun evaluates
     the velocity field twice per step (2x model calls) but has O(dt^2) local error instead
     of O(dt), which reduces integration drift over the num_steps trajectory.
+
+    Either pH may lie outside the trained range: ph_control.velocity_for_pH extrapolates
+    along the acidic->alkaline direction rather than pushing an out-of-range value through
+    the periodic embedding, which would alias. ph_lambda forces a specific extrapolation
+    strength instead of deriving one from target_pH, and exists for calibrate_ph.py.
     """
     if seed is not None:
         torch.manual_seed(seed)
-
-    pH_source_norm = normalize_pH(torch.tensor([source_pH])).to(DEVICE)
-    pH_target_norm = normalize_pH(torch.tensor([target_pH])).to(DEVICE)
 
     _, _, h, w = ref_image.shape
 
@@ -242,8 +236,10 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
             for x_idx in range(0, target_w - window_size + 1, stride):
                 x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
 
-                v_src_patch = model(x_patch, t, pH_source_norm)
-                v_tgt_patch = model(x_patch, t, pH_target_norm)
+                v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
+                                              rescale=ph_rescale)
+                v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
+                                              rescale=ph_rescale, lam_override=ph_lambda)
 
                 v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
                 v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
@@ -308,8 +304,11 @@ def visualize_difference(original_tensor, edited_tensor, original_size, source_p
 def main():
     parser = argparse.ArgumentParser(description="Image-to-Image pH Editing using Conditional UNet")
     parser.add_argument("--ref_image", type=str, required=True, help="Path to the reference image (e.g., 'data/ref_image.png')")
-    parser.add_argument("--source_pH", type=float, required=True, help=f"Initial pH of the reference image (between {PH_MIN} and {PH_MAX})")
-    parser.add_argument("--target_pH", type=float, required=True, help=f"Target pH for editing (between {PH_MIN} and {PH_MAX})")
+    parser.add_argument("--source_pH", type=float, required=True, help=f"Initial pH of the reference image (trained range {PH_MIN}-{PH_MAX})")
+    parser.add_argument("--target_pH", type=float, required=True,
+                        help=f"Target pH. Values outside the trained range {PH_MIN}-{PH_MAX} "
+                             "are reached by extrapolating along the acidic->alkaline "
+                             "direction; see ph_control.py")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
     parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
     parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
@@ -343,6 +342,7 @@ def main():
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
+    print(describe_pH(args.target_pH))
 
     display_ref = ref_image
     if args.repair_gaps:
