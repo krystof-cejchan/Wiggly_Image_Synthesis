@@ -44,8 +44,9 @@ import math
 import torch
 import torch.nn.functional as F
 
+from config import PH_MAX, PH_MIN
 from ph_control import predicted_waviness
-from waviness import trace_fibre, waviness
+from waviness import box_blur, trace_fibre, waviness
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
 _WL_LOG_SLOPE = -0.2477
@@ -75,30 +76,142 @@ def synth_displacement(width, rms, wavelength, device, generator=None, num_modes
     return d * (rms / std)
 
 
-def shear_rows(img, d, pad, generator=None):
-    """Resample so that out(x, y) = in(x, y - d(x)), padding vertically first.
+def centreline(img, smooth_frac=0.02):
+    """Absolute row position of the filament for every column, or None.
 
-    A wavier filament genuinely needs more room than its original tight bounding box, so
-    the output is taller. The new space is filled with noise matched to the image's own
-    background: mirror padding would fold a copy of the filament into it, and replicating
-    the edge rows smears whatever happens to sit on them into long vertical streaks -
-    these crops are tight bounding boxes, so their edge rows often clip real structure.
+    trace_fibre removes the linear trend, which is right for measuring waviness and wrong
+    here - the warp needs to know where the filament actually sits in the frame.
     """
-    values = img.flatten()
-    background = values[values > values.median()]
-    canvas = (torch.randn(img.shape[0], img.shape[1], img.shape[2] + 2 * pad, img.shape[3],
-                          device=img.device, generator=generator)
-              * background.std() + background.mean())
-    canvas[:, :, pad:pad + img.shape[2], :] = img
-    padded = canvas
-    _, _, h, w = padded.shape
-    ys = torch.arange(h, device=img.device, dtype=torch.float32).view(-1, 1)
-    xs = torch.arange(w, device=img.device, dtype=torch.float32).view(1, -1)
-    src_y = ys - d.view(1, -1)
-    grid = torch.stack([2 * xs.expand(h, w) / max(w - 1, 1) - 1,
-                        2 * src_y / max(h - 1, 1) - 1], dim=-1).unsqueeze(0)
-    return F.grid_sample(padded, grid, mode="bilinear", padding_mode="border",
-                         align_corners=True)
+    import numpy as np
+
+    smoothed = box_blur(img, 3)[0, 0]
+    background = smoothed.median(dim=0).values
+    darkest, path = smoothed.min(dim=0)
+    depth = background - darkest
+    strong = torch.quantile(depth, 0.75)
+    if strong <= 0:
+        return None
+    confident = torch.nonzero(depth > 0.5 * strong).flatten()
+    if confident.numel() < 10:
+        return None
+
+    width = img.shape[3]
+    xs = confident.detach().cpu().numpy()
+    ys = path[confident].detach().cpu().float().numpy()
+    full = np.interp(np.arange(width), xs, ys)
+    kernel = max(5, int(width * smooth_frac) | 1)
+    half = kernel // 2
+    full = np.convolve(np.pad(full, half, mode="edge"),
+                       np.ones(kernel) / kernel, mode="valid")[:width]
+    return torch.from_numpy(full).float().to(img.device)
+
+
+def _synth_background(img, rows, at_top, generator=None):
+    """Synthesise `rows` of background that blends with the edge it is attached to.
+
+    Built as illumination + grain, because those two need different treatment. The
+    illumination profile is copied per column from the adjacent real row, so brightness
+    continues smoothly across the seam and the crop's left-right falloff is preserved. The
+    grain is fresh 2D-correlated noise scaled to the crop's ACTUAL high-frequency standard
+    deviation, measured after subtracting a local blur.
+
+    Everything simpler was tried and left visible artefacts. The crops are tight bounding
+    boxes whose filament usually spans the full height, so there is no clean band to copy
+    or tile - tiling two rows just prints a repeating pattern. Measuring the grain from the
+    upper half of the histogram (an earlier attempt) underestimated it roughly twofold and
+    the extension read as conspicuously smooth.
+    """
+    plane = img[0, 0]
+    smooth = box_blur(img, 9)[0, 0]
+    grain = plane - smooth
+
+    line = centreline(img)
+    if line is None:
+        strength = float(grain.std())
+    else:
+        ys = torch.arange(plane.shape[0], device=plane.device).view(-1, 1)
+        away = (ys - line.view(1, -1)).abs() > 6  # ignore the filament and its shoulders
+        strength = float(grain[away].std()) if bool(away.any()) else float(grain.std())
+
+    level = smooth[0] if at_top else smooth[-1]
+    noise = torch.randn(1, 1, rows, plane.shape[1], device=plane.device, generator=generator)
+    noise = F.avg_pool2d(F.pad(noise, (1, 1, 1, 1), mode="reflect"), 3, stride=1)
+    noise = noise / noise.std().clamp(min=1e-6) * strength
+    return (level.view(1, 1, 1, -1) + noise)
+
+
+def _extend_frame(img, pad, generator=None):
+    """Add `pad` synthesised background rows above and below; original rows untouched."""
+    return torch.cat([_synth_background(img, pad, at_top=True, generator=generator),
+                      img,
+                      _synth_background(img, pad, at_top=False, generator=generator)], dim=2)
+
+
+def warp_filament(img, d, margin=3, extend=True):
+    """Displace the filament by d(x), with the displacement fading out away from it.
+
+    Earlier attempts warped the whole frame, which drags the background along so the noise
+    grain acquires the filament's undulation, and then tried splitting the image into
+    background and filament layers - which failed differently: these crops are tight
+    bounding boxes with ZERO filament-free rows, so the synthetic background fill had half
+    the real contrast, and a greyscale closing puts every dark speckle into the "filament"
+    layer, so warping it sheared the noise into vertical combs.
+
+    Warping locally avoids both. A Gaussian envelope centred on the filament means it moves
+    fully, background more than a few sigma away does not move at all, and the transition
+    is a gentle stretch through pure noise where it cannot be seen. The frame is extended by
+    reflection, so the new rows are real background grain rather than anything synthetic.
+
+    Falls back to the plain global shear if the filament cannot be located.
+    """
+    line = centreline(img)
+    if line is None:
+        return img, 0.0
+
+    # These crops are tight bounding boxes - a filament being made WAVIER often has no room
+    # at all inside the original frame (fit scale 0), so the frame has to grow. A filament
+    # being STRAIGHTENED moves inward and needs none, and extending it there is actively
+    # harmful: the synthesised bands carry noise that the per-column trace can latch onto
+    # instead of the now-flat filament, which reads back as more waviness, not less.
+    if extend:
+        pad = int(math.ceil(float(d.abs().max()))) + margin
+        img = _extend_frame(img, pad)
+        line = line + pad
+
+    _, _, height, width = img.shape
+    lo, hi = float(margin), float(height - 1 - margin)
+
+    # Scale the displacement so the filament always lands inside the EXISTING frame. No
+    # rows are invented at all, which is what finally removed the background artefacts:
+    # synthetic fill had the wrong contrast on these tight crops (they contain zero
+    # filament-free rows to sample from), and reflecting to make room duplicated the
+    # filament itself whenever it sat near an edge, so the trace locked onto the mirror
+    # copy. The cost is that a very tight crop cannot express the largest waviness; the
+    # caller is told the scale so it can report the shortfall rather than hide it.
+    scale = 1.0
+    positive, negative = d > 0, d < 0
+    if positive.any():
+        scale = min(scale, float(((hi - line)[positive] / d[positive]).clamp(min=0).min()))
+    if negative.any():
+        scale = min(scale, float(((lo - line)[negative] / d[negative]).clamp(min=0).min()))
+    scale = max(0.0, min(1.0, scale))
+    d = d * scale
+
+    peak = max(1.0, float(d.abs().max()))
+    # wide enough that the stretch between moved and stationary rows never folds
+    # (|dD/dy| < 1 needs sigma above about 0.6 * the peak displacement)
+    sigma = max(8.0, 1.3 * peak)
+
+    ys = torch.arange(height, device=img.device, dtype=torch.float32).view(-1, 1)
+    xs = torch.arange(width, device=img.device, dtype=torch.float32).view(1, -1)
+    envelope = torch.exp(-0.5 * ((ys - line.view(1, -1)) / sigma) ** 2)
+    src_y = ys - d.view(1, -1) * envelope
+
+    grid = torch.stack([2 * xs.expand(height, width) / max(width - 1, 1) - 1,
+                        2 * src_y / max(height - 1, 1) - 1], dim=-1).unsqueeze(0)
+    warped = F.grid_sample(img, grid, mode="bilinear", padding_mode="reflection",
+                           align_corners=True)
+    return warped, scale
 
 
 def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None):
@@ -132,8 +245,8 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None)
         if seed is not None:
             gen = torch.Generator(device=img.device).manual_seed(seed + attempt * 1000)
         d = synth_displacement(img.shape[3], applied, lam, img.device, generator=gen)
-        pad = int(math.ceil(3 * applied))
-        candidate = shear_rows(img, d, pad, generator=gen)
+        candidate, scale = warp_filament(img, d)
+        info["fit_scale"] = scale
 
         achieved = waviness(candidate)
         if achieved is None:
@@ -182,7 +295,8 @@ def _straighten(img, current, target, info):
     full = np.convolve(np.pad(full, pad_n, mode="edge"),
                        np.ones(kernel) / kernel, mode="valid")[:width]
     d = torch.from_numpy(full).float().to(img.device) * (target / max(current, 1e-3) - 1.0)
-    out = shear_rows(img, d, pad=max(2, int(abs(d).max().item()) + 2))
+    out, scale = warp_filament(img, d, extend=False)
+    info["fit_scale"] = scale
     info.update({"applied_rms": float(d.std()), "warped": True, "mode_detail": "straighten"})
     return out, info
 
@@ -199,9 +313,7 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
     Returns (image in [0,1], info dict). Everything in kw is forwarded to edit_image.
     """
     from img2img import edit_image
-    from config import PH_MAX
 
-    from config import PH_MIN
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
@@ -212,8 +324,29 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
     # Outside the range in EITHER direction the geometry is imposed, because the model's
     # own response is unreliable there: it cannot buckle harder than pH 8.8, and under an
     # img2img anchor it cannot straighten either.
-    warped, info = apply_ph_waviness(out * 2 - 1, target_pH, seed=seed)
-    info["mode"] = "warp"
+    # Size the displacement against the REAL source, then apply it to the model's output.
+    # Measuring the output directly does not work: img2img results are softer and carry
+    # faint ghost filaments, so the per-column trace wanders between them and reports ~9px
+    # of waviness even for an in-range edit of a 8.4px source. Fed that, the closed loop
+    # concludes the filament is already wavy enough and barely warps at all.
+    canvas = out * 2 - 1
+    if target_pH < PH_MIN:
+        # Straightening scales the filament's OWN traced centreline, so it must read the
+        # image it is straightening; a source-derived displacement would not line up.
+        straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed)
+        return ((straightened + 1) / 2).clamp(0, 1), {"mode": "warp", **plan}
+
+    _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed)
+    info = {"mode": "warp", **plan}
+    if not plan.get("warped") or not plan.get("applied_rms"):
+        return out, info
+
+    generator = torch.Generator(device=canvas.device).manual_seed(seed or 0)
+    displacement = synth_displacement(canvas.shape[3], plan["applied_rms"],
+                                      plan["wavelength"] or predicted_wavelength(target_pH),
+                                      canvas.device, generator=generator)
+    warped, info["fit_scale"] = warp_filament(canvas, displacement,
+                                              extend=plan.get("mode_detail") != "straighten")
     return ((warped + 1) / 2).clamp(0, 1), info
 
 
