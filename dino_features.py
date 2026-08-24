@@ -18,8 +18,16 @@ import torch.nn.functional as F
 class DinoV2Features(nn.Module):
     def __init__(self, model_name: str = "dinov2_vits14", img_size: int = 224):
         super().__init__()
-        # ViT-S/14: rychlý, 384-dim embedding. Pro víc kapacity lze dinov2_vitb14 (768-dim).
-        self.backbone = torch.hub.load("facebookresearch/dinov2", model_name)
+        # Pinned to a commit predating facebookresearch/dinov2#528, which added
+        # `float | None` union-type syntax to attention.py - that's Python 3.10+
+        # only and breaks `torch.hub.load` on 3.9 (TypeError: unsupported operand
+        # type(s) for |). `main` floats and could pick up other breaking changes
+        # over time regardless, so pin to a known-good ref rather than chase this.
+        # skip_validation is required because torch.hub's ref-validation only
+        # recognizes branches/tags, not arbitrary commit SHAs.
+        self.backbone = torch.hub.load(
+            "facebookresearch/dinov2:81b2b64", model_name, trust_repo=True, skip_validation=True
+        )
         self.backbone.eval()
         for p in self.backbone.parameters():
             p.requires_grad = False
