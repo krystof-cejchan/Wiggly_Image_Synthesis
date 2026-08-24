@@ -118,7 +118,7 @@ def save_comparison(orig_img, results, out_path, source_pH, target_pH, src_name,
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_emav2.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt")
     parser.add_argument("--data_dir", type=str, default=DATA_DIR)
     parser.add_argument("--out_dir", type=str, default="outputs_img2img/sweep")
     parser.add_argument("--strength", type=float, default=0.7)

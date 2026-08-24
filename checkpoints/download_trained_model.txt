@@ -1,2 +1,3 @@
-download the model at https://uschovna.cz/zasilka/WEUWCRG5AIFFDIH6-ESK/S6XD96Z7ME
-and place it in this directory
+download the model at https://www.uschovna.cz/zasilka/WL8NJZV8U4M3C6ET-M9H
+and place it in this directory as cfm_best_ema.pt (all scripts default --checkpoint
+to checkpoints/cfm_best_ema.pt) or specify its path explicitly with --checkpoint

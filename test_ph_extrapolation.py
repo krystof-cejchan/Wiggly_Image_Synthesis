@@ -55,7 +55,7 @@ def pick_sources(data_dir, count, min_w=220, min_h=32):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_emav2.pt")
+    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_ema.pt")
     ap.add_argument("--pH", type=float, nargs="+",
                     default=[3.0, 4.4, 5.8, 7.3, 8.8, 10.3, 11.8, 13.0])
     ap.add_argument("--sources", type=int, default=3)

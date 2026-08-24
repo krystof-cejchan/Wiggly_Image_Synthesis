@@ -8,7 +8,7 @@ Two curves get fitted and then composed:
 Composing them turns lambda, an arbitrary guidance knob, into a physical pH request.
 Re-run this after training a new checkpoint; nothing else needs to change.
 
-    python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_emav2.pt
+    python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema.pt
 """
 import argparse
 import json
@@ -100,7 +100,7 @@ def measure_response(model, sources, lambdas, steps, strength, seed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_emav2.pt")
+    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_ema.pt")
     ap.add_argument("--lambdas", type=float, nargs="+",
                     default=[0.0, 0.5, 1.0, 1.5, 2.5, 4.0])
     ap.add_argument("--per_bucket", type=int, default=1)
