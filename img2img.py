@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (optional)")
-    parser.add_argument("--contrast", type=float, default=1.0, help="Contrast strength (optional)")
+    parser.add_argument("--contrast", type=float, default=2.0, help="Contrast strength (optional)")
     parser.add_argument("--contrast_mode", type=str, default="linear", choices=["linear", "gamma"],
                         help="'linear' scales around the mean (preserves brightness); "
                              "'gamma' is the original img**contrast, kept to reproduce older runs")
