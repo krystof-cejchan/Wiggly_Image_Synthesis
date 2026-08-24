@@ -89,45 +89,50 @@ python3 img2img.py --ref_image <path/to/crop.png> \
 
 ## 5. Requesting a pH outside the trained range (5.8–8.8)
 
-The dataset only covers 5.8–8.8, but you can ask for values outside that. **For editing a real
-image (`img2img.py`'s job), use `ph_warp.edit_to_pH` for *either* direction — not the plain CLI.**
-It's tempting to think the plain `img2img.py` CLI already handles the below-5.8 case correctly,
-since it *will run* with a `--target_pH` below 5.8 without erroring (it's wired through
-`ph_control.py`'s velocity-space extrapolation automatically). But that mechanism was only
-validated for **free generation from noise** (`sample.py`, no reference image). For an actual
-edit, the reference image anchors the ODE trajectory strongly enough that pushing the velocity
-field harder doesn't reliably change the output — measured waviness stayed flat at ~6.5px across
-pH 3.0–7.3 regardless of how hard it was pushed, at typical editing strengths. So the plain CLI's
-out-of-range handling is really only meaningful for `sample.py`; for editing a real photo to any
-out-of-range pH, always go through `ph_warp.edit_to_pH`, which uses a **different, genuinely
-postprocessing mechanism** for editing specifically — see `test_ph_extrapolation.py`:
+The dataset only covers 5.8–8.8, but `img2img.py` handles requests outside it automatically —
+no different from any other edit:
 
 ```bash
-python3 test_ph_extrapolation.py --pH 3 4.4 5.8 7.3 8.8 10.3 11.8 13.0
+python3 img2img.py --ref_image <crop.png> --source_pH 5.8 --target_pH 11.0 --strength 0.65
 ```
 
-or call `ph_warp.edit_to_pH(model, ref_image, source_pH, target_pH, ...)` directly. It edits
+`main()` routes every edit through `edit_to_pH()` (in `img2img.py`), which picks the right
+mechanism for wherever `target_pH` falls and prints a one-line summary of what it's doing before
+it runs. You don't need to think about which direction you're asking for or call anything else —
+this section is about *why* it works this way, not something you need to act on.
+
+### Why this needs two different mechanisms internally
+
+**In-range (5.8–8.8)**: ordinary conditioning, nothing special — `edit_to_pH` is a thin pass-through
+to `edit_image` here.
+
+**Outside the range, in either direction**: the obvious approach — extrapolate the model's own
+conditioning past the trained range in *velocity* space (the same maneuver as classifier-free
+guidance) — was tried first, and it's still what `sample.py` uses for free generation (step 6
+below), where it's validated to work for the below-5.8 direction. But it does **not** carry over
+to editing a real image: a reference image anchors the ODE trajectory strongly enough that
+pushing the velocity field harder barely changes the output (measured waviness stayed flat at
+~6.5px across pH 3.0–7.3 during editing, "no matter how hard the conditioning was pushed"). And
+above 8.8 it doesn't work even for free generation — filaments got *smoother*, not wavier, because
+the velocity direction from 5.8→8.8 encodes texture/thickness/contrast together, not just
+geometry, and the model can't invent buckling it never saw.
+
+So for editing, `edit_to_pH` does something different for out-of-range requests: it edits
 normally to whichever trained anchor (5.8 or 8.8) is nearer, then explicitly reshapes the
-resulting image's pixels to hit a physically-extrapolated waviness target — geometrically
-warping the traced fiber centreline wavier, or geometrically shearing it straighter, whichever
-the requested pH calls for. Neither direction is "the network extrapolating on its own" once a
-real reference image is involved; both end up being a direct edit to image geometry.
+*resulting image's pixels* — geometrically warping the traced fiber centreline wavier, or
+geometrically shearing it straighter, sized against a physically-fit pH-vs-waviness law
+(`waviness.py`, `ph_control.predicted_waviness`). This is genuine postprocessing, not the network
+extrapolating on its own, and it's the only mechanism that was actually measured to work for
+editing in both directions.
 
-### Why the two directions still aren't symmetric under the hood
+A geometric wavier-edit can grow the canvas taller to fit the extra undulation — `img2img.py`
+prints a note when this happens, and the diff-map plot switches to a side-by-side view (no
+elementwise diff) when the edited image is taller than the input, since a pixel-by-pixel
+difference isn't meaningful against rows that don't exist in the original.
 
-- **Above 8.8 (wavier)**: velocity extrapolation was tried and measured to go the *wrong*
-  direction even during free generation (filaments got smoother, not wavier) — because the
-  velocity direction from 5.8→8.8 encodes texture/thickness/contrast together, not just
-  waviness, and the model can't invent buckling it never saw. So this direction is postprocessing
-  no matter how you generate.
-- **Below 5.8 (straighter)**: velocity extrapolation genuinely does work correctly *for free
-  generation* — the further you push, the straighter the unconditioned output gets. It's only
-  under an img2img anchor that it stops moving the needle, which is why `edit_to_pH` falls back
-  to geometric shearing for this direction too, specifically for editing.
-
-`sample.py` (step 6 below), which has no reference image to anchor, uses the velocity-extrapolation
-mechanism directly and it is correct there for the below-5.8 direction (not the above-8.8 one,
-per the point above) — the caveat in this section is specifically about *editing* a real image.
+`test_ph_extrapolation.py --pH 3 4.4 5.8 7.3 8.8 10.3 11.8 13.0` runs a whole sweep and plots
+waviness vs. pH if you want to sanity-check a checkpoint's extrapolation behavior in bulk rather
+than one image at a time.
 
 ### Calibrating the extrapolation
 
@@ -154,8 +159,8 @@ python3 sample.py --pH 5.8 6.4 7.0 7.4 8.2 8.8 --num_samples 4 --num_steps 1000
 ```
 
 Saves a grid PNG per requested pH to `outputs/sample_pH_<value>.png`. Out-of-range `--pH` values
-extrapolate via `ph_control.py`'s velocity-space mechanism (same as `img2img.py`'s CLI), and here
-— with no reference image anchoring anything — that mechanism is validated for the below-5.8
+extrapolate via `ph_control.py`'s velocity-space mechanism directly — unlike `img2img.py`, there's
+no reference image here for that mechanism to fail against, and it's validated for the below-5.8
 (straighter) direction. It's still wrong for above-8.8 (wavier) even here; that direction has no
 correct path through `sample.py` at all, since the geometric fix in `ph_warp.py` requires editing
 an existing image.
@@ -228,11 +233,16 @@ needs internet access to download the backbone weights via `torch.hub`.
   `--strength` explanation in step 4.
 - **A gap/hole in the source fiber doesn't get filled in by the edit** — try `--repair_gaps`
   (step 4); this is a known limitation of anchoring every ODE step to the input image.
-- **`--target_pH` outside 5.8–8.8 through the plain CLI produces something wrong, or barely
-  changed** — expected for editing; see step 5. Above 8.8 goes the *wrong* direction (straighter,
-  not wavier); below 5.8 typically just doesn't move much because the reference image anchors
-  the trajectory too strongly for the CLI's built-in extrapolation to have an effect. Use
-  `ph_warp.edit_to_pH` / `test_ph_extrapolation.py` for either direction instead of the plain CLI.
+- **Saved/displayed image is taller than the input after an out-of-range edit** — expected; see
+  step 5. A wavier geometric edit can need more vertical room than the original crop had, so the
+  canvas gets extended (a printed note says by how much). The comparison plot drops the diff-map
+  panel in this case, since an elementwise diff against rows that don't exist in the original
+  isn't meaningful.
+- **Achieved waviness (printed after an out-of-range edit) is noticeably off from the target** —
+  the geometric warp re-measures what it actually achieved and retries up to 3 times, but a very
+  tight/thin crop may not have room to reach a large target even after extending the canvas (see
+  `fit_scale` in the returned info dict, or `ph_warp.warp_filament`'s docstring); this is a real
+  physical limit of the crop, not a bug.
 - **Training produces near-white / washed-out samples** — this specific failure mode was caused
   in the past by an EMA bug interacting with gradient accumulation (see `CLAUDE.md`'s training
   section); if you see it again after modifying `train.py`, check that the EMA update still runs

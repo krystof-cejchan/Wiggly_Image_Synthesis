@@ -71,19 +71,19 @@ This opens a comparison plot (original / edited / difference map) and saves the 
 
 ## Requesting pH outside the trained range (5.8–8.8)
 
-The dataset only covers 5.8–8.8, but the tooling supports asking for values outside it. **For
-editing a real image, use `ph_warp.edit_to_pH(...)` for either direction, not `img2img.py`'s
-plain CLI** - passing an out-of-range `--target_pH` directly to `img2img.py` will run without
-error, but the result is wrong or barely changed for both directions once a real reference image
-is involved (its built-in extrapolation is only reliable for pure noise-to-image generation, not
-editing). Use the diagnostic script, or `ph_warp.edit_to_pH(...)` directly:
+The dataset only covers 5.8–8.8, but `img2img.py` handles requests outside it automatically -
+just pass a `--source_pH`/`--target_pH` beyond that range, same as any other edit:
 
 ```bash
-python3 test_ph_extrapolation.py --pH 3 4 5 6 7 8 9 10 11 12
+python3 img2img.py --ref_image <crop.png> --source_pH 5.8 --target_pH 11.0 --strength 0.65
 ```
 
-See `HOW_TO_RUN.md` §5 for the full explanation of why the two directions differ, and
-`PROJECT_OVERVIEW.md` §6 for the underlying reasoning and validation behind each mechanism.
+Under the hood this edits to the nearer trained anchor (5.8 or 8.8) first, then geometrically
+reshapes the result toward the requested pH's physically-extrapolated waviness - a real velocity
+extrapolation through the network alone was tried and doesn't work once a reference image
+anchors the edit (see `HOW_TO_RUN.md` §5 / `PROJECT_OVERVIEW.md` §6 for why). You don't need to
+know that to use it; the CLI dispatches to the correct mechanism either way and prints a
+one-line summary of what it's doing.
 
 ## Evaluation
 

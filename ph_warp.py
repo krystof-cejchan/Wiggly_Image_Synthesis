@@ -44,7 +44,6 @@ import math
 import torch
 import torch.nn.functional as F
 
-from config import PH_MAX, PH_MIN
 from ph_control import predicted_waviness
 from waviness import box_blur, trace_fibre, waviness
 
@@ -301,55 +300,6 @@ def _straighten(img, current, target, info):
     return out, info
 
 
-def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
-    """Edit a real crop to ANY pH, dispatching to whichever mechanism works there.
-
-        target_pH < 5.8   velocity extrapolation past the acidic anchor (validated:
-                          orientation spread falls 1.55 -> 1.21 -> 0.97 as it is pushed)
-        5.8 <= pH <= 8.8  ordinary conditioning, exactly as before
-        target_pH > 8.8   edit to the alkaline anchor, then impose the extra undulation
-                          geometrically - velocity extrapolation fails in this direction
-
-    Returns (image in [0,1], info dict). Everything in kw is forwarded to edit_image.
-    """
-    from img2img import edit_image
-
-
-    anchor = min(max(target_pH, PH_MIN), PH_MAX)
-    out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
-                     target_pH=anchor, seed=seed, **kw)
-    if PH_MIN <= target_pH <= PH_MAX:
-        return out, {"mode": "conditioned", "warped": False}
-
-    # Outside the range in EITHER direction the geometry is imposed, because the model's
-    # own response is unreliable there: it cannot buckle harder than pH 8.8, and under an
-    # img2img anchor it cannot straighten either.
-    # Size the displacement against the REAL source, then apply it to the model's output.
-    # Measuring the output directly does not work: img2img results are softer and carry
-    # faint ghost filaments, so the per-column trace wanders between them and reports ~9px
-    # of waviness even for an in-range edit of a 8.4px source. Fed that, the closed loop
-    # concludes the filament is already wavy enough and barely warps at all.
-    canvas = out * 2 - 1
-    if target_pH < PH_MIN:
-        # Straightening scales the filament's OWN traced centreline, so it must read the
-        # image it is straightening; a source-derived displacement would not line up.
-        straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed)
-        return ((straightened + 1) / 2).clamp(0, 1), {"mode": "warp", **plan}
-
-    _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed)
-    info = {"mode": "warp", **plan}
-    if not plan.get("warped") or not plan.get("applied_rms"):
-        return out, info
-
-    generator = torch.Generator(device=canvas.device).manual_seed(seed or 0)
-    displacement = synth_displacement(canvas.shape[3], plan["applied_rms"],
-                                      plan["wavelength"] or predicted_wavelength(target_pH),
-                                      canvas.device, generator=generator)
-    warped, info["fit_scale"] = warp_filament(canvas, displacement,
-                                              extend=plan.get("mode_detail") != "straighten")
-    return ((warped + 1) / 2).clamp(0, 1), info
-
-
 def refine_texture(model, img, anchor_pH, strength=0.4, num_steps=60, seed=None):
     """Re-render texture over warped geometry, without disturbing the geometry.
 
@@ -360,7 +310,9 @@ def refine_texture(model, img, anchor_pH, strength=0.4, num_steps=60, seed=None)
     the model repaints texture around geometry it cannot move. Source and target pH are
     both the anchor, so no pH editing happens here - only resynthesis.
     """
-    from img2img import edit_image  # imported lazily; img2img imports this module's peers
+    from img2img import edit_image  # imported lazily; img2img itself now imports FROM this
+                                    # module (apply_ph_waviness etc. for edit_to_pH), so this
+                                    # import must stay deferred to avoid a circular top-level import
     out = edit_image(model=model, ref_image=img, source_pH=anchor_pH, target_pH=anchor_pH,
                      denoising_strength=strength, num_steps=num_steps,
                      contrastive_scale=1.0, seed=seed, contrast=1.0, solver="heun")

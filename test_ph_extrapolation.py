@@ -23,8 +23,7 @@ from PIL import Image
 
 import ph_control
 from config import DEVICE, PH_MAX, PH_MIN
-from img2img import load_and_preprocess_image
-from ph_warp import edit_to_pH
+from img2img import load_and_preprocess_image, edit_to_pH
 from model import ConditionalUNet
 from waviness import waviness
 
@@ -76,7 +75,7 @@ def main():
     sources = pick_sources(DATA_DIR, args.sources)
     print(f"{len(sources)} sources x {len(args.pH)} pH values\n")
     for ph in args.pH:
-        print(" ", ph_control.describe(ph))
+        print(" ", ph_control.describe(ph, editing=True))
     print()
 
     per_ph = {ph: [] for ph in args.pH}
