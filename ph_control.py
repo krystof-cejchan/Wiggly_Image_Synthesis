@@ -146,31 +146,18 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None):
     return extrapolate(v_lo, v_hi, lam, rescale=rescale)
 
 
-def describe(pH_query, editing=False):
+def describe(pH_query):
     """One-line summary for CLI output, so an extrapolated request is never silent.
 
-    Which mechanism applies depends on the direction AND on whether a real reference image
-    is being edited. Velocity extrapolation (this module) is only validated for free
-    generation from noise (sample.py); under an img2img anchor it was measured to barely
-    move the output in either direction, so editing callers (img2img.edit_to_pH and its CLI,
-    test_ph_extrapolation.py) should pass editing=True to get an accurate description of what
-    actually runs there - see ph_warp.py for the measurements behind this split.
+    Which mechanism applies depends on the direction, because they were measured to work
+    asymmetrically - see ph_warp.py for the numbers behind that split.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
     if pH_query < PH_ANCHOR_LO:
-        if editing:
-            return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
-                    f"{PH_ANCHOR_HI:g}] - editing at pH {PH_ANCHOR_LO:g}, then damping "
-                    f"waviness geometrically toward {predicted_waviness(pH_query):.1f}px "
-                    f"(velocity extrapolation does not move the output under an img2img anchor)")
         return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
                 f"{PH_ANCHOR_HI:g}] - extrapolating the velocity field past the acidic "
                 f"anchor with lambda={ph_to_lambda(pH_query):.2f} (straighter)")
-    if editing:
-        return (f"pH {pH_query:g} is ABOVE the trained range [{PH_ANCHOR_LO:g}, "
-                f"{PH_ANCHOR_HI:g}] - editing at pH {PH_ANCHOR_HI:g}, then imposing "
-                f"waviness {predicted_waviness(pH_query):.1f}px geometrically")
     return (f"pH {pH_query:g} is ABOVE the trained range [{PH_ANCHOR_LO:g}, "
             f"{PH_ANCHOR_HI:g}] - conditioning at pH {PH_ANCHOR_HI:g}, then imposing "
             f"waviness {predicted_waviness(pH_query):.1f}px geometrically "
