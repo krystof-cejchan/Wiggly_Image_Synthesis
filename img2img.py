@@ -9,11 +9,8 @@ import matplotlib.pyplot as plt
 import torchvision.transforms.v2.functional as TF
 from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
-
-
-def normalize_pH(pH):
-    """normalize pH value to [-1, 1] range based on PH_MIN and PH_MAX"""
-    return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
+from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
+from waviness import box_blur
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -30,10 +27,38 @@ def load_and_preprocess_image(image_path):
     return img_tensor, original_size
 
 def create_blending_mask(window_size, device):
-    """create a 2D blending mask using a Hann window for smooth transitions between overlapping patches"""
-    window_1d = torch.hann_window(window_size, periodic=False, device=device)
+    """create a 2D blending mask using a Hann window for smooth transitions between overlapping patches
+
+    The window is taken from the INTERIOR of a Hann window of length window_size + 2.
+    A plain hann_window(window_size) is exactly 0 at both endpoints, and the canvas border
+    is covered by only one patch, so weight_global there is 0. Dividing by the clamped
+    weight then yields velocity 0, freezing row 0 and column 0 at their initial noise
+    value - the speckled 1px edge that appeared on the left/top of every result. Trimming
+    the endpoints keeps the window strictly positive while staying symmetric.
+    """
+    window_1d = torch.hann_window(window_size + 2, periodic=False, device=device)[1:-1]
     mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
     return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+
+
+def apply_contrast(img01, contrast, mode="linear"):
+    """Contrast boost for an image already mapped to [0, 1].
+
+    mode="linear" scales around the image mean, so the overall brightness is preserved.
+    mode="gamma" is the original img**contrast. That gamma only ever darkens (x**2 < x on
+    [0,1]) - it dropped the mean from 0.64 to 0.43 in testing - and it stretches
+    differences in the dark half of the range, which turns the illumination falloff that
+    is already present in the source crops into a heavy black end. The gradient itself is
+    real data and is left untouched either way; "linear" just stops amplifying it.
+    """
+    if contrast == 1.0:
+        return img01
+    if mode == "gamma":
+        return torch.pow(img01, contrast)
+    if mode != "linear":
+        raise ValueError(f"Unknown contrast mode: {mode!r} (expected 'linear' or 'gamma')")
+    mean = img01.mean()
+    return ((img01 - mean) * contrast + mean).clamp(0, 1)
 
 def safe_mirror_pad_4d(img_tensor, target_h, target_w):
     """
@@ -52,21 +77,135 @@ def safe_mirror_pad_4d(img_tensor, target_h, target_w):
     return img_tensor[:, :, :target_h, :target_w]
 
 @torch.no_grad()
+def repair_fibre_gaps(ref_image, max_gap=30, min_side=6, max_slope=1.5, blur=3):
+    """Bridge short bright breaks in the fibre, returning (repaired_image, list_of_gaps).
+
+    Why this exists: edit_image starts the ODE from (1-strength)*source + strength*noise,
+    so the source stays pinned as an anchor for the whole trajectory. A bright break in the
+    fibre is pinned along with everything else - the guidance wants a dark fibre through
+    that spot while the anchor insists it is bright, and the result fades or breaks exactly
+    there. Loosening the anchor is NOT a fix: at strength 0.85 ghost fibres appear and by
+    0.95 the output degenerates into several stacked copies, because the 0.3 anchor is the
+    only thing suppressing the mirror-padding tiling. So the repair edits the anchor
+    instead, and leaves strength alone.
+
+    Only short interior breaks bracketed by confident fibre on both sides are touched, and
+    the painted line is clamped with a minimum against the original, so background texture
+    survives and only the fibre core darkens.
+    """
+    device = ref_image.device
+    smooth = box_blur(ref_image, blur)[0, 0]
+    height, width = smooth.shape
+
+    # per-column background: the fibre is thin relative to the strip, so the column median
+    # sits in the background rather than on the fibre
+    background = smooth.median(dim=0).values
+    darkest, path_raw = smooth.min(dim=0)
+    depth = background - darkest  # >0 wherever a dark fibre is present
+
+    strong = torch.quantile(depth, 0.75)
+    if strong <= 0:
+        return ref_image, []
+    confident = depth > 0.5 * strong
+    if int(confident.sum()) < 2 * min_side:
+        return ref_image, []
+
+    # fibre thickness, from the half-maximum width of the confident columns
+    widths = []
+    for x in torch.nonzero(confident).flatten().tolist():
+        widths.append(int((smooth[:, x] < background[x] - 0.5 * depth[x]).sum()))
+    fwhm = torch.tensor(widths, dtype=torch.float32).median().item() if widths else 3.0
+    sigma = float(min(6.0, max(0.8, fwhm / 2.355)))
+
+    repaired = ref_image.clone()
+    rows = torch.arange(height, device=device, dtype=torch.float32).unsqueeze(1)
+    flags = confident.tolist()
+    gaps = []
+
+    x = 0
+    while x < width:
+        if flags[x]:
+            x += 1
+            continue
+        start = x
+        while x < width and not flags[x]:
+            x += 1
+        end = x - 1
+        left, right = start - 1, end + 1
+        # interior breaks only, and only short ones - a long stretch is a fibre that really
+        # does end there, not a defect to paint over
+        if left < 0 or right >= width or (end - start + 1) > max_gap:
+            continue
+        # a large vertical jump between the two sides usually means the columns belong to
+        # two different fibres; bridging them would invent a connection that is not there
+        if abs(int(path_raw[right]) - int(path_raw[left])) / max(1, right - left) > max_slope:
+            continue
+
+        lo = max(0, left - min_side + 1)
+        hi = min(width, right + min_side)
+        amp_left = depth[lo:left + 1][confident[lo:left + 1]]
+        amp_right = depth[right:hi][confident[right:hi]]
+        if amp_left.numel() == 0 or amp_right.numel() == 0:
+            continue
+        amplitude = 0.5 * (amp_left.mean() + amp_right.mean())
+
+        span = right - left
+        for xi in range(start, end + 1):
+            frac = (xi - left) / span
+            y_centre = (1 - frac) * float(path_raw[left]) + frac * float(path_raw[right])
+            base = (1 - frac) * background[left] + frac * background[right]
+            # Blend toward the fibre core weighted by the Gaussian itself: full strength on
+            # the centre line, untouched original a couple of sigma away. Compositing with a
+            # minimum() instead would clamp every background pixel brighter than `base` down
+            # to it, replacing the noise texture across the whole column with a flat band.
+            weight = torch.exp(-0.5 * ((rows.squeeze(1) - y_centre) / sigma) ** 2)
+            repaired[0, 0, :, xi] = (1 - weight) * repaired[0, 0, :, xi] + weight * (base - amplitude)
+
+        gaps.append({"start": start, "end": end, "width": end - start + 1,
+                     "y_left": int(path_raw[left]), "y_right": int(path_raw[right]),
+                     "amplitude": float(amplitude)})
+
+    return repaired, gaps
+
+
+def save_repair_diagnostic(original, repaired, gaps, out_path):
+    """Write a before/after of the anchor repair so the detection can be eyeballed."""
+    orig = ((original[0, 0].detach().cpu() + 1) / 2)
+    rep = ((repaired[0, 0].detach().cpu() + 1) / 2)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 5.5))
+    axes[0].imshow(orig, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("source (anchor before repair)", fontsize=9)
+    axes[1].imshow(rep, cmap="gray", vmin=0, vmax=1)
+    axes[1].set_title(f"anchor after repair - {len(gaps)} gap(s) bridged", fontsize=9)
+    axes[2].imshow((rep - orig).abs(), cmap="inferno", vmin=0, vmax=1)
+    axes[2].set_title("what the repair changed", fontsize=9)
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+
+
+@torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
-               contrast=1.2, solver="heun"):
+               contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
+               ph_rescale=False):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
     solver: "euler" (1st order) or "heun" (2nd order predictor-corrector). Heun evaluates
     the velocity field twice per step (2x model calls) but has O(dt^2) local error instead
     of O(dt), which reduces integration drift over the num_steps trajectory.
+
+    Either pH may lie outside the trained range: ph_control.velocity_for_pH extrapolates
+    along the acidic->alkaline direction rather than pushing an out-of-range value through
+    the periodic embedding, which would alias. ph_lambda forces a specific extrapolation
+    strength instead of deriving one from target_pH, and exists for calibrate_ph.py.
     """
     if seed is not None:
         torch.manual_seed(seed)
-
-    pH_source_norm = normalize_pH(torch.tensor([source_pH])).to(DEVICE)
-    pH_target_norm = normalize_pH(torch.tensor([target_pH])).to(DEVICE)
 
     _, _, h, w = ref_image.shape
 
@@ -97,8 +236,10 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
             for x_idx in range(0, target_w - window_size + 1, stride):
                 x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
 
-                v_src_patch = model(x_patch, t, pH_source_norm)
-                v_tgt_patch = model(x_patch, t, pH_target_norm)
+                v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
+                                              rescale=ph_rescale)
+                v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
+                                              rescale=ph_rescale, lam_override=ph_lambda)
 
                 v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
                 v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
@@ -125,9 +266,8 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     x_cropped = x[:, :, :h, :w]
 
     out = (x_cropped.clamp(-1, 1) + 1) / 2
-    out_contrasted = torch.pow(out, contrast)
 
-    return out_contrasted
+    return apply_contrast(out, contrast, contrast_mode)
 
 def visualize_difference(original_tensor, edited_tensor, original_size, source_pH, target_pH):
     """Visualizes the difference between the original and edited images."""
@@ -164,14 +304,24 @@ def visualize_difference(original_tensor, edited_tensor, original_size, source_p
 def main():
     parser = argparse.ArgumentParser(description="Image-to-Image pH Editing using Conditional UNet")
     parser.add_argument("--ref_image", type=str, required=True, help="Path to the reference image (e.g., 'data/ref_image.png')")
-    parser.add_argument("--source_pH", type=float, required=True, help=f"Initial pH of the reference image (between {PH_MIN} and {PH_MAX})")
-    parser.add_argument("--target_pH", type=float, required=True, help=f"Target pH for editing (between {PH_MIN} and {PH_MAX})")
+    parser.add_argument("--source_pH", type=float, required=True, help=f"Initial pH of the reference image (trained range {PH_MIN}-{PH_MAX})")
+    parser.add_argument("--target_pH", type=float, required=True,
+                        help=f"Target pH. Values outside the trained range {PH_MIN}-{PH_MAX} "
+                             "are reached by extrapolating along the acidic->alkaline "
+                             "direction; see ph_control.py")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
     parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
     parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (optional)")
     parser.add_argument("--contrast", type=float, default=1.0, help="Contrast strength (optional)")
+    parser.add_argument("--contrast_mode", type=str, default="linear", choices=["linear", "gamma"],
+                        help="'linear' scales around the mean (preserves brightness); "
+                             "'gamma' is the original img**contrast, kept to reproduce older runs")
+    parser.add_argument("--repair_gaps", action="store_true",
+                        help="Bridge short bright breaks in the fibre before editing. Off by "
+                             "default - it modifies the source anchor. Writes a before/after "
+                             "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
 
     args = parser.parse_args()
@@ -192,7 +342,21 @@ def main():
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
-    
+    print(describe_pH(args.target_pH))
+
+    display_ref = ref_image
+    if args.repair_gaps:
+        repaired, gaps = repair_fibre_gaps(ref_image)
+        if gaps:
+            spans = ", ".join(f"x={g['start']}-{g['end']} ({g['width']}px)" for g in gaps)
+            print(f"Repaired {len(gaps)} fibre gap(s): {spans}")
+            diag_path = "outputs_img2img/repair_diagnostic.png"
+            save_repair_diagnostic(ref_image, repaired, gaps, diag_path)
+            print(f"Repair diagnostic saved to: {diag_path}")
+            ref_image = repaired
+        else:
+            print("No repairable fibre gaps detected - anchor left unchanged.")
+
     edited_img = edit_image(
         model=model, 
         ref_image=ref_image, 
@@ -203,10 +367,12 @@ def main():
         contrastive_scale=args.contrastive_scale,         
         seed=args.seed,
         contrast=args.contrast,
-        solver=args.solver
+        solver=args.solver,
+        contrast_mode=args.contrast_mode
     )
-    
-    visualize_difference(ref_image, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
+
+    # compare against the unrepaired source - the repair is an input-side aid, not a result
+    visualize_difference(display_ref, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
     
     orig_w, orig_h = original_size
     edited_crop_for_save = edited_img[:, :, :orig_h, :orig_w]

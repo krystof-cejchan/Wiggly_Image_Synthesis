@@ -64,7 +64,7 @@ def main():
     # ==========================================
     # 1. Configuration
     # ==========================================
-    CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
+    CHECKPOINT_PATH = "checkpoints/cfm_best_emav2.pt"
     DATA_DIR = "data/cropped/cropped_output"
 
     # Translation FID settings
