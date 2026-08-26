@@ -18,14 +18,38 @@ from config import PH_MIN, PH_MAX, DEVICE
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
+from waviness import waviness as measure_waviness
 
 # hyperparameters
 DATA_DIR = "data/cropped/cropped_output"
-BATCH_SIZE = 16          
-ACCUMULATION_STEPS = 4  
+# Physical batch raised 16->64 with ACCUMULATION_STEPS cut 4->1 on the assumption of a GPU
+# with room for it: the EFFECTIVE batch (64) is unchanged, so this is purely "do the same
+# 4 micro-batches as one bigger parallel call" rather than 4 small serialized ones - no
+# change to what the optimizer sees per step. ITERATIONS and EVAL_INTERVAL are divided by
+# the same factor (4) to hold the total optimizer/EMA step count, the LR schedule length
+# (T_max below), and the samples-seen-between-evals ratio all exactly where they were -
+# PATIENCE counts evals, not samples, and each eval still represents the same amount of
+# data as before this rescaling - see PATIENCE itself below for why its VALUE changed
+# afterwards, for an unrelated reason. If you had a training run going under old numbers,
+# this needs a restart to take effect - editing the file doesn't touch a process already
+# running with old values loaded.
+BATCH_SIZE = 64
+ACCUMULATION_STEPS = 1
 LR = 1e-4
-ITERATIONS = 100_000
+ITERATIONS = 50_000  # doubled from 25,000: the last run plateaued at step 19,625 (best) and
+                     # exhausted PATIENCE at 23,375/25,000 - by then T_max (below, tied to
+                     # ITERATIONS) had the cosine LR nearly fully decayed, so it had no room
+                     # left to keep improving even if the plateau wasn't final. Doubling gives
+                     # the schedule twice the room before LR bottoms out. EVAL_INTERVAL and
+                     # PATIENCE are left as absolute eval counts (not rescaled with this) -
+                     # they're about how many evals of no-improvement to tolerate before
+                     # calling it converged, which doesn't need to track total budget.
 CFG_DROPOUT = 0.2
+WAVINESS_CFG_DROPOUT = 0.2  # independent of CFG_DROPOUT (own random draw per sample) so the
+                            # model gets real practice at "geometry unconditioned, texture
+                            # conditioned" and the reverse, not just both-or-neither - this is
+                            # what makes guiding each axis separately at inference meaningful
+                            # later instead of the two channels always moving together.
 PH_JITTER_STD = 0.08  # pH buckets are unevenly spaced (0.2-1.0 apart) - jittering the label
                       # each step teaches the model that nearby pH values should look similar,
                       # the interpolation signal the discrete buckets alone don't provide. Keep
@@ -34,9 +58,20 @@ PH_JITTER_STD = 0.08  # pH buckets are unevenly spaced (0.2-1.0 apart) - jitteri
                       # packed 5.8-7.8 range and flattens the pH->waviness response there, while
                       # barely reaching into the one big outlier gap (7.8->8.8) anyway.
 EMA_DECAY = 0.9999
-EVAL_INTERVAL = 500
-PATIENCE = 10        # val loss is noisy (fluctuates ~1e-2 while MIN_DELTA is 1e-5), so a
-                     # short patience stops on noise rather than on a real plateau
+EVAL_INTERVAL = 125  # scaled down from 500 with ITERATIONS, see the note above BATCH_SIZE
+PATIENCE = 30        # val loss is noisy (fluctuates ~1e-2 while MIN_DELTA is 1e-5) - this
+                     # comment predicted the exact failure that happened with the old value
+                     # of 10: the waviness-conditioned retrain's first eval (step 125) was
+                     # also its best, every one of the next 10 sat within noise of it, and
+                     # training stopped at step 1375/25000 (5.5%) with the live train loss
+                     # still visibly dropping. Every FiLMResBlock's emb_proj is zero-init
+                     # (see model.py), so EVERY conditioning signal - not just the new
+                     # waviness channel - starts with literally zero effect on the output
+                     # and has to be woken up by gradient descent; with a third signal now
+                     # sharing that same wake-up budget, 10 evals (80,000 samples) may
+                     # simply not have been enough runway. 30 is a reasoned bound, not a
+                     # validated one - it triples the runway without disabling early
+                     # stopping outright.
 MIN_DELTA = 1e-5
 SEED = 42
 # Crops are thin landscape strips (median 292x42). Training sizes must stay close to that
@@ -76,46 +111,68 @@ def safe_mirror_pad(img_tensor, target_h, target_w):
         
     return img_tensor
 
+def _crop_waviness(img_crop):
+    """Waviness of the ACTUAL post-crop tensor, not the dataset's whole-source-image label.
+
+    Measured directly: mean |whole-image label - this crop's real waviness| is 10.5px
+    against a whole-image label std of only 3.35px across the dataset - the label was
+    louder than its own signal for most crops, since TRAIN_SIZES crops are a small,
+    randomly-positioned window into a much longer source strip and can show a locally
+    straight stretch of an overall-wavy fibre or vice versa. Feeding that mismatch in as
+    the training label isn't a mild approximation, it's closer to random noise injected
+    into the SAME summed embedding t_embed/pH_embed also flow through - plausibly why
+    overall coherence degraded, not just waviness-conditioned behaviour specifically.
+    """
+    wav = measure_waviness(img_crop.unsqueeze(0))
+    return wav if wav is not None else float("nan")
+
 def dynamic_collate_fn(batch):
     """For each batch, randomly select an aspect ratio and crop the pre-prepared images."""
     target_h, target_w = random.choice(TRAIN_SIZES)
-    
+
     transform = T.Compose([
         T.RandomCrop((target_h, target_w)),
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
         T.ColorJitter(brightness=0.1, contrast=0.1)
     ])
-    
+
     images = []
+    wavs = []
     for item in batch:
         img = item[0]
         # Pad the image to ensure it is at least target_h x target_w in size
         img_padded = safe_mirror_pad(img, target_h, target_w)
         # Apply the random crop and color jitter
-        images.append(transform(img_padded))
-        
+        cropped = transform(img_padded)
+        images.append(cropped)
+        wavs.append(_crop_waviness(cropped))
+
     phs = [item[1] for item in batch]
-    return torch.stack(images), torch.stack(phs)
+    return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
 
 def val_collate_fn(batch):
     """For validation, we will use a fixed crop size (128x128) and no color jittering.
 
     CenterCrop, not RandomCrop: the crop must be identical on every evaluate() call or the
     val loss picks up crop-to-crop noise (~1e-2) that dwarfs MIN_DELTA (1e-5), which makes
-    early stopping fire on noise instead of on a real plateau.
+    early stopping fire on noise instead of on a real plateau. Waviness is measured on this
+    same fixed crop for the same reason - see _crop_waviness.
     """
     target_h, target_w = 128, 128
     transform = T.CenterCrop((target_h, target_w))
 
     images = []
+    wavs = []
     for item in batch:
         img = item[0]
         img_padded = safe_mirror_pad(img, target_h, target_w)
-        images.append(transform(img_padded))
-        
+        cropped = transform(img_padded)
+        images.append(cropped)
+        wavs.append(_crop_waviness(cropped))
+
     phs = [item[1] for item in batch]
-    return torch.stack(images), torch.stack(phs)
+    return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
 
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
@@ -132,24 +189,25 @@ def evaluate(model, dataloader, num_noise_samples=3):
     eval_gen = torch.Generator(device=DEVICE)
     eval_gen.manual_seed(12345) 
     
-    for x_batch, pH_batch in dataloader:
+    for x_batch, pH_batch, wav_batch in dataloader:
         x1 = x_batch.to(DEVICE)
         pH = normalize_pH(pH_batch.to(DEVICE).float())
-        
+        wav = wav_batch.to(DEVICE).float()
+
         batch_loss = 0.0
-        
+
         # Average the loss over multiple random samplings for each batch
         for _ in range(num_noise_samples):
             x0 = torch.randn(x1.shape, generator=eval_gen, device=DEVICE)
             t = torch.rand(x1.shape[0], generator=eval_gen, device=DEVICE)
-            
+
             t_expand = t.view(-1, 1, 1, 1)
             xt = (1 - t_expand) * x0 + t_expand * x1
             target = x1 - x0
-            
-            
+
+
             with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-                pred = model(xt, t, pH)
+                pred = model(xt, t, pH, wav)
                 loss = F.mse_loss(pred, target)
                 
             batch_loss += loss.item()
@@ -244,12 +302,43 @@ def main():
 
     # pH buckets are heavily imbalanced (e.g. 36 vs 136 images) - weight samples by
     # inverse pH-bucket frequency so each pH gets roughly equal gradient signal.
-    train_phs = [ph for _, ph in train_dataset.samples]
+    train_phs = [ph for _, ph, _ in train_dataset.samples]
     ph_counts = Counter(train_phs)
     train_sample_weights = [1.0 / ph_counts[ph] for ph in train_phs]
     train_sampler = WeightedRandomSampler(
         train_sample_weights, num_samples=len(train_dataset), replacement=True, generator=g
     )
+
+    # Normalization constants for the waviness conditioning channel. These get stored as
+    # buffers on the model itself (see WavinessEmbedding in model.py) so they travel with
+    # the checkpoint instead of risking going stale in a sidecar file - but they MUST be
+    # fit against what training actually feeds the model (dynamic_collate_fn's per-crop,
+    # post-augmentation measurement), not the per-source-image labels in
+    # train_dataset.samples: measured directly, those two distributions are wildly
+    # different (whole-image mean=4.09px std=3.41px vs per-crop mean=6.74px std=8.53px,
+    # crops reaching up to 82px) because a small random window can show far more locally
+    # exaggerated curvature than the fibre's overall shape. Z-scoring against the wrong
+    # (narrower) std means most real training examples land at extreme, saturating z-scores
+    # instead of the well-behaved range normalization is supposed to produce - confirmed as
+    # the direct cause of a trained checkpoint showing ~zero waviness sensitivity. Sampling
+    # through the real collate pipeline here, before training starts, is the only way to
+    # get the number that's actually correct for what training will feed the model.
+    print("sampling the actual per-crop waviness distribution through dynamic_collate_fn "
+          "(this determines the model's normalization scale - see the note above)...")
+    _sample_gen = torch.Generator(); _sample_gen.manual_seed(SEED)
+    _crop_wavs = []
+    for _ in range(50):
+        idx = torch.randint(0, len(train_dataset), (BATCH_SIZE,), generator=_sample_gen).tolist()
+        _, _, _wav_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
+        _crop_wavs.append(_wav_batch)
+    real_wavs = torch.cat(_crop_wavs)
+    real_wavs = real_wavs[~torch.isnan(real_wavs)].numpy()
+    if real_wavs.size == 0:
+        raise RuntimeError("No sampled crop produced a measurable waviness - check that "
+                           "waviness.trace_fibre can find a fibre in this dataset.")
+    WAV_MEAN, WAV_STD = float(real_wavs.mean()), float(real_wavs.std())
+    print(f"waviness conditioning: {real_wavs.size}/{50 * BATCH_SIZE} sampled crops measurable, "
+          f"mean={WAV_MEAN:.2f}px std={WAV_STD:.2f}px")
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
@@ -265,7 +354,7 @@ def main():
     )
 
     
-    model = ConditionalUNet().to(DEVICE)
+    model = ConditionalUNet(waviness_mean=WAV_MEAN, waviness_std=WAV_STD).to(DEVICE)
     ema_model = deepcopy(model).eval()
     for p in ema_model.parameters():
         p.requires_grad = False
@@ -293,7 +382,7 @@ def main():
     print(f"training images: {len(train_dataset)}, Validation images: {len(val_dataset)}")
 
     while step < ITERATIONS and not stop_training:
-        for x_batch, pH_batch in train_dataloader:
+        for x_batch, pH_batch, wav_batch in train_dataloader:
             if step >= ITERATIONS:
                 break
 
@@ -301,21 +390,34 @@ def main():
             pH_raw = pH_batch.to(DEVICE).float()
             pH_jittered = (pH_raw + torch.randn_like(pH_raw) * PH_JITTER_STD).clamp(PH_MIN, PH_MAX)
             pH = normalize_pH(pH_jittered)
+            # Raw (pixel-unit) waviness - the model normalizes internally via its own
+            # buffers (see ConditionalUNet). No PH_JITTER_STD-style jitter: unlike the
+            # sparse discrete pH buckets, waviness is already a continuous real measurement
+            # with no discreteness to smooth over.
+            wav_raw = wav_batch.to(DEVICE).float()
 
             x0 = torch.randn_like(x1)
             t = torch.rand(x1.shape[0], device=DEVICE)
-            
+
             t_expand = t.view(-1, 1, 1, 1)
             xt = (1 - t_expand) * x0 + t_expand * x1
             target = x1 - x0
-            
+
             drop_mask = torch.rand(x1.shape[0], device=DEVICE) < CFG_DROPOUT
             pH_input = torch.where(drop_mask, torch.full_like(pH, float("nan")), pH)
-                        
-          
+            # Independent draw from pH's dropout, so the model sees geometry-only,
+            # texture-only, both, and neither conditioning in roughly the proportions their
+            # separate rates imply - a prerequisite for guiding the two axes independently
+            # at inference later. wav_raw is already NaN wherever trace_fibre couldn't
+            # measure the source crop, so this where() naturally unions "dropped for CFG"
+            # with "unmeasurable" into the same null path.
+            wav_drop_mask = torch.rand(x1.shape[0], device=DEVICE) < WAVINESS_CFG_DROPOUT
+            wav_input = torch.where(wav_drop_mask, torch.full_like(wav_raw, float("nan")), wav_raw)
+
+
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
-                pred = model(xt, t, pH_input)
+                pred = model(xt, t, pH_input, wav_input)
                 loss = F.mse_loss(pred, target)
                 
             # keep the unscaled value for logging - the scaled one is 1/ACCUMULATION_STEPS of

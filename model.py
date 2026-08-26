@@ -33,10 +33,57 @@ class ScalarEmbedding(nn.Module):
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim),
         )
-    
+
     def forward(self, x):
         # Map scalar -> high-dimensional embedding used for FiLM
         return self.mlp(self.fourier(x))
+
+class PosLinear(nn.Linear):
+    """A Linear layer whose weights are constrained positive via softplus, so composed with
+    a monotone-increasing activation it stays monotone-increasing end to end.
+
+    Runje & Shankaranarayana's "Constrained Monotonic Neural Networks" build the general
+    multivariate case (splitting activations into convex/concave halves) because with more
+    than one input, monotonicity in each input separately still allows sign choices that
+    interact. WavinessEmbedding only ever has a single scalar input, so that machinery isn't
+    needed - but EVERY layer must still be sign-constrained, including the first: leaving
+    even one layer unconstrained lets its hidden units diverge in direction (some increasing
+    in x, some decreasing), and a later PosLinear layer combines them with positive
+    coefficients regardless of that per-unit direction, which is not guaranteed monotonic
+    (verified directly - it produced a U-shaped response). All-positive end to end is what
+    actually guarantees every output dimension is non-decreasing in the input.
+    """
+    def forward(self, x):
+        return F.linear(x, F.softplus(self.weight), self.bias)
+
+class WavinessEmbedding(nn.Module):
+    """Embeds a continuous, physically-measured waviness value - NOT periodic like
+    FourierFeatures, deliberately. Fourier features alias outside the range they were
+    trained on (see ph_control.py's docstring for the measured example), which is fine for
+    pH's texture/chemistry signal but was exactly wrong for the one input this project
+    actually needs to extrapolate. A monotonic pathway is the opposite failure mode by
+    construction: nothing in it can wrap around and start resembling a value from the other
+    end of the range.
+    """
+    def __init__(self, emb_dim=256, hidden=64):
+        super().__init__()
+        # Every layer (including the first) must be PosLinear, not just the later ones: with
+        # an unconstrained first layer, different hidden units end up increasing or
+        # decreasing in x depending on their weight's random sign, and a PosLinear layer
+        # combines them with positive coefficients regardless - a positive-weighted mix of
+        # oppositely-moving monotone functions is not itself monotone (confirmed by direct
+        # test: it produced a U-shaped, non-monotonic response). All-positive end to end
+        # guarantees every output dimension is non-decreasing in the input, full stop.
+        self.net = nn.Sequential(
+            PosLinear(1, hidden),
+            nn.Softplus(),
+            PosLinear(hidden, hidden),
+            nn.Softplus(),
+            PosLinear(hidden, emb_dim),
+        )
+
+    def forward(self, w):
+        return self.net(w.unsqueeze(-1))
 
 class FiLMResBlock(nn.Module):        
     def __init__(self, in_ch, out_ch, emb_dim, num_groups=32, dropout=0.1):
@@ -203,12 +250,14 @@ class ConditionalUNet(nn.Module):
         out_channels=1, 
         base_channels=64,              
         channel_mults=(1, 2, 4, 8, 8), # 5 stages -> 128 to 64, 32, 16, 8, 8 (Bottleneck at 8x8)
-        num_res_blocks=2, 
-        emb_dim=256, 
-        num_heads=4
+        num_res_blocks=2,
+        emb_dim=256,
+        num_heads=4,
+        waviness_mean=0.0,
+        waviness_std=1.0,
     ):
         super().__init__()
-        
+
         self.t_embed = ScalarEmbedding(emb_dim)
         # Lower frequency range than t_embed: t is sampled densely and continuously
         # over [0,1] during training, but pH only ever takes one of 7 discrete,
@@ -219,11 +268,25 @@ class ConditionalUNet(nn.Module):
         # not just the widest one, with nothing in training to constrain it there.
         self.pH_embed = ScalarEmbedding(emb_dim, num_freqs=16, max_freq=2.0)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
-        
-        # mlp projections for time and pH embeddings to produce FiLM parameters
+
+        # Continuous, causal geometry signal, disentangled from pH's texture/chemistry
+        # role - see WavinessEmbedding. Raw (pixel-unit) waviness is normalized HERE via
+        # buffers rather than by the caller (unlike pH's normalize_pH, which every caller
+        # applies externally): these constants are fit to one specific training run, and
+        # ph_calibration.json already shows what happens when a checkpoint-specific
+        # constant lives in a sidecar file instead of the checkpoint - it silently goes
+        # stale after a retrain. Buffers travel with state_dict(), so there's nothing to
+        # forget to re-run.
+        self.register_buffer("waviness_mean", torch.tensor(float(waviness_mean)))
+        self.register_buffer("waviness_std", torch.tensor(float(waviness_std)))
+        self.waviness_embed = WavinessEmbedding(emb_dim)
+        self.null_waviness_emb = nn.Parameter(torch.zeros(emb_dim))
+
+        # mlp projections for time, pH and waviness embeddings to produce FiLM parameters
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.pH_proj = nn.Linear(emb_dim, emb_dim)
-        
+        self.waviness_proj = nn.Linear(emb_dim, emb_dim)
+
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
         self.down_stages = nn.ModuleList()
@@ -253,7 +316,7 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
     
-    def forward(self, x, t, pH):
+    def forward(self, x, t, pH, waviness=None):
         """
         Forward pass for conditional U-Net.
 
@@ -261,6 +324,11 @@ class ConditionalUNet(nn.Module):
             x: image tensor (B, C_in, H, W)
             t: scalar tensor for time/step (B,)
             pH: scalar tensor for conditional pH (B,) or NaN for null condition
+            waviness: scalar tensor for conditional RAW (pixel-unit, not pre-normalized)
+                waviness (B,), NaN for null condition, or None to mean "all null" - the
+                default keeps every call site that predates this argument (e.g. the
+                embedding-space extrapolation path in ph_control.py) working unchanged,
+                falling back to whatever geometry signal pH's own channel carries alone.
 
         Returns:
             output tensor (B, C_out, H, W)
@@ -278,8 +346,20 @@ class ConditionalUNet(nn.Module):
             pH_emb_real,
         )
 
+        if waviness is None:
+            waviness = torch.full_like(pH, float("nan"))
+        wav_is_null = torch.isnan(waviness)
+        wav_norm = (waviness - self.waviness_mean) / self.waviness_std.clamp(min=1e-6)
+        wav_safe = torch.where(wav_is_null, torch.zeros_like(wav_norm), wav_norm)
+        wav_emb_real = self.waviness_embed(wav_safe)
+        wav_emb = torch.where(
+            wav_is_null.unsqueeze(-1),
+            self.null_waviness_emb.expand_as(wav_emb_real),
+            wav_emb_real,
+        )
+
         # The merged embedding is then used to modulate the feature maps in the U-Net via FiLM layers.
-        emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb))
+        emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb) + self.waviness_proj(wav_emb))
         # input conv
         x = self.conv_in(x)
         all_skips = []

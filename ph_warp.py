@@ -76,6 +76,36 @@ def synth_displacement(width, rms, wavelength, device, generator=None, num_modes
     return d * (rms / std)
 
 
+# Safety bound on the synthesized displacement's steepness (peak px of vertical shift per
+# px of horizontal travel). Measured directly by warping a real crop at increasing pH and
+# inspecting the result: wavelength shrinks log-linearly with pH while amplitude grows
+# linearly, so past a point grid_sample's per-column resampling starts interfering with the
+# background grain's own spatial frequency and tears it into a vertical comb/moire pattern
+# that has nothing to do with the requested waviness - at pH 15.8 (peak slope ~5.4) this
+# destroys the image before refine_texture even runs. pH 10-11 (slope 0.7-1.2) renders
+# clean; pH 12 (slope 2.5) already shows the comb artifact in the background. 1.0 sits at
+# the clean end of that measured boundary.
+MAX_DISPLACEMENT_SLOPE = 1.0
+
+
+def bounded_displacement(width, rms, wavelength, device, generator=None, num_modes=5, max_widen=6):
+    """synth_displacement, widening the wavelength until the realized peak slope is safe.
+
+    A sum of several modes can locally interfere to a steeper slope than a single sinusoid
+    of the same RMS would predict, so this measures the actual result each attempt rather
+    than trusting a closed-form estimate. Returns (d, wavelength_used) - the caller needs
+    the actual wavelength to report it and to reuse it against the model's output canvas.
+    """
+    for _ in range(max_widen):
+        d = synth_displacement(width, rms, wavelength, device, generator=generator,
+                               num_modes=num_modes)
+        slope = float((d[1:] - d[:-1]).abs().max()) if d.numel() > 1 else 0.0
+        if slope <= MAX_DISPLACEMENT_SLOPE:
+            break
+        wavelength *= 1.5
+    return d, wavelength
+
+
 def centreline(img, smooth_frac=0.02):
     """Absolute row position of the filament for every column, or None.
 
@@ -147,7 +177,21 @@ def _extend_frame(img, pad, generator=None):
                       _synth_background(img, pad, at_top=False, generator=generator)], dim=2)
 
 
-def warp_filament(img, d, margin=3, extend=True):
+WARP_MARGIN = 3
+
+
+def _envelope_sigma(d):
+    """Width of warp_filament's Gaussian envelope for a given displacement, factored out so
+    the background-preservation mask (see _preserve_background) can fade over the same span
+    the warp itself already used - using a narrower mask would cut into pixels the warp only
+    partially moved, leaving a visible seam at the mask boundary."""
+    peak = max(1.0, float(d.abs().max())) if d.numel() else 1.0
+    # wide enough that the stretch between moved and stationary rows never folds
+    # (|dD/dy| < 1 needs sigma above about 0.6 * the peak displacement)
+    return max(8.0, 1.3 * peak)
+
+
+def warp_filament(img, d, margin=WARP_MARGIN, extend=True):
     """Displace the filament by d(x), with the displacement fading out away from it.
 
     Earlier attempts warped the whole frame, which drags the background along so the noise
@@ -197,10 +241,7 @@ def warp_filament(img, d, margin=3, extend=True):
     scale = max(0.0, min(1.0, scale))
     d = d * scale
 
-    peak = max(1.0, float(d.abs().max()))
-    # wide enough that the stretch between moved and stationary rows never folds
-    # (|dD/dy| < 1 needs sigma above about 0.6 * the peak displacement)
-    sigma = max(8.0, 1.3 * peak)
+    sigma = _envelope_sigma(d)
 
     ys = torch.arange(height, device=img.device, dtype=torch.float32).view(-1, 1)
     xs = torch.arange(width, device=img.device, dtype=torch.float32).view(1, -1)
@@ -240,11 +281,12 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None)
     # always re-warping the ORIGINAL rather than the previous attempt: repeated resampling
     # would soften the filament a little more each round.
     best, best_err, applied = None, float("inf"), needed
+    best_wavelength = lam
     for attempt in range(3):
         gen = None
         if seed is not None:
             gen = torch.Generator(device=img.device).manual_seed(seed + attempt * 1000)
-        d = synth_displacement(img.shape[3], applied, lam, img.device, generator=gen)
+        d, lam_used = bounded_displacement(img.shape[3], applied, lam, img.device, generator=gen)
         candidate, scale = warp_filament(img, d)
         info["fit_scale"] = scale
 
@@ -255,12 +297,13 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None)
         err = abs(achieved - target)
         if err < best_err:
             best, best_err, info["applied_rms"] = candidate, err, applied
+            best_wavelength = lam_used
             info["achieved"] = achieved
         if err <= 0.05 * target:
             break
         applied *= max(0.4, min(2.5, target / max(achieved, 1e-3)))
 
-    info.update({"wavelength": lam, "warped": True})
+    info.update({"wavelength": best_wavelength, "warped": True})
     return best, info
 
 
@@ -301,7 +344,61 @@ def _straighten(img, current, target, info):
     return out, info
 
 
-def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
+BACKGROUND_MASK_SIGMA = 10.0  # NOT tied to _envelope_sigma - that one scales with how far
+# the fiber's displacement peaks (needed to keep grid_sample from folding) and gets huge at
+# extreme pH, e.g. ~35px on a 125px-tall canvas whose own waviness already sweeps most of
+# the frame; masking that wide leaves almost nothing counted as "background" at all. This
+# stays fixed regardless of displacement size: it only needs to cover the fiber's own
+# thickness plus a small feather, not how far the fiber travelled from its original line.
+
+
+def _preserve_background(edited, ref_image, pad, sigma, new_line, old_line, edge_feather=4.0):
+    """Composite the edited canvas back onto the untouched source outside a feathered band
+    around the fiber, so an out-of-range pH request only visibly changes the microtubule -
+    not the surrounding field. Left alone, the field changes too: the anchor edit is a
+    full-canvas img2img pass over the whole crop, and even the LOCAL warp's own envelope
+    only fades toward zero with distance from the fiber rather than cutting off.
+
+    new_line and old_line are the fiber's traced row position (absolute, not detrended) in
+    the edited canvas and in ref_image respectively, or None if untraceable - the caller
+    supplies both rather than this function re-tracing `edited` itself, because re-tracing
+    GENERATED content near a freshly extended/padded edge was measured to be unreliable: the
+    per-column argmin the trace relies on occasionally latches onto a stray dark pixel in the
+    synthesised pad rows and swings by 100px within a handful of columns. Where the caller
+    has it (the geometric-warp path), new_line is instead derived analytically from old_line
+    plus the exact displacement that was applied - no re-trace, no failure mode.
+
+    The band covers BOTH where the fiber used to be and where it ended up: masking only the
+    new position left a visible ghost of the old, un-erased fiber wherever the two diverge by
+    more than a couple of sigma. pad is how many synthesised rows the warp added top/bottom
+    (0 if it did not extend) - those rows have no original counterpart and are always kept as
+    edited, ramped in over edge_feather pixels rather than a hard cutoff, which otherwise
+    showed as a visible seam at the join. sigma is fixed (BACKGROUND_MASK_SIGMA) rather than
+    tied to the warp's own envelope width - see that constant for why.
+    """
+    if new_line is None:
+        return edited
+
+    _, _, height, width = edited.shape
+    orig_h = ref_image.shape[2]
+    ys = torch.arange(height, device=edited.device, dtype=torch.float32).view(-1, 1)
+    fiber_mask = torch.exp(-0.5 * ((ys - new_line.view(1, -1)) / sigma) ** 2)
+    if old_line is not None:
+        old_mask = torch.exp(-0.5 * ((ys - (old_line + pad).view(1, -1)) / sigma) ** 2)
+        fiber_mask = torch.max(fiber_mask, old_mask)
+
+    ys_flat = ys.view(-1)
+    valid = (torch.sigmoid((ys_flat - pad) / edge_feather)
+            * torch.sigmoid((pad + orig_h - 1 - ys_flat) / edge_feather)).view(-1, 1)
+    keep_edited = torch.clamp(fiber_mask + (1 - valid), 0, 1).view(1, 1, height, width)
+
+    source_aligned = torch.zeros_like(edited)
+    source_aligned[:, :, pad:pad + orig_h, :] = ref_image
+    return keep_edited * edited + (1 - keep_edited) * source_aligned
+
+
+def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=True,
+               geometry_mode="warp", **kw):
     """Edit a real crop to ANY pH, dispatching to whichever mechanism works there.
 
         target_pH < 5.8   velocity extrapolation past the acidic anchor (validated:
@@ -310,10 +407,55 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
         target_pH > 8.8   edit to the alkaline anchor, then impose the extra undulation
                           geometrically - velocity extrapolation fails in this direction
 
+    extend_frame lets the above-range warp grow the canvas (adding synthesised background
+    rows top/bottom) when a thin source crop has no room to express the requested waviness
+    otherwise; False caps the warp to whatever fits inside the existing frame instead (see
+    warp_filament's `scale`/fit_scale). Outside the trained range the result is composited
+    back onto the untouched source everywhere except a feathered band around the fiber (see
+    _preserve_background) - both the anchor edit and the warp touch the wider field by
+    default, and only the microtubule itself is meant to change. This composite only applies
+    outside [PH_MIN, PH_MAX]; ordinary in-range conditioning is untouched. See
+    refine_texture's docstring for why a texture touch-up pass is NOT additionally run.
+
+    geometry_mode="warp" (default) is everything documented above - unchanged, still what
+    every existing caller gets. geometry_mode="native" skips the pixel warp entirely and
+    drives geometry in EITHER direction through the model's own waviness conditioning
+    instead (model.py's WavinessEmbedding); it needs a checkpoint trained with that
+    embedding and is NOT YET VALIDATED against real output (no such checkpoint exists as of
+    this writing) - see img2img.py's --geometry_mode flag to compare the two directly once
+    one does. Out-of-range native results still go through _preserve_background, for the
+    same reason the warp path does: edit_image's sliding window is a full-canvas pass, not
+    fibre-restricted, regardless of which conditioning mechanism drives it.
+
     Returns (image in [0,1], info dict). Everything in kw is forwarded to edit_image.
     """
     from img2img import edit_image
 
+    if geometry_mode not in ("warp", "native"):
+        raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} (expected 'warp' or 'native')")
+
+    if geometry_mode == "native":
+        # Both branches MUST share the same pH anchor. Clamping source_pH and target_pH
+        # independently (the original bug here) leaves the contrastive push varying pH
+        # between them too whenever the real source_pH differs from the target's anchor -
+        # exactly the texture/geometry entanglement this whole mechanism exists to remove.
+        # Pinning both to target_pH's anchor makes waviness the ONLY thing that differs
+        # between the two branches, so v_target - v_source is a clean geometry direction.
+        anchor = min(max(target_pH, PH_MIN), PH_MAX)
+        out = edit_image(model=model, ref_image=ref_image, source_pH=anchor,
+                         target_pH=anchor, seed=seed,
+                         source_waviness=predicted_waviness(source_pH),
+                         target_waviness=predicted_waviness(target_pH), **kw)
+        info = {"mode": "native", "target_waviness": predicted_waviness(target_pH)}
+        if not (PH_MIN <= target_pH <= PH_MAX):
+            canvas = out * 2 - 1
+            old_line = centreline(ref_image)
+            new_line = centreline(canvas) if old_line is not None else None
+            canvas = _preserve_background(canvas, ref_image, pad=0,
+                                          sigma=BACKGROUND_MASK_SIGMA,
+                                          new_line=new_line, old_line=old_line)
+            out = ((canvas + 1) / 2).clamp(0, 1)
+        return out, info
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
@@ -334,7 +476,14 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
         # Straightening scales the filament's OWN traced centreline, so it must read the
         # image it is straightening; a source-derived displacement would not line up.
         straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed)
-        return ((straightened + 1) / 2).clamp(0, 1), {"mode": "warp", **plan}
+        info = {"mode": "warp", **plan}
+        if plan.get("warped"):
+            old_line = centreline(ref_image)
+            new_line = centreline(straightened) if old_line is not None else None
+            straightened = _preserve_background(straightened, ref_image, pad=0,
+                                                sigma=BACKGROUND_MASK_SIGMA,
+                                                new_line=new_line, old_line=old_line)
+        return ((straightened + 1) / 2).clamp(0, 1), info
 
     _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed)
     info = {"mode": "warp", **plan}
@@ -342,23 +491,45 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, **kw):
         return out, info
 
     generator = torch.Generator(device=canvas.device).manual_seed(seed or 0)
-    displacement = synth_displacement(canvas.shape[3], plan["applied_rms"],
-                                      plan["wavelength"] or predicted_wavelength(target_pH),
-                                      canvas.device, generator=generator)
-    warped, info["fit_scale"] = warp_filament(canvas, displacement,
-                                              extend=plan.get("mode_detail") != "straighten")
+    displacement, _ = bounded_displacement(canvas.shape[3], plan["applied_rms"],
+                                           plan["wavelength"] or predicted_wavelength(target_pH),
+                                           canvas.device, generator=generator)
+    warp_extend = extend_frame and plan.get("mode_detail") != "straighten"
+    warped, info["fit_scale"] = warp_filament(canvas, displacement, extend=warp_extend)
+
+    pad = 0
+    if warp_extend:
+        pad = int(math.ceil(float(displacement.abs().max()))) + WARP_MARGIN
+    old_line = centreline(ref_image)
+    new_line = None
+    if old_line is not None:
+        # Derived analytically from the exact displacement applied, rather than re-traced
+        # from `warped` - see _preserve_background's docstring for why re-tracing generated
+        # content near the padded edge is unreliable. Correct at the line's own row, where
+        # warp_filament's Gaussian envelope is ~1 by construction.
+        new_line = old_line + pad + displacement * info["fit_scale"]
+    warped = _preserve_background(warped, ref_image, pad=pad, sigma=BACKGROUND_MASK_SIGMA,
+                                  new_line=new_line, old_line=old_line)
     return ((warped + 1) / 2).clamp(0, 1), info
 
 
 def refine_texture(model, img, anchor_pH, strength=0.4, num_steps=60, seed=None):
     """Re-render texture over warped geometry, without disturbing the geometry.
 
-    The shear resamples pixels, which softens the filament and leaves the synthesised
-    background looking flatter than real microscopy noise. Running a short img2img pass
-    fixes that, and it is safe precisely because of the property that made the anchor
-    useless for CHANGING waviness: at a modest strength the source pins the centreline, so
-    the model repaints texture around geometry it cannot move. Source and target pH are
-    both the anchor, so no pH editing happens here - only resynthesis.
+    NOT currently called by edit_to_pH - kept as a documented dead end. The idea was sound
+    on paper: the warp's grid_sample shear softens the filament and leaves the synthesised
+    background flatter than real microscopy noise, and a short same-pH img2img pass should
+    fix that safely, since at a modest strength the source pins the centreline and the model
+    can only repaint texture around geometry it cannot move.
+
+    Measured instead: feeding ANY resampled image back through edit_image - warped, merely
+    frame-extended, or even the model's own unwarped anchor output re-fed unchanged - adds a
+    fine-grained grainy/salt-and-pepper texture across the WHOLE frame, well beyond whatever
+    region actually needed smoothing. This held at every strength tried from 0.05 to 0.4
+    with no safe low end, so it is not a dosing problem. The model was trained only on real
+    crops - never on its own output, and never on grid_sample-resampled ones - and handing
+    either back as a fresh anchor apparently lands it somewhere it never learned to denoise
+    cleanly. edit_to_pH returns the plain warped image instead.
     """
     from img2img import edit_image  # imported lazily; img2img imports this module's peers
     out = edit_image(model=model, ref_image=img, source_pH=anchor_pH, target_pH=anchor_pH,

@@ -4,25 +4,39 @@ import torch
 import torchvision.utils as vutils
 from model import ConditionalUNet
 from config import PH_MIN, PH_MAX, DEVICE
-from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
+from ph_control import normalize_pH, velocity_for_pH, predicted_waviness, describe as describe_pH
 
 @torch.no_grad()
 def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None,
-           solver="heun", guidance_rescale=0.7):
+           solver="heun", guidance_rescale=0.7, geometry_mode="embedding"):
     """Generate samples at any pH.
 
-    pH_query may lie outside the trained range: velocity_for_pH extrapolates along the
-    acidic->alkaline direction instead of feeding an out-of-range value into the periodic
-    embedding. Classifier-free guidance then applies on top of that, unchanged.
+    geometry_mode="embedding" (default): pH_query may lie outside the trained range;
+    velocity_for_pH extrapolates along the acidic->alkaline direction instead of feeding an
+    out-of-range value into the periodic embedding. Validated for BELOW-range generation
+    only (see ph_control.py's docstring) - there is still no correct path above range
+    through this mode.
+    geometry_mode="native": drives geometry through the model's own waviness conditioning
+    instead (model.py's WavinessEmbedding), in EITHER direction - needs a checkpoint
+    trained with it, NOT YET VALIDATED (no such checkpoint exists as of this writing).
+    Free generation has no reference-image anchor for this to fight the way img2img.py's
+    editing does, so there is a real chance it works both directions here where the warp-
+    based mechanism in ph_warp.py needed one direction handled geometrically instead - but
+    that is a hypothesis, not yet a measurement.
+    Classifier-free guidance applies on top of either mode, unchanged.
     """
     if seed is not None:
         torch.manual_seed(seed)
+
+    if geometry_mode not in ("embedding", "native"):
+        raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} (expected 'embedding' or 'native')")
+    target_waviness = predicted_waviness(pH_query) if geometry_mode == "native" else None
 
     pH_null = torch.full((num_samples,), float("nan"), device=DEVICE)
 
     def compute_v_cfg(x_in, step_idx):
         t = torch.full((num_samples,), step_idx / num_steps, device=DEVICE)
-        v_cond = velocity_for_pH(model, x_in, t, pH_query)
+        v_cond = velocity_for_pH(model, x_in, t, pH_query, waviness=target_waviness)
         v_uncond = model(x_in, t, pH_null)
         v_cfg = v_uncond + cfg_scale * (v_cond - v_uncond)
 
@@ -63,6 +77,11 @@ def main():
     parser.add_argument("--num_steps", type=int, default=1000)
     parser.add_argument("--cfg_scale", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--geometry_mode", type=str, default="embedding", choices=["embedding", "native"],
+                        help="'embedding' (default) is the validated velocity-extrapolation "
+                             "mechanism, correct below range only. 'native' drives geometry "
+                             "through the model's own waviness conditioning instead - requires "
+                             "a checkpoint trained with it; NOT YET VALIDATED.")
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
@@ -76,9 +95,10 @@ def main():
     os.makedirs("outputs", exist_ok=True)
 
     for ph in args.pH:
-        print(f"Generuji vzorky pro pH = {ph} ... ({describe_pH(ph)})")
+        print(f"Generuji vzorky pro pH = {ph} ... ({describe_pH(ph, geometry_mode=args.geometry_mode)})")
         samples = sample(model, pH_query=ph, num_samples=args.num_samples,
-                         num_steps=args.num_steps, cfg_scale=args.cfg_scale, seed=args.seed)
+                         num_steps=args.num_steps, cfg_scale=args.cfg_scale, seed=args.seed,
+                         geometry_mode=args.geometry_mode)
 
         save_path = f"outputs/sample_pH_{ph}.png"
         vutils.save_image(samples, save_path, nrow=4)

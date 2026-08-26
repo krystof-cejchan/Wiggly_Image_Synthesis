@@ -10,6 +10,7 @@ import torchvision.transforms.v2.functional as TF
 from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
+from ph_warp import edit_to_pH
 from waviness import box_blur
 
 def load_and_preprocess_image(image_path):
@@ -191,7 +192,7 @@ def save_repair_diagnostic(original, repaired, gaps, out_path):
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
-               ph_rescale=False):
+               ph_rescale=False, source_waviness=None, target_waviness=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
@@ -203,6 +204,12 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     along the acidic->alkaline direction rather than pushing an out-of-range value through
     the periodic embedding, which would alias. ph_lambda forces a specific extrapolation
     strength instead of deriving one from target_pH, and exists for calibrate_ph.py.
+
+    source_waviness/target_waviness, when given, are forwarded to velocity_for_pH and take
+    over from the embedding-space extrapolation above: geometry is driven directly through
+    the model's own waviness conditioning instead (needs a checkpoint trained with it - see
+    model.py's WavinessEmbedding). ph_warp.edit_to_pH's geometry_mode="native" is what sets
+    these; a plain call here still defaults to today's behaviour unchanged.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -237,9 +244,10 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                 x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
 
                 v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
-                                              rescale=ph_rescale)
+                                              rescale=ph_rescale, waviness=source_waviness)
                 v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
-                                              rescale=ph_rescale, lam_override=ph_lambda)
+                                              rescale=ph_rescale, lam_override=ph_lambda,
+                                              waviness=target_waviness)
 
                 v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
                 v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
@@ -270,16 +278,26 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     return apply_contrast(out, contrast, contrast_mode)
 
 def visualize_difference(original_tensor, edited_tensor, original_size, source_pH, target_pH):
-    """Visualizes the difference between the original and edited images."""
+    """Visualizes the difference between the original and edited images.
+
+    An above-range target pH can grow the edited canvas taller than the source (ph_warp
+    extends the frame to fit waviness a thin crop has no room for) - the diff map only
+    makes sense over pixels the two share, so it's taken from a centered crop of the taller
+    image rather than assuming matching shapes.
+    """
     orig_w, orig_h = original_size
     orig_crop = original_tensor[:, :, :orig_h, :orig_w]
-    edit_crop = edited_tensor[:, :, :orig_h, :orig_w]
-    
+    edit_crop = edited_tensor[:, :, :, :orig_w]
+
     orig_img = (orig_crop.squeeze().cpu() + 1) / 2
     edit_img = edit_crop.squeeze().cpu()
-    
-    diff_map = torch.abs(orig_img - edit_img)
-    
+
+    if edit_img.shape[0] == orig_img.shape[0]:
+        diff_map = torch.abs(orig_img - edit_img)
+    else:
+        top = (edit_img.shape[0] - orig_img.shape[0]) // 2
+        diff_map = torch.abs(orig_img - edit_img[top:top + orig_img.shape[0]])
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
     # original
@@ -299,7 +317,7 @@ def visualize_difference(original_tensor, edited_tensor, original_size, source_p
     fig.colorbar(im_diff, ax=axes[2], fraction=0.046, pad=0.04)
     
     plt.tight_layout()
-    plt.show()
+    #plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description="Image-to-Image pH Editing using Conditional UNet")
@@ -323,6 +341,12 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
+    parser.add_argument("--geometry_mode", type=str, default="warp", choices=["warp", "native"],
+                        help="'warp' (default) is the validated geometric pixel-warp mechanism "
+                             "this CLI has always used outside the trained range. 'native' drives "
+                             "geometry through the model's own waviness conditioning instead - "
+                             "requires a checkpoint trained with it (see model.py's "
+                             "WavinessEmbedding); NOT YET VALIDATED against real output.")
 
     args = parser.parse_args()
     
@@ -342,7 +366,7 @@ def main():
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
-    print(describe_pH(args.target_pH))
+    print(describe_pH(args.target_pH, geometry_mode=args.geometry_mode))
 
     display_ref = ref_image
     if args.repair_gaps:
@@ -357,26 +381,47 @@ def main():
         else:
             print("No repairable fibre gaps detected - anchor left unchanged.")
 
-    edited_img = edit_image(
-        model=model, 
-        ref_image=ref_image, 
-        source_pH=args.source_pH,  
-        target_pH=args.target_pH, 
-        denoising_strength=args.strength, 
+    edited_img, edit_info = edit_to_pH(
+        model=model,
+        ref_image=ref_image,
+        source_pH=args.source_pH,
+        target_pH=args.target_pH,
+        denoising_strength=args.strength,
         num_steps=args.num_steps,
-        contrastive_scale=args.contrastive_scale,         
+        contrastive_scale=args.contrastive_scale,
         seed=args.seed,
         contrast=args.contrast,
         solver=args.solver,
-        contrast_mode=args.contrast_mode
+        contrast_mode=args.contrast_mode,
+        extend_frame=True,
+        geometry_mode=args.geometry_mode,
     )
+    if edit_info.get("mode") == "warp":
+        if edit_info.get("warped"):
+            grown = edited_img.shape[2] - ref_image.shape[2]
+            achieved = edit_info.get("achieved")
+            detail = f"achieved rms {achieved:.1f}px" if achieved is not None else \
+                     f"applied rms {edit_info.get('applied_rms', 0.0):.1f}px"
+            extra = f", canvas grew {grown}px to fit it" if grown > 0 else ""
+            print(f"Geometric pH warp applied: target waviness {edit_info.get('target', 0.0):.1f}px "
+                  f"({detail}{extra})")
+            if edit_info.get("fit_scale", 1.0) < 0.999:
+                print(f"  Note: source crop limited the warp to "
+                      f"{edit_info['fit_scale'] * 100:.0f}% of the requested displacement.")
+        else:
+            print("No geometric pH warp applied: the fibre could not be confidently traced "
+                  "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
+    elif edit_info.get("mode") == "native":
+        print(f"Native waviness conditioning applied: target waviness "
+              f"{edit_info.get('target_waviness', 0.0):.1f}px (untested mechanism - no "
+              f"checkpoint trained with it exists yet; compare against --geometry_mode warp)")
 
     # compare against the unrepaired source - the repair is an input-side aid, not a result
     visualize_difference(display_ref, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
-    
+
     orig_w, orig_h = original_size
-    edited_crop_for_save = edited_img[:, :, :orig_h, :orig_w]
-    
+    edited_crop_for_save = edited_img[:, :, :, :orig_w]
+
     save_path = f"outputs_img2img/edited_pH_{args.target_pH}_str_{args.strength}.png"
     vutils.save_image(edited_crop_for_save, save_path, nrow=1)
     print(f"Result saved to: {save_path}")

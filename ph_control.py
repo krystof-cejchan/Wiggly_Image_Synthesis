@@ -132,12 +132,25 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
     return v
 
 
-def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None):
+def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
-    as before. Outside, it costs two calls and blends them.
+    as before. Outside, it costs two calls and blends them (embedding-space extrapolation) -
+    UNLESS `waviness` is given, which takes over instead: pH is pinned to the nearest
+    trained anchor (texture/chemistry fidelity) and the requested geometry goes straight
+    into the model's own waviness conditioning (see model.py's WavinessEmbedding), which -
+    unlike this function's embedding-space extrapolation - has no periodic component to
+    alias and was built specifically to extrapolate past its training range without
+    wrapping. Requires a checkpoint trained with the waviness-conditioned ConditionalUNet;
+    a checkpoint predating that silently ignores `waviness` via forward()'s default (None),
+    so this argument is always safe to pass, it just does nothing on an old checkpoint.
     """
+    if waviness is not None:
+        anchor = min(max(pH_query, PH_MIN), PH_MAX)
+        ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
+        wav = torch.full((x.shape[0],), float(waviness), device=x.device)
+        return model(x, t, ph, wav)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)
@@ -146,14 +159,26 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None):
     return extrapolate(v_lo, v_hi, lam, rescale=rescale)
 
 
-def describe(pH_query):
+def describe(pH_query, geometry_mode="warp"):
     """One-line summary for CLI output, so an extrapolated request is never silent.
 
-    Which mechanism applies depends on the direction, because they were measured to work
-    asymmetrically - see ph_warp.py for the numbers behind that split.
+    geometry_mode must match whatever the caller is actually about to run (img2img.py's and
+    sample.py's own --geometry_mode) - this function has no way to know which mechanism was
+    selected otherwise, and describing the wrong one is worse than describing neither. Which
+    mechanism applies inside "warp"/"embedding" mode depends on the direction, because those
+    were measured to work asymmetrically - see ph_warp.py for the numbers behind that split.
+    "native" is symmetric across direction (it's the same conditioning pathway either way)
+    but is NOT YET VALIDATED - flagged as such every time it's named here on purpose.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
+    direction = "BELOW" if pH_query < PH_ANCHOR_LO else "ABOVE"
+    if geometry_mode == "native":
+        anchor = min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI)
+        return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+                f"{PH_ANCHOR_HI:g}] - NATIVE waviness conditioning: anchoring pH at "
+                f"{anchor:g}, targeting {predicted_waviness(pH_query):.1f}px directly "
+                f"through the model's own conditioning (mechanism not yet validated)")
     if pH_query < PH_ANCHOR_LO:
         return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
                 f"{PH_ANCHOR_HI:g}] - extrapolating the velocity field past the acidic "
