@@ -4,7 +4,7 @@ import torch
 import torchvision.utils as vutils
 from model import ConditionalUNet
 from config import PH_MIN, PH_MAX, DEVICE
-from ph_control import normalize_pH, velocity_for_pH, predicted_waviness, describe as describe_pH
+from ph_control import normalize_pH, velocity_for_pH, predicted_waviness_native, describe as describe_pH
 
 @torch.no_grad()
 def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None,
@@ -30,7 +30,7 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
 
     if geometry_mode not in ("embedding", "native"):
         raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} (expected 'embedding' or 'native')")
-    target_waviness = predicted_waviness(pH_query) if geometry_mode == "native" else None
+    target_waviness = predicted_waviness_native(pH_query) if geometry_mode == "native" else None
 
     pH_null = torch.full((num_samples,), float("nan"), device=DEVICE)
 

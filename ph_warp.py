@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 
 from config import PH_MAX, PH_MIN
-from ph_control import predicted_waviness
+from ph_control import predicted_waviness, predicted_waviness_native
 from waviness import box_blur, trace_fibre, waviness
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
@@ -441,12 +441,16 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # exactly the texture/geometry entanglement this whole mechanism exists to remove.
         # Pinning both to target_pH's anchor makes waviness the ONLY thing that differs
         # between the two branches, so v_target - v_source is a clean geometry direction.
+        # predicted_waviness_native, NOT predicted_waviness: the model's conditioning was
+        # trained on per-crop-scale labels, not the whole-image scale predicted_waviness()
+        # is calibrated against (that mismatch is what made waviness conditioning
+        # ineffective in the first place - see ph_control.py's _DEFAULTS).
         anchor = min(max(target_pH, PH_MIN), PH_MAX)
         out = edit_image(model=model, ref_image=ref_image, source_pH=anchor,
                          target_pH=anchor, seed=seed,
-                         source_waviness=predicted_waviness(source_pH),
-                         target_waviness=predicted_waviness(target_pH), **kw)
-        info = {"mode": "native", "target_waviness": predicted_waviness(target_pH)}
+                         source_waviness=predicted_waviness_native(source_pH),
+                         target_waviness=predicted_waviness_native(target_pH), **kw)
+        info = {"mode": "native", "target_waviness": predicted_waviness_native(target_pH)}
         if not (PH_MIN <= target_pH <= PH_MAX):
             canvas = out * 2 - 1
             old_line = centreline(ref_image)

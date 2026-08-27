@@ -52,9 +52,22 @@ class PosLinear(nn.Linear):
     coefficients regardless of that per-unit direction, which is not guaranteed monotonic
     (verified directly - it produced a U-shaped response). All-positive end to end is what
     actually guarantees every output dimension is non-decreasing in the input.
+
+    The all-positive constraint has a second consequence that isn't optional to handle: an
+    ordinary Linear layer's output stays roughly bounded regardless of width because its
+    positive- and negative-weighted terms cancel (central-limit behaviour); a sum of
+    strictly-positive weights times strictly-positive activations (Softplus's output is
+    always positive) CANNOT cancel, so the sum grows linearly with fan-in instead of
+    staying flat. Measured directly on a trained model: this stacked 3 deep (1->64->64->256)
+    into a final embedding with norm ~10000-16000, over 1000x pH_embed's ~7-8 - large enough
+    to dominate and likely saturate the shared FiLM pathway regardless of the actual value
+    requested, which plausibly explains near-zero waviness sensitivity surviving every
+    labeling/calibration fix so far. Dividing by fan-in (in_features) here cancels that
+    linear growth directly - it's just a positive constant, so it changes nothing about
+    monotonicity, only the scale.
     """
     def forward(self, x):
-        return F.linear(x, F.softplus(self.weight), self.bias)
+        return F.linear(x, F.softplus(self.weight) / self.weight.shape[1], self.bias)
 
 class WavinessEmbedding(nn.Module):
     """Embeds a continuous, physically-measured waviness value - NOT periodic like

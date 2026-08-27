@@ -325,12 +325,21 @@ def main():
     # get the number that's actually correct for what training will feed the model.
     print("sampling the actual per-crop waviness distribution through dynamic_collate_fn "
           "(this determines the model's normalization scale - see the note above)...")
+    # dynamic_collate_fn draws from Python's global random module and torch's global RNG
+    # internally (random.choice, T.RandomCrop, T.RandomHorizontalFlip, ...), NOT an
+    # isolated generator - sampling through it here, before the main loop, was silently
+    # consuming and shifting that global state, so the ACTUAL training run's random crop/
+    # flip/jitter sequence was never the one SEED=42 was supposed to produce, and changed
+    # any time this sampling loop's size changed. Save and restore both RNGs around it so
+    # measuring statistics has no side effect on the run being measured.
+    _random_state, _torch_state = random.getstate(), torch.get_rng_state()
     _sample_gen = torch.Generator(); _sample_gen.manual_seed(SEED)
     _crop_wavs = []
     for _ in range(50):
         idx = torch.randint(0, len(train_dataset), (BATCH_SIZE,), generator=_sample_gen).tolist()
         _, _, _wav_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
         _crop_wavs.append(_wav_batch)
+    random.setstate(_random_state); torch.set_rng_state(_torch_state)
     real_wavs = torch.cat(_crop_wavs)
     real_wavs = real_wavs[~torch.isnan(real_wavs)].numpy()
     if real_wavs.size == 0:
