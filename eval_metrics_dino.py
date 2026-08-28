@@ -22,14 +22,13 @@ from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import DEVICE
+from config import DEVICE, CHECKPOINT_PATH
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 from img2img import edit_image, load_and_preprocess_image
 from dino_features import DinoV2Features
 
 # --- Konfigurace ---
-CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
 DATA_DIR = "data/cropped/cropped_output"
 SOURCE_PH = 5.8
 TARGET_PH = 8.8

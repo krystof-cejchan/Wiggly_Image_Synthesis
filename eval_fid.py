@@ -3,7 +3,7 @@ import torch
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import DEVICE
+from config import DEVICE, CHECKPOINT_PATH
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 from sample import sample, normalize_pH  # normalize_pH is used by the model inputs
@@ -48,7 +48,7 @@ def warmup_gpu(model, num_runs=5):
     """Run a few warm-up passes so the GPU settles before timed operations."""
     print(f"Running {num_runs} warm-up iterations...")
     model.eval()
-    dummy_x = torch.randn(2, 1, 128, 128, device=DEVICE)
+    dummy_x = torch.randn(2, 1, 64, 256, device=DEVICE)  # a trained frame size, see config.TRAIN_SIZES
     dummy_t = torch.rand(2, device=DEVICE)
     dummy_ph = normalize_pH(torch.tensor([7.0, 7.0])).to(DEVICE)
     
@@ -63,7 +63,6 @@ def warmup_gpu(model, num_runs=5):
 @torch.no_grad()
 def main():
     # 1. Configuration
-    CHECKPOINT_PATH = "./checkpoints/cfm_best_ema.pt"
     DATA_DIR = "./data/cropped/cropped_output"
     TARGET_PH = 8.8  # pH value to evaluate
     BATCH_SIZE = 16
@@ -102,10 +101,10 @@ def main():
 
     # NOTE: evaluated at NATIVE resolution, one image at a time - not squashed
     # through train.py's val_collate_fn. Real crops are thin strips (median
-    # ~40px tall), so mirror-padding them up to a 128x128 square meant most of
+    # ~40px tall), so mirror-padding them up to a square meant most of
     # each "real" sample was an exact mirrored duplicate of itself, an artifact
-    # the synthetic samples below (generated natively at 128x128, no padding)
-    # never have. FID's built-in Inception extractor resizes every update()
+    # the synthetic samples below (generated natively at sample()'s own 64x256,
+    # a trained frame size, with no padding) never have. FID's built-in Inception extractor resizes every update()
     # call to 299x299 internally regardless of input shape, so per-image native
     # sizes here are fine even though the synthetic batch below is fixed-size.
     for path in tqdm(real_paths, desc="Real data"):

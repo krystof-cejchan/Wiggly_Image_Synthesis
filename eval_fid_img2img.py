@@ -3,7 +3,7 @@ import torch
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import DEVICE
+from config import DEVICE, CHECKPOINT_PATH
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 
@@ -64,7 +64,6 @@ def main():
     # ==========================================
     # 1. Configuration
     # ==========================================
-    CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
     DATA_DIR = "data/cropped/cropped_output"
 
     # Translation FID settings

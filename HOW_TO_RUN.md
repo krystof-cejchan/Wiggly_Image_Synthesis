@@ -19,7 +19,7 @@ Nothing in this repo works without one — download it per the instructions in
 `checkpoints/download_trained_model.txt` and save it as:
 
 ```
-checkpoints/cfm_best_ema.pt
+checkpoints/cfm_best_ema_ex.pt
 ```
 
 Every script defaults `--checkpoint` (or `CHECKPOINT_PATH`) to that exact path, so if you save
@@ -135,7 +135,7 @@ The mapping from "requested pH" to "how hard to push" is fit from real measureme
 guessed, and it's specific to one checkpoint's response curve:
 
 ```bash
-python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema.pt
+python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema_ex.pt
 ```
 
 This writes `ph_calibration.json` (fitted constants) plus `outputs/ph_calibration.png` (the two
@@ -169,9 +169,9 @@ python3 train.py
 Runs up to 100,000 iterations with early stopping (stops after 10 evaluations, i.e. 5000 steps,
 with no validation improvement). Writes:
 
-- `checkpoints/cfm_best_ema.pt` — updated every time validation loss improves; this is the file
+- `checkpoints/cfm_best_ema_ex.pt` (`config.CHECKPOINT_PATH`) — updated every time validation loss improves; this is the file
   every other script loads by default.
-- `checkpoints/cfm_final_ema.pt` — written only if training runs to completion without
+- `checkpoints/cfm_final_ema_ex.pt` (`config.FINAL_CHECKPOINT_PATH`) — written only if training runs to completion without
   early-stopping.
 - `outputs/training_loss.png` and `outputs/training_loss.csv` — written when training ends,
   either way. **Always check the plot after a run**: the log-scale panel makes late-stage
@@ -219,11 +219,14 @@ needs internet access to download the backbone weights via `torch.hub`.
 ## Troubleshooting
 
 - **"Checkpoint not found"** — see step 2. Every script's default path is
-  `checkpoints/cfm_best_ema.pt`; if you're using a different file, pass `--checkpoint` explicitly.
-- **Output looks like a tiled/repeating pattern, not one fiber** — the input crop is smaller than
-  the sliding-window size (128px by default) in one or both dimensions; `img2img.py`
-  mirror-pads it up before editing, and a small enough crop mostly generates its own mirrored
-  reflection. Check the crop's actual pixel dimensions.
+  `config.CHECKPOINT_PATH` (`checkpoints/cfm_best_ema_ex.pt`); if you're using a different file, pass
+  `--checkpoint` explicitly. A checkpoint saved before the waviness conditioning existed will not
+  load into today's model at all — that is a missing-keys error, not a path problem.
+- **Output looks like a tiled/repeating pattern, not one fiber** — the input crop is narrower
+  than the trained minimum frame width (`config.TRAIN_MIN_W`, 192px); `img2img.py` mirror-pads
+  it up to that before editing, and a small enough crop mostly generates its own mirrored
+  reflection. Check the crop's actual pixel dimensions. (Height is grown with *synthesised*
+  background instead of reflection, so a short crop does not tile.)
 - **Fiber breaks into disconnected pieces** — lower `--strength` (try 0.35–0.45); see the
   `--strength` explanation in step 4.
 - **A gap/hole in the source fiber doesn't get filled in by the edit** — try `--repair_gaps`

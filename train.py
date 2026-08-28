@@ -15,7 +15,8 @@ import matplotlib
 matplotlib.use("Agg")  # training usually runs headless / over ssh - never try to open a window
 import matplotlib.pyplot as plt
 
-from config import PH_MIN, PH_MAX, DEVICE
+from config import (PH_MIN, PH_MAX, DEVICE, TRAIN_SIZES,
+                    CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH)
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
@@ -78,15 +79,16 @@ PATIENCE = 30        # val loss is noisy (fluctuates ~1e-2 while MIN_DELTA is 1e
                      # stopping outright.
 MIN_DELTA = 1e-5
 SEED = 42
-# Crop geometry, matched to the real data: source heights are 10-121px (median 43, p90 66)
-# and widths run to ~950. Heights here stay in that band on purpose. The old set asked for
-# 128 and even 256px tall crops, which forced 1.5-6x VERTICAL mirror tiling on nearly every
-# sample; framing.py documents why that destroyed the waviness label (corr 0.94 with a pure
-# tiling artefact) and taught the model to draw stacked fibres. Short crops are now grown
-# with synthesised background instead, so the taller entries here cost nothing but give the
-# warp augmentation below room to express a genuinely wavy fibre. All dims stay divisible
-# by 16 for the U-Net's 4 downsampling stages.
-TRAIN_SIZES = [(48, 384), (64, 256), (64, 384), (80, 256), (96, 192)]
+# Crop geometry (TRAIN_SIZES) now lives in config.py, imported above. It moved there
+# because img2img.py has to frame its editing window inside the same band - it used to
+# carry its own independent 128x128 window, which drifted out of this band when the sizes
+# here changed and silently cost the waviness conditioning all of its effect at inference
+# time. Heights stay in the real data's band on purpose; the old set asked for 128 and even
+# 256px tall crops, which forced 1.5-6x VERTICAL mirror tiling on nearly every sample, and
+# framing.py documents why that destroyed the waviness label (corr 0.94 with a pure tiling
+# artefact) and taught the model to draw stacked fibres. Short crops are grown with
+# synthesised background instead, so the taller entries cost nothing but give the warp
+# augmentation below room to express a genuinely wavy fibre.
 
 # On-the-fly waviness augmentation. The real data is severely unbalanced in the property we
 # actually want to control: only 25 of 361 source images can yield a crop above 12px of
@@ -568,7 +570,7 @@ def main():
                     best_val_loss = val_loss
                     best_step = step
                     epochs_without_improvement = 0
-                    torch.save(ema_model.state_dict(), "checkpoints/cfm_best_ema.pt")
+                    torch.save(ema_model.state_dict(), CHECKPOINT_PATH)
                 else:
                     epochs_without_improvement += 1
 
@@ -583,9 +585,9 @@ def main():
             step += 1
 
     if not stop_training:
-        torch.save(ema_model.state_dict(), "checkpoints/cfm_final_ema.pt")
-        print("Training completed. Final model saved as 'checkpoints/cfm_final_ema.pt'.")
-    print(f"Best validation loss: {best_val_loss:.4f} at step {best_step}. Model saved as 'checkpoints/cfm_best_ema.pt'.")
+        torch.save(ema_model.state_dict(), FINAL_CHECKPOINT_PATH)
+        print(f"Training completed. Final model saved as {FINAL_CHECKPOINT_PATH!r}.")
+    print(f"Best validation loss: {best_val_loss:.4f} at step {best_step}. Model saved as {CHECKPOINT_PATH!r}.")
 
     # always plot, whether we finished the full run or stopped early
     plot_loss_history(train_hist_steps, train_hist_losses,

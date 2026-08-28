@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ```
 
 Before running, download the trained model per `checkpoints/download_trained_model.txt` and save
-it as `checkpoints/cfm_best_ema.pt` — every script defaults to that path.
+it as `checkpoints/cfm_best_ema_ex.pt` — `config.CHECKPOINT_PATH`, which every script defaults to.
 
 ## Quick start
 

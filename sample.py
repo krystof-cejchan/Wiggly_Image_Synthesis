@@ -3,7 +3,7 @@ import argparse
 import torch
 import torchvision.utils as vutils
 from model import ConditionalUNet
-from config import PH_MIN, PH_MAX, DEVICE
+from config import PH_MIN, PH_MAX, DEVICE, CHECKPOINT_PATH
 from ph_control import normalize_pH, velocity_for_pH, predicted_waviness_native, describe as describe_pH
 
 @torch.no_grad()
@@ -70,7 +70,7 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
 
 def main():
     parser = argparse.ArgumentParser(description="Generate microtubule samples at any pH")
-    parser.add_argument("--checkpoint", default="checkpoints/cfm_best_ema.pt")
+    parser.add_argument("--checkpoint", default=CHECKPOINT_PATH)
     parser.add_argument("--pH", type=float, nargs="+",
                         default=[4.0,4.4,4.8,5.2,5.8, 6.4, 7.0, 7.4, 8.2, 8.8, 9.4, 10.0, 10.6, 11.2, 11.8, 12.4],
                         help=f"pH values to generate. Outside the trained range "

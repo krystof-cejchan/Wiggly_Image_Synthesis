@@ -24,7 +24,7 @@ import torch
 import torchvision.utils as vutils
 from PIL import Image
 
-from config import PH_MIN, PH_MAX, DEVICE
+from config import PH_MIN, PH_MAX, DEVICE, TRAIN_MIN_W, CHECKPOINT_PATH
 from img2img import (edit_image, load_and_preprocess_image, repair_fibre_gaps,
                      save_repair_diagnostic)
 from model import ConditionalUNet
@@ -36,10 +36,12 @@ DEFAULT_SCALES = [1.0, 2.0, 3.0, 5.0, 7.0]
 def discover_sources(data_dir, per_bucket, seed, min_width, min_height):
     """Pick `per_bucket` images from every pH folder. The folder name is the source pH.
 
-    Crops smaller than the 128x128 sliding window are skipped. edit_image mirror-pads
-    anything undersized up to the window, so a 44x37 crop becomes a 3x5 tiled grid of
-    itself and the model faithfully generates that tiling instead of a single fiber -
-    the result is unreadable noise. About a third of the dataset is this small.
+    Crops narrower than the trained minimum frame width (config.TRAIN_MIN_W) are skipped.
+    edit_image mirror-pads anything narrower up to that, so a 44px-wide crop becomes a
+    repeating strip of itself and the model faithfully generates that tiling instead of a
+    single fiber - the result is unreadable noise. About half the dataset is this narrow.
+    Height needs no such filter: short crops are grown with synthesised background, not
+    reflected (framing.py).
     """
     rng = random.Random(seed)
     sources = []
@@ -118,7 +120,7 @@ def save_comparison(orig_img, results, out_path, source_pH, target_pH, src_name,
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt")
+    parser.add_argument("--checkpoint", type=str, default=CHECKPOINT_PATH)
     parser.add_argument("--data_dir", type=str, default=DATA_DIR)
     parser.add_argument("--out_dir", type=str, default="outputs_img2img/sweep")
     parser.add_argument("--strength", type=float, default=0.7)
@@ -130,8 +132,9 @@ def main():
                              f"[{PH_MIN}, {PH_MAX}] relative to each source.")
     parser.add_argument("--per_bucket", type=int, default=1,
                         help="How many source images to draw from each pH folder")
-    parser.add_argument("--min_width", type=int, default=128,
-                        help="Skip crops narrower than this (they get mirror-tiled into noise)")
+    parser.add_argument("--min_width", type=int, default=TRAIN_MIN_W,
+                        help="Skip crops narrower than this (edit_image mirror-tiles anything "
+                             "below the trained minimum width, which repeats the fibre)")
     parser.add_argument("--min_height", type=int, default=32,
                         help="Skip crops shorter than this (they get mirror-tiled into noise)")
     parser.add_argument("--seed", type=int, default=42)

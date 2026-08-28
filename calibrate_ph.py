@@ -17,7 +17,7 @@ Three curves get fitted:
 
 Re-run this after training a new checkpoint; nothing else needs to change.
 
-    python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema.pt
+    python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema_ex.pt
 """
 import argparse
 import json
@@ -34,7 +34,7 @@ import math
 
 import ph_control
 import train as T
-from config import DEVICE, PH_MAX, PH_MIN
+from config import DEVICE, PH_MAX, PH_MIN, CHECKPOINT_PATH
 from img2img import edit_image, load_and_preprocess_image
 from model import ConditionalUNet
 from waviness import waviness
@@ -173,7 +173,7 @@ def _fit_physics(per_ph):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_ema.pt")
+    ap.add_argument("--checkpoint", default=CHECKPOINT_PATH)
     ap.add_argument("--lambdas", type=float, nargs="+",
                     default=[0.0, 0.5, 1.0, 1.5, 2.5, 4.0])
     ap.add_argument("--per_bucket", type=int, default=1)

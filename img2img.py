@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
@@ -7,7 +8,8 @@ import torchvision.utils as vutils
 from PIL import Image
 import matplotlib.pyplot as plt
 import torchvision.transforms.v2.functional as TF
-from config import PH_MIN, PH_MAX, DEVICE
+from config import (PH_MIN, PH_MAX, DEVICE, CHECKPOINT_PATH,
+                    TRAIN_MIN_H, TRAIN_MIN_W, TRAIN_MAX_W)
 from model import ConditionalUNet
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
@@ -47,6 +49,53 @@ def create_blending_mask(win_h, win_w, device, taper_h=True, taper_w=True):
         return torch.hann_window(n + 2, periodic=False, device=device)[1:-1]
     mask_2d = axis(win_h, taper_h).unsqueeze(1) * axis(win_w, taper_w).unsqueeze(0)
     return mask_2d.unsqueeze(0).unsqueeze(0)
+
+
+# How far a crop may be grown vertically, as a multiple of its own height. Matches the cap
+# dynamic_collate_fn applies during training (~2.2x the batch's 25th-percentile source
+# height): past it, more of the frame is synthesised background than real crop, and
+# framing.synth_background has too few donor rows to recycle without visible streaking.
+HEIGHT_PAD_LIMIT = 2.2
+
+
+def frame_height(h):
+    """Canvas height to edit a crop of height `h` in, as a multiple of 16.
+
+    The U-Net needs a multiple of 16 (4 downsampling stages), and the model was only ever
+    shown frames TRAIN_MIN_H..TRAIN_MAX_H tall (config.TRAIN_SIZES), so a shorter crop is grown toward
+    TRAIN_MIN_H with synthesised background - but never by more than HEIGHT_PAD_LIMIT.
+    A crop taller than the trained band keeps its own height; nothing is ever cropped away.
+
+    It is tempting to go further and size the frame to the waviness being ASKED for, since an
+    RMS excursion of r sweeps roughly +-sqrt(2)*r and a frame shorter than that cannot show
+    it. That was tried and is wrong: padding this dataset's 55px crop out to 96px so an 11px
+    request would fit gave the model a mostly-empty frame and it filled the new room with a
+    SECOND fibre (measured waviness 15.2px, but of a stacked pair, not one wavier filament),
+    on top of the vertical streaking the deep background synthesis leaves. The native path is
+    therefore bounded by the crop's own height, roughly (h/2 - fibre half-thickness)/sqrt(2),
+    ~18px of RMS excursion for a 64px frame. Growing the frame to get past that is
+    ph_warp.py's warp path (`extend_frame`), which can do it safely because it moves pixels
+    instead of asking the model to generate into the new rows.
+    """
+    natural = int(math.ceil(h / 16) * 16)
+    want = min(max(h, TRAIN_MIN_H), HEIGHT_PAD_LIMIT * h)
+    return max(natural, int(want // 16) * 16)
+
+
+def plan_window_starts(total_w, window_w, stride):
+    """Left edges of the sliding windows, spread evenly across the canvas.
+
+    `stride` decides only HOW MANY windows there are; where they sit follows from the canvas,
+    with the last one flush against the right edge. The old version stepped by a fixed stride
+    and then mirror-padded the canvas until the arithmetic came out even - for a 478px crop
+    that was ~100px (20%) of reflected fibre, which every window near the right edge then
+    spent part of its receptive field on.
+    """
+    if total_w <= window_w:
+        return [0]
+    count = math.ceil((total_w - window_w) / stride) + 1
+    span = total_w - window_w
+    return [round(i * span / (count - 1)) for i in range(count)]
 
 
 def apply_contrast(img01, contrast, mode="linear"):
@@ -181,11 +230,18 @@ def save_repair_diagnostic(original, repaired, gaps, out_path):
 
 @torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
-               num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
+               num_steps=100, contrastive_scale=3.0, seed=None, window_size=None, stride=None,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
                ph_rescale=False, source_waviness=None, target_waviness=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
+
+    window_size/stride default to the frame geometry the model was trained on
+    (config.TRAIN_SIZES): one window over the whole crop when it fits inside the trained
+    width band, a TRAIN_MAX_W-wide window slid across it when it does not. Passing them
+    explicitly overrides that and is only useful for reproducing an older run - the previous
+    fixed 128px-wide window sat outside that band and is exactly what stopped the waviness
+    conditioning working (see config.TRAIN_SIZES for the measurement).
 
     solver: "euler" (1st order) or "heun" (2nd order predictor-corrector). Heun evaluates
     the velocity field twice per step (2x model calls) but has O(dt^2) local error instead
@@ -207,17 +263,25 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
     _, _, h, w = ref_image.shape
 
-    # Height: grow only to the next multiple of 16 (the U-Net's 4 downsampling stages), with
-    # SYNTHESISED BACKGROUND rather than reflection. The old code padded to
-    # max(window_size, ...) + stride - 192px for a 55px crop - which mirror-tiled the fibre
-    # 3.5x and then asked the model to edit a hall of mirrors. See framing.py.
-    pad_h = ((h + 15) // 16) * 16
-    top_offset = (pad_h - h) // 2
-    padded_ref = pad_height_background(ref_image, pad_h, jitter=0.0) if pad_h > h else ref_image
-    # Width: reflection here is safe (it keeps the centreline single-valued - framing.py).
-    target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
+    # Frame the canvas inside the geometry the model was actually trained on (frame_height).
+    # Height grows with SYNTHESISED BACKGROUND rather than reflection: reflecting to reach a
+    # target height mirror-tiles the fibre - 3.5x over for a 55px crop, back when the height
+    # was padded to fit the window rather than the other way round - and then asks the model
+    # to edit a hall of mirrors. See framing.py.
+    frame_h = frame_height(h)
+    top_offset = (frame_h - h) // 2
+    padded_ref = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    # Width: reflection here is safe (it keeps the centreline single-valued - framing.py) and
+    # is now used only to reach the next multiple of 16, or the trained minimum width for a
+    # crop narrower than anything the model has seen.
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
     padded_ref = mirror_pad_width(padded_ref, target_w)
     target_h = padded_ref.shape[2]
+
+    # One window over the whole crop whenever it fits the trained width band; a wider crop
+    # slides a trained-width window across it with 50% overlap.
+    win_w = min(target_w, TRAIN_MAX_W if window_size is None else window_size)
+    starts = plan_window_starts(target_w, win_w, win_w // 2 if stride is None else stride)
 
     t_start = 1.0 - denoising_strength
     noise = torch.randn_like(padded_ref)
@@ -225,7 +289,8 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
     start_step = int(t_start * num_steps)
     # one full-height window, sliding horizontally only: no vertical taper needed
-    mask = create_blending_mask(target_h, window_size, ref_image.device, taper_h=False)
+    mask = create_blending_mask(target_h, win_w, ref_image.device, taper_h=False,
+                                taper_w=len(starts) > 1)
 
     def compute_v_dir(x_in, step_idx):
         """Velocity field at (x_in, t=step_idx/num_steps), blended across sliding windows."""
@@ -238,8 +303,8 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
         v_target_global = torch.zeros_like(x_in)
         weight_global = torch.zeros_like(x_in)
 
-        for x_idx in range(0, target_w - window_size + 1, stride):
-            x_patch = x_in[:, :, :, x_idx:x_idx+window_size]
+        for x_idx in starts:
+            x_patch = x_in[:, :, :, x_idx:x_idx+win_w]
 
             v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
                                           rescale=ph_rescale, waviness=source_waviness)
@@ -247,9 +312,9 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                                           rescale=ph_rescale, lam_override=ph_lambda,
                                           waviness=target_waviness)
 
-            v_source_global[:, :, :, x_idx:x_idx+window_size] += v_src_patch * mask
-            v_target_global[:, :, :, x_idx:x_idx+window_size] += v_tgt_patch * mask
-            weight_global[:, :, :, x_idx:x_idx+window_size] += mask
+            v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
+            v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask
+            weight_global[:, :, :, x_idx:x_idx+win_w] += mask
 
         v_source = v_source_global / weight_global.clamp(min=1e-8)
         v_target = v_target_global / weight_global.clamp(min=1e-8)
@@ -315,7 +380,7 @@ def visualize_difference(original_tensor, edited_tensor, original_size, source_p
     fig.colorbar(im_diff, ax=axes[2], fraction=0.046, pad=0.04)
     
     plt.tight_layout()
-    #plt.show()
+    plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description="Image-to-Image pH Editing using Conditional UNet")
@@ -325,7 +390,7 @@ def main():
                         help=f"Target pH. Values outside the trained range {PH_MIN}-{PH_MAX} "
                              "are reached by extrapolating along the acidic->alkaline "
                              "direction; see ph_control.py")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=CHECKPOINT_PATH, help="Path to the model checkpoint")
     parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
     parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")

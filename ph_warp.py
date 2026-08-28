@@ -402,9 +402,9 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
     instead (model.py's WavinessEmbedding); it needs a checkpoint trained with that
     embedding. Its response has been measured monotonic in the requested waviness, with real
     training support to about pH 16 - past that the warp path is the one with data behind it.
-    See img2img.py's --geometry_mode flag to compare the two directly. Out-of-range native results still go through _preserve_background, for the
-    same reason the warp path does: edit_image's sliding window is a full-canvas pass, not
-    fibre-restricted, regardless of which conditioning mechanism drives it.
+    See img2img.py's --geometry_mode flag to compare the two directly. Native results are NOT
+    composited back onto the source (the warp path's _preserve_background) in either
+    direction - see the comment at that branch for why.
 
     Returns (image in [0,1], info dict). Everything in kw is forwarded to edit_image.
     """
@@ -425,20 +425,23 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # is calibrated against (that mismatch is what made waviness conditioning
         # ineffective in the first place - see ph_control.py's _DEFAULTS).
         anchor = min(max(target_pH, PH_MIN), PH_MAX)
+        target_waviness = predicted_waviness_native(target_pH)
         out = edit_image(model=model, ref_image=ref_image, source_pH=anchor,
                          target_pH=anchor, seed=seed,
                          source_waviness=predicted_waviness_native(source_pH),
-                         target_waviness=predicted_waviness_native(target_pH), **kw)
-        info = {"mode": "native", "target_waviness": predicted_waviness_native(target_pH)}
-        if not (PH_MIN <= target_pH <= PH_MAX):
-            canvas = out * 2 - 1
-            old_line = centreline(ref_image)
-            new_line = centreline(canvas) if old_line is not None else None
-            canvas = _preserve_background(canvas, ref_image, pad=0,
-                                          sigma=BACKGROUND_MASK_SIGMA,
-                                          new_line=new_line, old_line=old_line)
-            out = ((canvas + 1) / 2).clamp(0, 1)
-        return out, info
+                         target_waviness=target_waviness, **kw)
+        # No _preserve_background here, unlike the warp path below, and deliberately not
+        # only outside the trained range either. The warp path needs it because it RESAMPLES
+        # the whole frame and invents background rows, so the field around the fibre is
+        # synthetic and worth throwing away. Nothing geometric happens on this path - the
+        # model generates the frame the same way it does for an ordinary in-range edit, and
+        # that output is not composited. Doing it only above pH 8.8 put a visible seam in the
+        # tool's behaviour at exactly the boundary the native mechanism exists to cross, and
+        # it re-imposed the SOURCE's flat background over a canvas whose undulation is the
+        # thing being asked for. It also had to re-trace the fibre in generated content to
+        # place its mask, which the warp path documents as unreliable and which showed here
+        # as rectangular blocks of kept-canvas where the trace jumped.
+        return out, {"mode": "native", "target_waviness": target_waviness}
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
