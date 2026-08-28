@@ -107,7 +107,7 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
                 ref, _ = load_and_preprocess_image(os.path.join(path, name))
                 for _ in range(crops_per_image):
                     _, _, wav = T.dynamic_collate_fn(
-                        [(ref.squeeze(0).cpu(), torch.tensor(ph), torch.tensor(0.0))])
+                        [(ref.squeeze(0).cpu(), torch.tensor(ph))])
                     value = wav.item()
                     if not math.isnan(value):
                         per_ph.setdefault(ph, []).append(value)

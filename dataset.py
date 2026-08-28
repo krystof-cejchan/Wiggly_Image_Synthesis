@@ -5,8 +5,6 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.v2 as T
 
-from waviness import waviness as measure_waviness
-
 class MicrotubuleDataset(Dataset):
     def __init__(self, root_dir, is_train=True, val_split_ratio=0.2, min_height=0):
         """min_height drops sources shorter than this many pixels. Very short crops are a
@@ -44,35 +42,21 @@ class MicrotubuleDataset(Dataset):
 
                         if is_train and not is_val_sample:
                             img_path = os.path.join(ph_dir, img_name)
-                            self.samples.append((img_path, ph_val, self._measure(img_path)))
+                            self.samples.append((img_path, ph_val))
                         elif not is_train and is_val_sample:
                             img_path = os.path.join(ph_dir, img_name)
-                            self.samples.append((img_path, ph_val, self._measure(img_path)))
+                            self.samples.append((img_path, ph_val))
 
                 except ValueError:
                     continue
 
         self.is_train = is_train
 
-    def _measure(self, img_path):
-        """Waviness of the full (uncropped) source crop, measured once at dataset-build
-        time - reuses the exact same real-pixel measurement waviness.py already computes
-        for calibration, not a synthetic label. NaN where trace_fibre can't confidently
-        lock onto a fibre (common on the smallest crops): fed to the model as the same
-        'missing' sentinel pH's own null conditioning already uses, not a separate
-        mechanism.
-        """
-        image = Image.open(img_path).convert('L')
-        image_tensor = self.base_transform(image)
-        wav = measure_waviness(image_tensor.unsqueeze(0))
-        return float(wav) if wav is not None else float("nan")
-
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, ph, wav = self.samples[idx]
+        img_path, ph = self.samples[idx]
         image = Image.open(img_path).convert('L')
         image_tensor = self.base_transform(image)
-        return (image_tensor, torch.tensor(ph, dtype=torch.float32),
-               torch.tensor(wav, dtype=torch.float32))
+        return image_tensor, torch.tensor(ph, dtype=torch.float32)

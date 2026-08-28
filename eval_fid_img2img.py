@@ -69,7 +69,7 @@ def main():
 
     # Translation FID settings
     SOURCE_PH = 5.8   # starting pH
-    TARGET_PH = 8.8   # target pH
+    TARGET_PH = 12.8   # target pH
     MAX_SAMPLES = 1000
 
     # ==========================================

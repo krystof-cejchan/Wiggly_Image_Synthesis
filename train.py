@@ -385,10 +385,10 @@ def main():
 
     # pH buckets are heavily imbalanced (e.g. 36 vs 136 images) - weight samples by
     # inverse pH-bucket frequency so each pH gets roughly equal gradient signal.
-    train_phs = [ph for _, ph, _ in train_dataset.samples]
+    train_phs = [ph for _, ph in train_dataset.samples]
     ph_counts = Counter(train_phs)
     train_sample_weights = [1.0 / ph_counts[ph] for ph in train_phs]
-    train_heights = [Image.open(p).size[1] for p, _, _ in train_dataset.samples]
+    train_heights = [Image.open(p).size[1] for p, _ in train_dataset.samples]
     train_sampler = HeightStratifiedBatchSampler(
         train_heights, train_sample_weights, BATCH_SIZE,
         num_batches=max(1, len(train_dataset) // BATCH_SIZE))
