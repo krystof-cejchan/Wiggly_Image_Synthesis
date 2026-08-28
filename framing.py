@@ -131,10 +131,22 @@ def mirror_pad_width(img, target_w):
 
 
 def fit_frame(img, target_h, target_w, generator=None, jitter=0.35):
-    """Full fit: width by reflection + random window, height by crop-or-background-pad."""
-    img = mirror_pad_width(img, target_w)
+    """Full fit: width by random window (reflecting only when the source is too narrow),
+    height by crop-or-background-pad.
+
+    The random window has to be taken from the SOURCE, before any reflection. This used to
+    call mirror_pad_width first and then crop - but mirror_pad_width always returns exactly
+    target_w (it trims), so `w > target_w` was never true and the crop was dead code: every
+    sample contributed only its leftmost target_w columns, on every epoch, forever. Verified
+    directly before the fix - 20 different generator seeds returned the identical window. For
+    a dataset whose widths reach 958px against a 384px frame that threw away most of the
+    longest fibres, and it meant each source's waviness label was measured on one fixed
+    region of it rather than sampling the whole filament.
+    """
     w = img.shape[3]
     if w > target_w:
         left = int(torch.randint(0, w - target_w + 1, (1,), generator=generator).item())
         img = img[:, :, :, left:left + target_w]
+    else:
+        img = mirror_pad_width(img, target_w)
     return fit_height(img, target_h, generator=generator, jitter=jitter)

@@ -205,9 +205,18 @@ def val_collate_fn(batch):
     target_h, target_w = 64, 256
     images, wavs = [], []
     for item in batch:
-        img = mirror_pad_width(item[0].unsqueeze(0), target_w)
-        left = max(0, (img.shape[3] - target_w) // 2)
-        img = img[:, :, :, left:left + target_w]
+        img = item[0].unsqueeze(0)
+        # Centre window, taken from the SOURCE - the same dead-code trap fit_frame had:
+        # mirror_pad_width returns exactly target_w, so cropping after it could never move
+        # the window and this "centre crop" was really a LEFT crop on every wider source.
+        # Deterministic either way, so early stopping is unaffected in kind - but val losses
+        # from before this fix are not comparable to ones after it, because they score
+        # different pixels.
+        if img.shape[3] > target_w:
+            left = (img.shape[3] - target_w) // 2
+            img = img[:, :, :, left:left + target_w]
+        else:
+            img = mirror_pad_width(img, target_w)
         h = img.shape[2]
         if h > target_h:
             top = (h - target_h) // 2
