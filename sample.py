@@ -8,7 +8,8 @@ from ph_control import normalize_pH, velocity_for_pH, predicted_waviness_native,
 
 @torch.no_grad()
 def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None,
-           solver="heun", guidance_rescale=0.7, geometry_mode="embedding"):
+           solver="heun", guidance_rescale=0.7, geometry_mode="embedding",
+           height=64, width=256):
     """Generate samples at any pH.
 
     geometry_mode="embedding" (default): pH_query may lie outside the trained range;
@@ -17,12 +18,10 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
     only (see ph_control.py's docstring) - there is still no correct path above range
     through this mode.
     geometry_mode="native": drives geometry through the model's own waviness conditioning
-    instead (model.py's WavinessEmbedding), in EITHER direction - needs a checkpoint
-    trained with it, NOT YET VALIDATED (no such checkpoint exists as of this writing).
-    Free generation has no reference-image anchor for this to fight the way img2img.py's
-    editing does, so there is a real chance it works both directions here where the warp-
-    based mechanism in ph_warp.py needed one direction handled geometrically instead - but
-    that is a hypothesis, not yet a measurement.
+    instead (model.py's WavinessEmbedding), in EITHER direction - needs a checkpoint trained
+    with it. Measured on a short validation run, output waviness rises monotonically with the
+    request in this free-generation setting (there is no reference-image anchor here for it to
+    fight, unlike img2img editing). Training support reaches about pH 16.
     Classifier-free guidance applies on top of either mode, unchanged.
     """
     if seed is not None:
@@ -49,7 +48,10 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
         v_rescaled = v_cfg * (std_cond / std_cfg.clamp(min=1e-8))
         return guidance_rescale * v_rescaled + (1 - guidance_rescale) * v_cfg
 
-    x = torch.randn(num_samples, 1, 128, 128, device=DEVICE)
+    # 64x256, not 128x128: the real crops are thin strips (median 43x297) and the model
+    # is trained on frames in that band, so a square canvas asks it for something it has
+    # never seen and used to come back as stacked mirror copies of a fibre.
+    x = torch.randn(num_samples, 1, height, width, device=DEVICE)
     dt = 1.0 / num_steps
     for i in range(num_steps):
         v1 = compute_v_cfg(x, i)
@@ -74,6 +76,8 @@ def main():
                         help=f"pH values to generate. Outside the trained range "
                              f"{PH_MIN}-{PH_MAX} the model extrapolates; see ph_control.py")
     parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--height", type=int, default=64, help="must be a multiple of 16")
+    parser.add_argument("--width", type=int, default=256, help="must be a multiple of 16")
     parser.add_argument("--num_steps", type=int, default=1000)
     parser.add_argument("--cfg_scale", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=None)
@@ -81,7 +85,7 @@ def main():
                         help="'embedding' (default) is the validated velocity-extrapolation "
                              "mechanism, correct below range only. 'native' drives geometry "
                              "through the model's own waviness conditioning instead - requires "
-                             "a checkpoint trained with it; NOT YET VALIDATED.")
+                             "a checkpoint trained with it; training support to ~pH 16.")
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
@@ -98,7 +102,8 @@ def main():
         print(f"Generuji vzorky pro pH = {ph} ... ({describe_pH(ph, geometry_mode=args.geometry_mode)})")
         samples = sample(model, pH_query=ph, num_samples=args.num_samples,
                          num_steps=args.num_steps, cfg_scale=args.cfg_scale, seed=args.seed,
-                         geometry_mode=args.geometry_mode)
+                         geometry_mode=args.geometry_mode,
+                         height=args.height, width=args.width)
 
         save_path = f"outputs/sample_pH_{ph}.png"
         vutils.save_image(samples, save_path, nrow=4)

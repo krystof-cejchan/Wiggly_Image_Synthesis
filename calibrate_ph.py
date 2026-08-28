@@ -74,51 +74,46 @@ def measure_real(data_dir, min_w=128, min_h=32):
 
 
 def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=42):
-    """Waviness of real crops, grouped by pH folder - measured the SAME way training sees
-    them (train.py's own dynamic_collate_fn: a random TRAIN_SIZES crop, flips, jitter), not
-    on the whole loaded image.
+    """Waviness of real crops measured exactly as training measures it - through train.py's
+    own dynamic_collate_fn (frame fitted to a TRAIN_SIZES aspect ratio, flips, jitter).
 
-    Whole-image measurement (measure_real, above) put predicted_waviness()'s output on a
-    completely different scale than what the model's native conditioning is actually
-    trained to respond to: measured directly, whole-image waviness across this dataset has
-    std ~3.4px, while the real per-crop training distribution (what dynamic_collate_fn
-    actually feeds the model) has std ~8.5px and reaches crops as wavy as 82px.
-    Calibrating native conditioning's targets against the wrong (whole-image) scale
-    compressed almost the model's entire learned range of response into under one
-    training-distribution standard deviation of extrapolation request - confirmed as a
-    direct cause of a trained checkpoint showing near-zero waviness sensitivity even after
-    everything else was fixed. This function is what fits native_waviness_slope/intercept
-    instead - see ph_control.predicted_waviness_native.
+    This is the scale the model's native waviness conditioning is trained on, and it is not
+    the same as measure_real's whole-image scale, so the two fits are kept separate - see
+    ph_control.py's _DEFAULTS.
 
-    Sampling crops_per_image augmented crops per source image (instead of one whole-image
-    measurement) keeps the per-bucket statistics stable despite each individual crop
-    measurement now carrying its own random-crop noise, the same way training averages
-    that noise out over many epochs.
+    The warp augmentation is switched OFF here. It exists to populate the conditioning axis
+    during training, but this function is fitting the PHYSICS - how wavy a real filament at
+    a given pH actually is - and that has to come from real geometry only. Leaving it on
+    would fold a random synthetic displacement into the pH->waviness law itself.
     """
+    saved_prob, T.WARP_AUG_PROB = T.WARP_AUG_PROB, 0.0
     T.set_seed(seed)  # dynamic_collate_fn draws from both random's and torch's global RNG
-    per_ph = {}
-    for folder in sorted(os.listdir(data_dir)):
-        path = os.path.join(data_dir, folder)
-        try:
-            ph = float(folder)
-        except ValueError:
-            continue
-        if not os.path.isdir(path):
-            continue
-        for name in sorted(os.listdir(path)):
-            if not name.endswith(".png"):
+    try:
+        per_ph = {}
+        for folder in sorted(os.listdir(data_dir)):
+            path = os.path.join(data_dir, folder)
+            try:
+                ph = float(folder)
+            except ValueError:
                 continue
-            w, h = Image.open(os.path.join(path, name)).size
-            if w < min_w or h < min_h:
+            if not os.path.isdir(path):
                 continue
-            ref, _ = load_and_preprocess_image(os.path.join(path, name))
-            for _ in range(crops_per_image):
-                _, _, wav = T.dynamic_collate_fn(
-                    [(ref.squeeze(0).cpu(), torch.tensor(ph), torch.tensor(0.0))])
-                value = wav.item()
-                if not math.isnan(value):
-                    per_ph.setdefault(ph, []).append(value)
-    return per_ph
+            for name in sorted(os.listdir(path)):
+                if not name.endswith(".png"):
+                    continue
+                w, h = Image.open(os.path.join(path, name)).size
+                if w < min_w or h < min_h:
+                    continue
+                ref, _ = load_and_preprocess_image(os.path.join(path, name))
+                for _ in range(crops_per_image):
+                    _, _, wav = T.dynamic_collate_fn(
+                        [(ref.squeeze(0).cpu(), torch.tensor(ph), torch.tensor(0.0))])
+                    value = wav.item()
+                    if not math.isnan(value):
+                        per_ph.setdefault(ph, []).append(value)
+        return per_ph
+    finally:
+        T.WARP_AUG_PROB = saved_prob
 
 
 def pick_sources(data_dir, per_bucket, min_w=200, min_h=32):

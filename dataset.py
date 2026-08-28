@@ -8,7 +8,12 @@ import torchvision.transforms.v2 as T
 from waviness import waviness as measure_waviness
 
 class MicrotubuleDataset(Dataset):
-    def __init__(self, root_dir, is_train=True, val_split_ratio=0.2):
+    def __init__(self, root_dir, is_train=True, val_split_ratio=0.2, min_height=0):
+        """min_height drops sources shorter than this many pixels. Very short crops are a
+        fibre with almost no background around it: they carry little signal, trace
+        unreliably, and - because framing.py now grows short crops with synthesised
+        background instead of mirroring them - they are the samples that would need more
+        synthetic rows than they have real ones to donate grain from."""
         self.root_dir = root_dir
         self.samples = []
 
@@ -27,6 +32,8 @@ class MicrotubuleDataset(Dataset):
                     all_images.sort()
 
                     for img_name in all_images:
+                        if min_height and Image.open(os.path.join(ph_dir, img_name)).size[1] < min_height:
+                            continue
                         base_name = img_name.split('_crop')[0]
 
                         hash_hex = hashlib.md5(base_name.encode('utf-8')).hexdigest()

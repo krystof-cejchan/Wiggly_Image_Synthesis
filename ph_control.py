@@ -64,22 +64,26 @@ CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 #   - native conditioning (model.py's WavinessEmbedding) is trained on per-crop labels
 #     (train.py's dynamic_collate_fn: a random TRAIN_SIZES crop, flips, jitter) -
 #     native_waviness_slope/intercept, fit the same way, on that same scale.
-# Measured directly: whole-image waviness across this dataset has std ~3.4px, the actual
-# per-crop training distribution has std ~8.5px (crops reaching up to 82px). Feeding the
-# whole-image-scale number to native conditioning compressed almost the model's entire
-# learned range into under one training-distribution standard deviation of extrapolation
-# request - confirmed as a direct cause of a trained checkpoint showing near-zero waviness
-# sensitivity. The native fit's R^2 (0.032) is much lower than the whole-image fit's
-# (0.84): an individual small crop is noisy around the pH trend the way any small random
-# window is, but n=2212 is large enough for the slope itself to still be meaningful, and
-# the per-bucket means climb clearly across the real range regardless. Re-run
-# calibrate_ph.py after training a new checkpoint for the complete, current fit of both;
+# Measured directly, the two scales differ by roughly 1.4x, so feeding a whole-image-scale
+# number to native conditioning systematically undershoots what the model was trained to
+# respond to. The native fit's R^2 (~0.09) is low in absolute terms because an individual
+# small crop is noisy around the pH trend the way any small random window is - but its
+# per-bucket means climb monotonically across the real range (4.2 -> 7.6px from pH 5.8 to
+# 8.8 over n>1000 crops), which is what the slope is actually being fit to.
+#
+# NOTE ON RANGE. The training distribution these feed reaches ~20px of waviness (see
+# train.py's WARP_AUG_MAX_WAVINESS and the frame-height limits above TRAIN_SIZES), so
+# native conditioning has real support up to about pH 16. predicted_waviness_native(20)
+# asks for ~25px, which is past anything the model has seen; above roughly pH 16-17 the
+# geometric warp (geometry_mode="warp") remains the mechanism with actual coverage.
+#
+# Re-run calibrate_ph.py after training a new checkpoint for the current fit of both;
 # these are the same-methodology numbers to fall back on until then.
 _DEFAULTS = {
     "waviness_slope": 1.093,        # rms_dev = slope*pH + intercept, whole-image scale
     "waviness_intercept": -3.108,
-    "native_waviness_slope": 1.8768,   # same relationship, per-crop training scale
-    "native_waviness_intercept": -6.0340,
+    "native_waviness_slope": 1.5258,   # same relationship, per-crop training scale
+    "native_waviness_intercept": -5.4576,
     "lambda_gain": 1.0,           # 1.0 = the natural "range-widths past the anchor" scale
     "max_lambda": 3.0,
 }
@@ -205,7 +209,9 @@ def describe(pH_query, geometry_mode="warp"):
     mechanism applies inside "warp"/"embedding" mode depends on the direction, because those
     were measured to work asymmetrically - see ph_warp.py for the numbers behind that split.
     "native" is symmetric across direction (it's the same conditioning pathway either way)
-    but is NOT YET VALIDATED - flagged as such every time it's named here on purpose.
+    and its response has been measured monotonic in the request; it has real training
+    support to about pH 16 (see _DEFAULTS), above which "warp" is the mechanism with
+    actual data behind it.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
@@ -215,8 +221,7 @@ def describe(pH_query, geometry_mode="warp"):
         return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
                 f"{PH_ANCHOR_HI:g}] - NATIVE waviness conditioning: anchoring pH at "
                 f"{anchor:g}, targeting {predicted_waviness_native(pH_query):.1f}px "
-                f"directly through the model's own conditioning (mechanism not yet "
-                f"validated)")
+                f"directly through the model's own conditioning")
     if pH_query < PH_ANCHOR_LO:
         return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
                 f"{PH_ANCHOR_HI:g}] - extrapolating the velocity field past the acidic "

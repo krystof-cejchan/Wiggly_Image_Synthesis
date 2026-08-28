@@ -1,9 +1,10 @@
 import os
 import csv
+import math
 import torch
 import torch.nn.functional as F
 from collections import Counter
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from copy import deepcopy
@@ -18,7 +19,10 @@ from config import PH_MIN, PH_MAX, DEVICE
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
+from PIL import Image
 from waviness import waviness as measure_waviness
+from framing import fit_frame, mirror_pad_width, pad_height_background
+from ph_warp import bounded_displacement, warp_filament
 
 # hyperparameters
 DATA_DIR = "data/cropped/cropped_output"
@@ -74,11 +78,41 @@ PATIENCE = 30        # val loss is noisy (fluctuates ~1e-2 while MIN_DELTA is 1e
                      # stopping outright.
 MIN_DELTA = 1e-5
 SEED = 42
-# Crops are thin landscape strips (median 292x42). Training sizes must stay close to that
-# aspect ratio: safe_mirror_pad reaches a target by repeatedly reflecting the image, so a
-# 384x384 target turns one 42px-tall fiber into 16 stacked mirror copies and the model
-# learns to generate that tiled hall-of-mirrors instead of a single fiber.
-TRAIN_SIZES = [(128, 128), (64, 256), (256, 64), (48, 384), (80, 192)]
+# Crop geometry, matched to the real data: source heights are 10-121px (median 43, p90 66)
+# and widths run to ~950. Heights here stay in that band on purpose. The old set asked for
+# 128 and even 256px tall crops, which forced 1.5-6x VERTICAL mirror tiling on nearly every
+# sample; framing.py documents why that destroyed the waviness label (corr 0.94 with a pure
+# tiling artefact) and taught the model to draw stacked fibres. Short crops are now grown
+# with synthesised background instead, so the taller entries here cost nothing but give the
+# warp augmentation below room to express a genuinely wavy fibre. All dims stay divisible
+# by 16 for the U-Net's 4 downsampling stages.
+TRAIN_SIZES = [(48, 384), (64, 256), (64, 384), (80, 256), (96, 192)]
+
+# On-the-fly waviness augmentation. The real data is severely unbalanced in the property we
+# actually want to control: only 25 of 361 source images can yield a crop above 12px of
+# waviness and only 7 can reach 16px, while pH 15.8 asks for ~14px and pH 20 for ~19px.
+# Training on that alone leaves the conditioning axis empty exactly where it matters.
+# So a random (NOT pH-derived) smooth displacement is applied to the fibre, and the label is
+# then MEASURED from the result rather than assumed. This is deliberately not the same thing
+# as pre-generating warped images labelled with a made-up pH: no synthetic pH-to-geometry
+# association is taught anywhere - the pH label stays the sample's real pH, and the pH->
+# waviness mapping still comes only from calibrate_ph.py's fit on real crops. The
+# augmentation populates the waviness axis and nothing else. warp_filament moves only the
+# fibre (Gaussian envelope), leaving background grain untouched, so texture stays real.
+WARP_AUG_PROB = 0.5
+WARP_AUG_MAX_WAVINESS = 26.0
+
+# A frame can only physically show so much waviness before the fibre leaves it: roughly
+# (H/2 - margin)/sqrt(2), i.e. ~12px at H=48, ~18px at H=64, ~24px at H=80, ~30px at H=96.
+# Reaching the pH 15.8-20 targets therefore needs the taller frames - but padding a 28px
+# source up to 96px means inventing more rows than the crop has real ones to donate grain
+# from, which shows up as horizontal streaking. So batches are stratified by source height
+# (HeightStratifiedBatchSampler) and the collate picks a frame height the batch can
+# actually support: tall frames get built from genuinely tall fibres, not padded up from
+# tiny ones.
+MIN_SOURCE_HEIGHT = 24
+TALL_MIN_HEIGHT = 48
+TALL_BATCH_FRACTION = 0.4
 
 def set_seed(seed):
     """Zajistí reprodukovatelnost napříč PyTorch i Pythonem."""
@@ -92,87 +126,99 @@ def set_seed(seed):
 def normalize_pH(pH):
     return 2 * (pH - PH_MIN) / (PH_MAX - PH_MIN) - 1
 
-def safe_mirror_pad(img_tensor, target_h, target_w):
-    """
-   multiple mirror padding to ensure the image tensor is at least target_h x target_w in size.
-    If the image is already larger than the target dimensions, it will be returned unchanged.
-    """
-    _, h, w = img_tensor.shape
-    
-    # Mirror padding to ensure the image tensor is at least target_h x target_w in size
-    while h < target_h:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[1])], dim=1)
-        h = img_tensor.shape[1]
-        
-    # Mirror padding to ensure the image tensor is at least target_h x target_w in size
-    while w < target_w:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
-        w = img_tensor.shape[2]
-        
-    return img_tensor
+def _measure(img4):
+    """Waviness of the exact tensor the model will be trained on, or NaN if untraceable.
 
-def _crop_waviness(img_crop):
-    """Waviness of the ACTUAL post-crop tensor, not the dataset's whole-source-image label.
-
-    Measured directly: mean |whole-image label - this crop's real waviness| is 10.5px
-    against a whole-image label std of only 3.35px across the dataset - the label was
-    louder than its own signal for most crops, since TRAIN_SIZES crops are a small,
-    randomly-positioned window into a much longer source strip and can show a locally
-    straight stretch of an overall-wavy fibre or vice versa. Feeding that mismatch in as
-    the training label isn't a mild approximation, it's closer to random noise injected
-    into the SAME summed embedding t_embed/pH_embed also flow through - plausibly why
-    overall coherence degraded, not just waviness-conditioned behaviour specifically.
+    Measured after every augmentation, on the final frame, so the label can never disagree
+    with the pixels. NaN feeds the same "unconditioned" null path pH already uses.
     """
-    wav = measure_waviness(img_crop.unsqueeze(0))
-    return wav if wav is not None else float("nan")
+    value = measure_waviness(img4)
+    return float(value) if value is not None else float("nan")
+
+
+def _warp_augment(img4):
+    """Randomly make the fibre wavier, so the conditioning axis is populated where the real
+    data is empty. Returns the warped frame; the caller re-measures the label from it.
+
+    The requested amount is drawn uniformly between the fibre's current waviness and
+    WARP_AUG_MAX_WAVINESS, which spreads samples across the sparse upper range instead of
+    piling them at the bottom where the real distribution already sits (real p50 = 3.3px).
+    warp_filament(extend=False) rescales anything that would not fit the frame, so the
+    fibre can never be pushed out of view.
+    """
+    current = measure_waviness(img4)
+    if current is None or current >= WARP_AUG_MAX_WAVINESS:
+        return img4
+    target = random.uniform(current, WARP_AUG_MAX_WAVINESS)
+    needed = math.sqrt(max(0.0, target ** 2 - current ** 2))
+    if needed < 0.5:
+        return img4
+    displacement, _ = bounded_displacement(
+        img4.shape[3], needed, random.uniform(120.0, 400.0), img4.device)
+    warped, _ = warp_filament(img4, displacement, extend=False)
+    return warped
+
 
 def dynamic_collate_fn(batch):
-    """For each batch, randomly select an aspect ratio and crop the pre-prepared images."""
-    target_h, target_w = random.choice(TRAIN_SIZES)
+    """Pick an aspect ratio the batch can support, then crop/pad every sample to it.
 
-    transform = T.Compose([
-        T.RandomCrop((target_h, target_w)),
+    The frame height is capped at ~2.2x the batch's 25th-percentile source height so no
+    sample ends up mostly synthesised background. Paired with
+    HeightStratifiedBatchSampler, which makes some batches entirely tall sources, this is
+    what lets the tall frames (needed to express high waviness) exist at all without
+    over-padding the short crops.
+    """
+    heights = [item[0].shape[1] for item in batch]
+    cap = 2.2 * float(np.percentile(heights, 25))
+    allowed = [s for s in TRAIN_SIZES if s[0] <= cap] or [min(TRAIN_SIZES)]
+    target_h, target_w = random.choice(allowed)
+
+    photometric = T.Compose([
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-        T.ColorJitter(brightness=0.1, contrast=0.1)
+        T.ColorJitter(brightness=0.1, contrast=0.1),
     ])
 
-    images = []
-    wavs = []
+    images, wavs = [], []
     for item in batch:
-        img = item[0]
-        # Pad the image to ensure it is at least target_h x target_w in size
-        img_padded = safe_mirror_pad(img, target_h, target_w)
-        # Apply the random crop and color jitter
-        cropped = transform(img_padded)
-        images.append(cropped)
-        wavs.append(_crop_waviness(cropped))
+        img = fit_frame(item[0].unsqueeze(0), target_h, target_w)
+        img = photometric(img)
+        if random.random() < WARP_AUG_PROB:
+            img = _warp_augment(img)
+        images.append(img.squeeze(0))
+        wavs.append(_measure(img))
 
     phs = [item[1] for item in batch]
     return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
+
 
 def val_collate_fn(batch):
-    """For validation, we will use a fixed crop size (128x128) and no color jittering.
+    """Fixed 64x256 centre crop, no jitter and no warp augmentation.
 
-    CenterCrop, not RandomCrop: the crop must be identical on every evaluate() call or the
-    val loss picks up crop-to-crop noise (~1e-2) that dwarfs MIN_DELTA (1e-5), which makes
-    early stopping fire on noise instead of on a real plateau. Waviness is measured on this
-    same fixed crop for the same reason - see _crop_waviness.
+    Everything here must be identical on every evaluate() call or the val loss picks up
+    augmentation noise (~1e-2) that dwarfs MIN_DELTA (1e-5), which makes early stopping fire
+    on noise instead of on a real plateau. The background padding draws random numbers, so
+    it gets a fixed-seed generator rather than the global RNG.
     """
-    target_h, target_w = 128, 128
-    transform = T.CenterCrop((target_h, target_w))
-
-    images = []
-    wavs = []
+    target_h, target_w = 64, 256
+    images, wavs = [], []
     for item in batch:
-        img = item[0]
-        img_padded = safe_mirror_pad(img, target_h, target_w)
-        cropped = transform(img_padded)
-        images.append(cropped)
-        wavs.append(_crop_waviness(cropped))
+        img = mirror_pad_width(item[0].unsqueeze(0), target_w)
+        left = max(0, (img.shape[3] - target_w) // 2)
+        img = img[:, :, :, left:left + target_w]
+        h = img.shape[2]
+        if h > target_h:
+            top = (h - target_h) // 2
+            img = img[:, :, top:top + target_h, :]
+        elif h < target_h:
+            gen = torch.Generator().manual_seed(1234)
+            img = pad_height_background(img, target_h, generator=gen, jitter=0.0)
+        images.append(img.squeeze(0))
+        wavs.append(_measure(img))
 
     phs = [item[1] for item in batch]
     return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
+
 
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
@@ -284,6 +330,43 @@ def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_ste
     print(f"Loss history saved to: {csv_path}")
 
 
+class HeightStratifiedBatchSampler(torch.utils.data.Sampler):
+    """Batches of similar source height, still weighted by inverse pH-bucket frequency.
+
+    A plain shuffled batch always contains a few very short crops, which forces the collate
+    to pick a short frame - so the tall frames that high waviness needs would never occur.
+    A fraction of batches is therefore drawn only from sources at least TALL_MIN_HEIGHT
+    tall, letting the collate safely choose a tall frame for those. The inverse-pH-frequency
+    weighting is applied within whichever pool is used, so pH balance is preserved either
+    way.
+    """
+
+    def __init__(self, heights, weights, batch_size, num_batches,
+                 tall_min=TALL_MIN_HEIGHT, tall_fraction=TALL_BATCH_FRACTION, seed=SEED):
+        self.heights = np.asarray(heights)
+        self.weights = np.asarray(weights, dtype=np.float64)
+        self.batch_size = batch_size
+        self.num_batches = num_batches
+        self.tall_fraction = tall_fraction
+        self.tall_pool = np.flatnonzero(self.heights >= tall_min)
+        self.full_pool = np.arange(len(self.heights))
+        self.rng = np.random.default_rng(seed)
+
+    def _draw(self, pool):
+        p = self.weights[pool]
+        return [int(i) for i in self.rng.choice(pool, size=self.batch_size,
+                                                replace=True, p=p / p.sum())]
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            tall = (len(self.tall_pool) >= self.batch_size // 4
+                    and self.rng.random() < self.tall_fraction)
+            yield self._draw(self.tall_pool if tall else self.full_pool)
+
+    def __len__(self):
+        return self.num_batches
+
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
@@ -297,17 +380,21 @@ def main():
     g = torch.Generator()
     g.manual_seed(SEED)
     
-    train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True)
-    val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False)
+    train_dataset = MicrotubuleDataset(DATA_DIR, is_train=True, min_height=MIN_SOURCE_HEIGHT)
+    val_dataset = MicrotubuleDataset(DATA_DIR, is_train=False, min_height=MIN_SOURCE_HEIGHT)
 
     # pH buckets are heavily imbalanced (e.g. 36 vs 136 images) - weight samples by
     # inverse pH-bucket frequency so each pH gets roughly equal gradient signal.
     train_phs = [ph for _, ph, _ in train_dataset.samples]
     ph_counts = Counter(train_phs)
     train_sample_weights = [1.0 / ph_counts[ph] for ph in train_phs]
-    train_sampler = WeightedRandomSampler(
-        train_sample_weights, num_samples=len(train_dataset), replacement=True, generator=g
-    )
+    train_heights = [Image.open(p).size[1] for p, _, _ in train_dataset.samples]
+    train_sampler = HeightStratifiedBatchSampler(
+        train_heights, train_sample_weights, BATCH_SIZE,
+        num_batches=max(1, len(train_dataset) // BATCH_SIZE))
+    n_tall = len(train_sampler.tall_pool)
+    print(f"training images: {len(train_dataset)} (>= {MIN_SOURCE_HEIGHT}px tall), "
+          f"of which {n_tall} are >= {TALL_MIN_HEIGHT}px and can carry a tall frame")
 
     # Normalization constants for the waviness conditioning channel. These get stored as
     # buffers on the model itself (see WavinessEmbedding in model.py) so they travel with
@@ -339,6 +426,13 @@ def main():
         idx = torch.randint(0, len(train_dataset), (BATCH_SIZE,), generator=_sample_gen).tolist()
         _, _, _wav_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
         _crop_wavs.append(_wav_batch)
+    # the stratified sampler also emits all-tall batches, which reach frame heights (and so
+    # waviness values) a uniformly-sampled batch never can - include some or the
+    # normalization scale would be fit to only the shorter half of the real distribution
+    for _ in range(20):
+        _, _, _wav_batch = dynamic_collate_fn(
+            [train_dataset[i] for i in train_sampler._draw(train_sampler.tall_pool)])
+        _crop_wavs.append(_wav_batch)
     random.setstate(_random_state); torch.set_rng_state(_torch_state)
     real_wavs = torch.cat(_crop_wavs)
     real_wavs = real_wavs[~torch.isnan(real_wavs)].numpy()
@@ -346,13 +440,12 @@ def main():
         raise RuntimeError("No sampled crop produced a measurable waviness - check that "
                            "waviness.trace_fibre can find a fibre in this dataset.")
     WAV_MEAN, WAV_STD = float(real_wavs.mean()), float(real_wavs.std())
-    print(f"waviness conditioning: {real_wavs.size}/{50 * BATCH_SIZE} sampled crops measurable, "
+    print(f"waviness conditioning: {real_wavs.size}/{70 * BATCH_SIZE} sampled crops measurable, "
           f"mean={WAV_MEAN:.2f}px std={WAV_STD:.2f}px")
 
     train_dataloader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
-        num_workers=4, drop_last=True,
-        worker_init_fn=seed_worker, generator=g,
+        train_dataset, batch_sampler=train_sampler,
+        num_workers=4, worker_init_fn=seed_worker, generator=g,
         collate_fn=dynamic_collate_fn
     )
     
@@ -388,7 +481,7 @@ def main():
     stop_training = False
 
     print(f"{DEVICE}.")
-    print(f"training images: {len(train_dataset)}, Validation images: {len(val_dataset)}")
+    print(f"validation images: {len(val_dataset)}")
 
     while step < ITERATIONS and not stop_training:
         for x_batch, pH_batch, wav_batch in train_dataloader:

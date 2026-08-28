@@ -137,37 +137,16 @@ def centreline(img, smooth_frac=0.02):
 
 
 def _synth_background(img, rows, at_top, generator=None):
-    """Synthesise `rows` of background that blends with the edge it is attached to.
+    """Synthesised background rows for the warp path's frame extension.
 
-    Built as illumination + grain, because those two need different treatment. The
-    illumination profile is copied per column from the adjacent real row, so brightness
-    continues smoothly across the seam and the crop's left-right falloff is preserved. The
-    grain is fresh 2D-correlated noise scaled to the crop's ACTUAL high-frequency standard
-    deviation, measured after subtracting a local blur.
-
-    Everything simpler was tried and left visible artefacts. The crops are tight bounding
-    boxes whose filament usually spans the full height, so there is no clean band to copy
-    or tile - tiling two rows just prints a repeating pattern. Measuring the grain from the
-    upper half of the histogram (an earlier attempt) underestimated it roughly twofold and
-    the extension read as conspicuously smooth.
+    Delegates to framing.synth_background, which is the single implementation shared with
+    the training pipeline. It recycles the crop's own high-frequency residual instead of
+    synthesising grain from scaled white noise: the noise-based version this used to
+    contain reproduced the right standard deviation but the wrong spectrum, and the
+    extension read as coarse blotching next to the fine grain of the real rows.
     """
-    plane = img[0, 0]
-    smooth = box_blur(img, 9)[0, 0]
-    grain = plane - smooth
-
-    line = centreline(img)
-    if line is None:
-        strength = float(grain.std())
-    else:
-        ys = torch.arange(plane.shape[0], device=plane.device).view(-1, 1)
-        away = (ys - line.view(1, -1)).abs() > 6  # ignore the filament and its shoulders
-        strength = float(grain[away].std()) if bool(away.any()) else float(grain.std())
-
-    level = smooth[0] if at_top else smooth[-1]
-    noise = torch.randn(1, 1, rows, plane.shape[1], device=plane.device, generator=generator)
-    noise = F.avg_pool2d(F.pad(noise, (1, 1, 1, 1), mode="reflect"), 3, stride=1)
-    noise = noise / noise.std().clamp(min=1e-6) * strength
-    return (level.view(1, 1, 1, -1) + noise)
+    from framing import synth_background
+    return synth_background(img, rows, at_top, generator=generator)
 
 
 def _extend_frame(img, pad, generator=None):
@@ -421,9 +400,9 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
     every existing caller gets. geometry_mode="native" skips the pixel warp entirely and
     drives geometry in EITHER direction through the model's own waviness conditioning
     instead (model.py's WavinessEmbedding); it needs a checkpoint trained with that
-    embedding and is NOT YET VALIDATED against real output (no such checkpoint exists as of
-    this writing) - see img2img.py's --geometry_mode flag to compare the two directly once
-    one does. Out-of-range native results still go through _preserve_background, for the
+    embedding. Its response has been measured monotonic in the requested waviness, with real
+    training support to about pH 16 - past that the warp path is the one with data behind it.
+    See img2img.py's --geometry_mode flag to compare the two directly. Out-of-range native results still go through _preserve_background, for the
     same reason the warp path does: edit_image's sliding window is a full-canvas pass, not
     fibre-restricted, regardless of which conditioning mechanism drives it.
 

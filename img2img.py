@@ -11,6 +11,7 @@ from config import PH_MIN, PH_MAX, DEVICE
 from model import ConditionalUNet
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
+from framing import pad_height_background, mirror_pad_width
 from waviness import box_blur
 
 def load_and_preprocess_image(image_path):
@@ -27,19 +28,25 @@ def load_and_preprocess_image(image_path):
     img_tensor = transform(image).unsqueeze(0).to(DEVICE)
     return img_tensor, original_size
 
-def create_blending_mask(window_size, device):
-    """create a 2D blending mask using a Hann window for smooth transitions between overlapping patches
+def create_blending_mask(win_h, win_w, device, taper_h=True, taper_w=True):
+    """2D blending mask for overlapping patches, tapered only along axes that actually slide.
 
-    The window is taken from the INTERIOR of a Hann window of length window_size + 2.
-    A plain hann_window(window_size) is exactly 0 at both endpoints, and the canvas border
-    is covered by only one patch, so weight_global there is 0. Dividing by the clamped
-    weight then yields velocity 0, freezing row 0 and column 0 at their initial noise
-    value - the speckled 1px edge that appeared on the left/top of every result. Trimming
-    the endpoints keeps the window strictly positive while staying symmetric.
+    The window is taken from the INTERIOR of a Hann window of length n + 2. A plain
+    hann_window(n) is exactly 0 at both endpoints, and the canvas border is covered by only
+    one patch, so weight_global there is 0; dividing by the clamped weight then yields
+    velocity 0, freezing the outermost row/column at its initial noise value. Trimming the
+    endpoints keeps the window strictly positive while staying symmetric.
+
+    An axis with only one window position needs no taper at all (its factor would cancel in
+    the weighted average anyway) - passing ones keeps that exact rather than relying on the
+    division to undo it.
     """
-    window_1d = torch.hann_window(window_size + 2, periodic=False, device=device)[1:-1]
-    mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
-    return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+    def axis(n, taper):
+        if not taper:
+            return torch.ones(n, device=device)
+        return torch.hann_window(n + 2, periodic=False, device=device)[1:-1]
+    mask_2d = axis(win_h, taper_h).unsqueeze(1) * axis(win_w, taper_w).unsqueeze(0)
+    return mask_2d.unsqueeze(0).unsqueeze(0)
 
 
 def apply_contrast(img01, contrast, mode="linear"):
@@ -60,22 +67,6 @@ def apply_contrast(img01, contrast, mode="linear"):
         raise ValueError(f"Unknown contrast mode: {mode!r} (expected 'linear' or 'gamma')")
     mean = img01.mean()
     return ((img01 - mean) * contrast + mean).clamp(0, 1)
-
-def safe_mirror_pad_4d(img_tensor, target_h, target_w):
-    """
-    Pads a 4D tensor (N, C, H, W) to at least target_h and target_w using mirror padding.
-    If the tensor is already larger than the target dimensions, it will be returned unchanged.
-    """
-    # height mirror padding (2nd dimension)
-    while img_tensor.shape[2] < target_h:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
-        
-    # width mirror padding (3rd dimension)
-    while img_tensor.shape[3] < target_w:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[3])], dim=3)
-        
-    # Crop to the exact target size if it exceeds
-    return img_tensor[:, :, :target_h, :target_w]
 
 @torch.no_grad()
 def repair_fibre_gaps(ref_image, max_gap=30, min_side=6, max_slope=1.5, blur=3):
@@ -216,17 +207,25 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
     _, _, h, w = ref_image.shape
 
-    target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
+    # Height: grow only to the next multiple of 16 (the U-Net's 4 downsampling stages), with
+    # SYNTHESISED BACKGROUND rather than reflection. The old code padded to
+    # max(window_size, ...) + stride - 192px for a 55px crop - which mirror-tiled the fibre
+    # 3.5x and then asked the model to edit a hall of mirrors. See framing.py.
+    pad_h = ((h + 15) // 16) * 16
+    top_offset = (pad_h - h) // 2
+    padded_ref = pad_height_background(ref_image, pad_h, jitter=0.0) if pad_h > h else ref_image
+    # Width: reflection here is safe (it keeps the centreline single-valued - framing.py).
     target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
-
-    padded_ref = safe_mirror_pad_4d(ref_image, target_h, target_w)
+    padded_ref = mirror_pad_width(padded_ref, target_w)
+    target_h = padded_ref.shape[2]
 
     t_start = 1.0 - denoising_strength
     noise = torch.randn_like(padded_ref)
     x = (1 - t_start) * noise + t_start * padded_ref
 
     start_step = int(t_start * num_steps)
-    mask = create_blending_mask(window_size, ref_image.device)
+    # one full-height window, sliding horizontally only: no vertical taper needed
+    mask = create_blending_mask(target_h, window_size, ref_image.device, taper_h=False)
 
     def compute_v_dir(x_in, step_idx):
         """Velocity field at (x_in, t=step_idx/num_steps), blended across sliding windows."""
@@ -239,19 +238,18 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
         v_target_global = torch.zeros_like(x_in)
         weight_global = torch.zeros_like(x_in)
 
-        for y in range(0, target_h - window_size + 1, stride):
-            for x_idx in range(0, target_w - window_size + 1, stride):
-                x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
+        for x_idx in range(0, target_w - window_size + 1, stride):
+            x_patch = x_in[:, :, :, x_idx:x_idx+window_size]
 
-                v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
-                                              rescale=ph_rescale, waviness=source_waviness)
-                v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
-                                              rescale=ph_rescale, lam_override=ph_lambda,
-                                              waviness=target_waviness)
+            v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
+                                          rescale=ph_rescale, waviness=source_waviness)
+            v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
+                                          rescale=ph_rescale, lam_override=ph_lambda,
+                                          waviness=target_waviness)
 
-                v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
-                v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
-                weight_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += mask
+            v_source_global[:, :, :, x_idx:x_idx+window_size] += v_src_patch * mask
+            v_target_global[:, :, :, x_idx:x_idx+window_size] += v_tgt_patch * mask
+            weight_global[:, :, :, x_idx:x_idx+window_size] += mask
 
         v_source = v_source_global / weight_global.clamp(min=1e-8)
         v_target = v_target_global / weight_global.clamp(min=1e-8)
@@ -271,7 +269,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
         else:
             raise ValueError(f"Unknown solver: {solver!r} (expected 'euler' or 'heun')")
 
-    x_cropped = x[:, :, :h, :w]
+    x_cropped = x[:, :, top_offset:top_offset + h, :w]
 
     out = (x_cropped.clamp(-1, 1) + 1) / 2
 
@@ -346,7 +344,7 @@ def main():
                              "this CLI has always used outside the trained range. 'native' drives "
                              "geometry through the model's own waviness conditioning instead - "
                              "requires a checkpoint trained with it (see model.py's "
-                             "WavinessEmbedding); NOT YET VALIDATED against real output.")
+                             "WavinessEmbedding); training support to ~pH 16.")
 
     args = parser.parse_args()
     
@@ -413,8 +411,8 @@ def main():
                   "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
     elif edit_info.get("mode") == "native":
         print(f"Native waviness conditioning applied: target waviness "
-              f"{edit_info.get('target_waviness', 0.0):.1f}px (untested mechanism - no "
-              f"checkpoint trained with it exists yet; compare against --geometry_mode warp)")
+              f"{edit_info.get('target_waviness', 0.0):.1f}px (supported by training data to "
+              f"~pH 16; above that compare against --geometry_mode warp)")
 
     # compare against the unrepaired source - the repair is an input-side aid, not a result
     visualize_difference(display_ref, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
