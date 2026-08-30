@@ -76,6 +76,51 @@ def waviness(ref_image):
     return float(np.sqrt(np.mean(y ** 2)))
 
 
+def wave_period(ref_image, min_rms=1.5):
+    """Dominant undulation period of the filament in pixels, or None. Lower = more waves.
+
+    This is the SPECTRAL PEAK of the traced centreline - deliberately not a turning-point
+    count and not a power-weighted mean period. The per-column trace is jittery, and both of
+    those estimators are dominated by that jitter rather than by the undulation the eye
+    follows: measured against the real crops they reported period RISING with pH and rated a
+    single-arc generated image as wavier than a real many-waved one, both of which are wrong.
+    The peak gives 311px at pH 5.8 falling to 136px at pH 8.8, agreeing with the independent
+    measurement in ph_warp.py's header (304 -> 144).
+
+    Why it is needed at all: waviness() is an RMS deviation, and a wave of amplitude A scores
+    A/sqrt(2) whether it completes one arc across the crop or ten. The local slope and
+    curvature, though, scale as A/L - so among all geometries meeting a requested rms, one
+    long arc is by far the cheapest to draw, and a model told only the rms will produce
+    exactly that. Conditioning on the period as well is what makes "many small waves"
+    expressible at all.
+
+    Returns None when the filament is too straight for a period to mean anything (rms below
+    min_rms), so the label goes to the null embedding rather than carrying pure noise.
+
+    The estimate is bounded by the crop width - a 400px crop cannot show a 600px period - so
+    values near the frame width are truncated rather than resolved.
+    """
+    traced = trace_fibre(ref_image)
+    if traced is None:
+        return None
+    x, y = traced
+    xs = np.arange(int(x.min()), int(x.max()) + 1)
+    n = len(xs)
+    if n < 128:
+        return None
+    ys = np.interp(xs, x, y)
+    if float(np.sqrt(np.mean(ys ** 2))) < min_rms:
+        return None
+    ys = ys - np.polyval(np.polyfit(np.arange(n), ys, 1), np.arange(n))
+    spectrum = np.abs(np.fft.rfft(ys * np.hanning(n))) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0)
+    spectrum[0] = 0.0                       # the DC bin is the mean, already removed
+    if spectrum.sum() <= 0:
+        return None
+    peak = freqs[int(np.argmax(spectrum))]
+    return float(1.0 / peak) if peak > 0 else None
+
+
 def waviness_stats(ref_image):
     """Both metrics, for analysis. Returns None when no fibre could be traced."""
     traced = trace_fibre(ref_image)

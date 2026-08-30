@@ -14,7 +14,8 @@ from model import from_state_dict
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
 from framing import pad_height_background, mirror_pad_width
-from waviness import box_blur, waviness as measure_waviness
+from waviness import (box_blur, waviness as measure_waviness,
+                      wave_period as measure_wave_period)
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -257,10 +258,32 @@ def measure_frame_waviness(ref_image):
 
 
 @torch.no_grad()
+def measure_frame_period(ref_image):
+    """The reference's own undulation period, measured in the frames the model will see.
+
+    Companion to measure_frame_waviness - the contrastive pair's source branch should state
+    both halves of "what the filament is now", and both are measurable. Returns None when no
+    window yields a period (waviness.wave_period declines to guess one for a filament too
+    straight for it to mean anything), which the caller turns into the fitted value.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_wave_period(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+@torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=None, stride=None,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
-               ph_rescale=False, source_waviness=None, target_waviness=None):
+               ph_rescale=False, source_waviness=None, target_waviness=None,
+               source_period=None, target_period=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
@@ -283,7 +306,10 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     source_waviness/target_waviness, when given, are forwarded to velocity_for_pH and take
     over from the embedding-space extrapolation above: geometry is driven directly through
     the model's own waviness conditioning instead (needs a checkpoint trained with it - see
-    model.py's WavinessEmbedding). ph_warp.edit_to_pH's geometry_mode="native" is what sets
+    model.py's WavinessEmbedding). source_period/target_period are the second half of that
+    geometry request - HOW OFTEN the centreline turns, where waviness says how far it strays.
+    Both are needed: rms alone is degenerate between one long arc and many short waves, and a
+    model told only the rms produces the arc. ph_warp.edit_to_pH's geometry_mode="native" is what sets
     these; a plain call here still defaults to today's behaviour unchanged.
     """
     if seed is not None:
@@ -353,10 +379,11 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
             v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
                                           rescale=ph_rescale, waviness=source_waviness,
-                                          source=src_patch)
+                                          source=src_patch, period=source_period)
             v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
                                           rescale=ph_rescale, lam_override=ph_lambda,
-                                          waviness=target_waviness, source=src_patch)
+                                          waviness=target_waviness, source=src_patch,
+                                          period=target_period)
 
             v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
             v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask

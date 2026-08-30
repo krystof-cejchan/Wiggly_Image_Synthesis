@@ -268,6 +268,9 @@ class ConditionalUNet(nn.Module):
         num_heads=4,
         waviness_mean=0.0,
         waviness_std=1.0,
+        log_period_mean=0.0,
+        log_period_std=1.0,
+        period_conditioned=True,
     ):
         super().__init__()
 
@@ -306,10 +309,28 @@ class ConditionalUNet(nn.Module):
         self.waviness_embed = WavinessEmbedding(emb_dim)
         self.null_waviness_emb = nn.Parameter(torch.zeros(emb_dim))
 
+        # SECOND geometry channel: the dominant undulation period, in log pixels. Waviness is
+        # an RMS deviation and says nothing about wavelength - a wave of amplitude A scores
+        # A/sqrt(2) whether it makes one arc across the crop or ten - while the bending cost
+        # goes as A/L, so a model told only the rms draws the cheapest thing that satisfies
+        # it: one long arc. Measured on a checkpoint conditioned on rms alone, 93% of the
+        # generated centreline's variance was a single arc spanning the whole frame, against
+        # 13% for real crops at the same pH. Period is what makes "many small waves"
+        # expressible. Log, because real periods span 40-400px; monotone embedding for the
+        # same reason waviness uses one - it has to extrapolate without aliasing.
+        self.period_conditioned = period_conditioned
+        if period_conditioned:
+            self.register_buffer("log_period_mean", torch.tensor(float(log_period_mean)))
+            self.register_buffer("log_period_std", torch.tensor(float(log_period_std)))
+            self.period_embed = WavinessEmbedding(emb_dim)
+            self.null_period_emb = nn.Parameter(torch.zeros(emb_dim))
+
         # mlp projections for time, pH and waviness embeddings to produce FiLM parameters
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.pH_proj = nn.Linear(emb_dim, emb_dim)
         self.waviness_proj = nn.Linear(emb_dim, emb_dim)
+        if period_conditioned:
+            self.period_proj = nn.Linear(emb_dim, emb_dim)
 
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
@@ -340,7 +361,18 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
     
-    def forward(self, x, t, pH, waviness=None, source=None):
+    def _gated(self, raw, mean, std, embed, null_emb):
+        """Normalise a raw scalar conditioning value and embed it, routing NaN to the learned
+        null embedding. Shared by the waviness and period channels, which differ only in
+        their constants - both are normalised HERE via buffers rather than by the caller, so
+        the constants travel inside the checkpoint and cannot go stale in a sidecar file."""
+        is_null = torch.isnan(raw)
+        normed = (raw - mean) / std.clamp(min=1e-6)
+        safe = torch.where(is_null, torch.zeros_like(normed), normed)
+        real = embed(safe)
+        return torch.where(is_null.unsqueeze(-1), null_emb.expand_as(real), real)
+
+    def forward(self, x, t, pH, waviness=None, source=None, period=None):
         """
         Forward pass for conditional U-Net.
 
@@ -379,18 +411,20 @@ class ConditionalUNet(nn.Module):
 
         if waviness is None:
             waviness = torch.full_like(pH, float("nan"))
-        wav_is_null = torch.isnan(waviness)
-        wav_norm = (waviness - self.waviness_mean) / self.waviness_std.clamp(min=1e-6)
-        wav_safe = torch.where(wav_is_null, torch.zeros_like(wav_norm), wav_norm)
-        wav_emb_real = self.waviness_embed(wav_safe)
-        wav_emb = torch.where(
-            wav_is_null.unsqueeze(-1),
-            self.null_waviness_emb.expand_as(wav_emb_real),
-            wav_emb_real,
-        )
+        wav_emb = self._gated(waviness, self.waviness_mean, self.waviness_std,
+                              self.waviness_embed, self.null_waviness_emb)
 
         # The merged embedding is then used to modulate the feature maps in the U-Net via FiLM layers.
-        emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb) + self.waviness_proj(wav_emb))
+        emb = self.t_proj(t_emb) + self.pH_proj(pH_emb) + self.waviness_proj(wav_emb)
+        if self.period_conditioned:
+            if period is None:
+                period = torch.full_like(pH, float("nan"))
+            # log, matching how the normalisation constants were fitted
+            log_period = torch.log(period.clamp(min=1.0))
+            emb = emb + self.period_proj(
+                self._gated(log_period, self.log_period_mean, self.log_period_std,
+                            self.period_embed, self.null_period_emb))
+        emb = F.silu(emb)
         # input conv
         x = self.conv_in(x)
         all_skips = []
@@ -423,16 +457,21 @@ def from_state_dict(state_dict, device=None):
         conv_in.weight  (64, 1, 3, 3)   ->  from-noise model, editing needs SDEdit
         conv_in.weight  (64, 2, 3, 3)   ->  source-conditioned, editing is a direct render
         waviness_mean present            ->  has the waviness conditioning channel
+        log_period_mean present          ->  also has the undulation-period channel
 
     waviness_mean/std are constructor arguments only because they are registered buffers; the
     values in the checkpoint immediately overwrite whatever is passed, so the defaults here
     are irrelevant to the loaded model.
     """
     in_channels = state_dict["conv_in.weight"].shape[1]
-    kwargs = {"in_channels": in_channels}
+    kwargs = {"in_channels": in_channels,
+              "period_conditioned": "log_period_mean" in state_dict}
     if "waviness_mean" in state_dict:
         kwargs["waviness_mean"] = float(state_dict["waviness_mean"])
         kwargs["waviness_std"] = float(state_dict["waviness_std"])
+    if kwargs["period_conditioned"]:
+        kwargs["log_period_mean"] = float(state_dict["log_period_mean"])
+        kwargs["log_period_std"] = float(state_dict["log_period_std"])
     model = ConditionalUNet(**kwargs)
     model.load_state_dict(state_dict)
     return model if device is None else model.to(device)

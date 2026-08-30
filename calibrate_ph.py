@@ -79,7 +79,8 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
 
     This is the scale the model's native waviness conditioning is trained on, and it is not
     the same as measure_real's whole-image scale, so the two fits are kept separate - see
-    ph_control.py's _DEFAULTS.
+    ph_control.py's _DEFAULTS. Returns (waviness, period) dicts: the geometry request has two
+    halves and both are measured here, on the same crops and the same scale.
 
     The warp augmentation is switched OFF here. It exists to populate the conditioning axis
     during training, but this function is fitting the PHYSICS - how wavy a real filament at
@@ -89,7 +90,7 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
     saved_prob, T.WARP_AUG_PROB = T.WARP_AUG_PROB, 0.0
     T.set_seed(seed)  # dynamic_collate_fn draws from both random's and torch's global RNG
     try:
-        per_ph = {}
+        per_ph, per_ph_period = {}, {}
         for folder in sorted(os.listdir(data_dir)):
             path = os.path.join(data_dir, folder)
             try:
@@ -106,12 +107,15 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
                     continue
                 ref, _ = load_and_preprocess_image(os.path.join(path, name))
                 for _ in range(crops_per_image):
-                    _, _, _, wav = T.dynamic_collate_fn(
+                    _, _, _, wav, period = T.dynamic_collate_fn(
                         [(ref.squeeze(0).cpu(), torch.tensor(ph))])
                     value = wav.item()
                     if not math.isnan(value):
                         per_ph.setdefault(ph, []).append(value)
-        return per_ph
+                    period_value = period.item()
+                    if not math.isnan(period_value):
+                        per_ph_period.setdefault(ph, []).append(period_value)
+        return per_ph, per_ph_period
     finally:
         T.WARP_AUG_PROB = saved_prob
 
@@ -205,7 +209,7 @@ def main():
 
     print("\n[2/4] measuring per-crop waviness the same way training sees it (feeds "
           "native waviness conditioning)")
-    per_ph_native = measure_real_native(DATA_DIR)
+    per_ph_native, per_ph_period = measure_real_native(DATA_DIR)
     print(f"  {'pH':>5} {'n':>4} {'mean rms_dev':>13}")
     for ph in sorted(per_ph_native):
         vals = np.array(per_ph_native[ph])
@@ -215,6 +219,17 @@ def main():
     print(f"  selected law: {native_law['form']} {np.round(native_law['coeffs'], 4).tolist()}")
     print(f"  (R^2 is much lower than [1/4]'s: an individual small crop is noisy around the "
           f"pH trend the way any small random window is)")
+
+    print("\n[2b/4] undulation PERIOD vs pH (the other half of the geometry request - "
+          "waviness says how far the centreline strays, period how often it turns)")
+    print(f"  {'pH':>5} {'n':>4} {'median period':>14}")
+    for ph in sorted(per_ph_period):
+        vals = np.array(per_ph_period[ph])
+        print(f"  {ph:5.1f} {len(vals):4d} {np.median(vals):14.0f}px")
+    period_law, period_diag, *_ = _fit_physics(per_ph_period, "undulation period")
+    print(f"  selected law: {period_law['form']} {np.round(period_law['coeffs'], 4).tolist()}")
+    print("  extrapolated: " + "  ".join(
+        f"pH{p}:{ph_control.eval_law(period_law, p):.0f}px" for p in (8.8, 10.8, 12.8)))
 
     print("\n[3/4] measuring the generator's response to lambda")
     model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
@@ -241,6 +256,8 @@ def main():
         "checkpoint": os.path.basename(args.checkpoint),
         "waviness_law": law,
         "native_waviness_law": native_law,
+        "period_law": period_law,
+        "period_law_diagnostics": period_diag,
         "waviness_law_diagnostics": law_diag,
         "native_waviness_law_diagnostics": native_diag,
         # the plain linear fit is still written so an older checkout can read this file

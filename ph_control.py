@@ -87,6 +87,12 @@ _DEFAULTS = {
     "native_waviness_intercept": -5.4576,
     "lambda_gain": 1.0,           # 1.0 = the natural "range-widths past the anchor" scale
     "max_lambda": 3.0,
+    # Dominant undulation period vs pH. Exponential by default rather than linear: the period
+    # FALLS with pH (measured spectral peak 336px at pH 6.8 down to 136px at 8.8), and a
+    # straight line through falling data reaches zero and then goes negative - this fit
+    # crosses zero at no pH at all. calibrate_ph.py re-selects the form from the data anyway;
+    # these coefficients are ph_warp.py's original log-linear fit, kept as the fallback.
+    "period_law": {"form": "exponential", "coeffs": [-0.2477, 7.142]},
 }
 
 
@@ -121,6 +127,11 @@ WAVINESS_FORMS = ("linear", "exponential", "quadratic")
 # past that asks for geometry the model has never been shown. Extrapolated laws are clamped
 # here rather than allowed to run away - an exponential law would ask for 152px at pH 20.
 MAX_SUPPORTED_WAVINESS = 26.0
+
+# Undulation period, in pixels. Bounded by what train.py's augmentation actually generates
+# (WARP_AUG_MIN_PERIOD/WARP_AUG_MAX_PERIOD) - and at the top end also by the editing frame,
+# since a period longer than the crop is a single arc rather than a wave.
+MIN_SUPPORTED_PERIOD, MAX_SUPPORTED_PERIOD = 50.0, 400.0
 
 
 def _fit_form(form, ph, w):
@@ -230,6 +241,22 @@ def predicted_waviness_native(pH):
     return min(MAX_SUPPORTED_WAVINESS, max(0.5, eval_law(law, pH)))
 
 
+def predicted_period(pH):
+    """Dominant undulation period in pixels that a real filament at this pH would have.
+
+    The companion to predicted_waviness_native: waviness says how FAR the centreline strays,
+    this says how OFTEN it turns. Both are needed because rms alone is degenerate - one arc
+    across the crop and ten waves of the same amplitude score identically - and a model given
+    only the rms draws the cheapest option, which is the single arc.
+
+    Clamped to the range the augmentation actually populates; outside it the model has been
+    shown no geometry, and above the editing frame's own width a "period" is just an arc.
+    """
+    cal = _calibration()
+    law = cal.get("period_law", _DEFAULTS["period_law"])
+    return min(MAX_SUPPORTED_PERIOD, max(MIN_SUPPORTED_PERIOD, eval_law(law, pH)))
+
+
 def ph_to_lambda(pH_query):
     """Signed extrapolation strength for a requested pH. 0 inside the trained range.
 
@@ -276,7 +303,7 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
 
 
 def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None,
-                    source=None):
+                    source=None, period=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
@@ -291,13 +318,16 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
     so this argument is always safe to pass, it just does nothing on an old checkpoint.
 
     `source` is the image being edited, for a source-conditioned checkpoint (model.py's
-    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too.
+    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too. So is
+    `period`, the requested undulation period, which a checkpoint without that channel drops.
     """
     if waviness is not None:
         anchor = min(max(pH_query, PH_MIN), PH_MAX)
         ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
         wav = torch.full((x.shape[0],), float(waviness), device=x.device)
-        return model(x, t, ph, wav, source=source)
+        per = (None if period is None
+               else torch.full((x.shape[0],), float(period), device=x.device))
+        return model(x, t, ph, wav, source=source, period=per)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)

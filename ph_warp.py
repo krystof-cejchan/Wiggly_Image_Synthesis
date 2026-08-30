@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 
 from config import PH_MAX, PH_MIN
-from ph_control import predicted_waviness, predicted_waviness_native
+from ph_control import predicted_waviness, predicted_waviness_native, predicted_period
 from waviness import box_blur, trace_fibre, waviness
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
@@ -88,21 +88,41 @@ def synth_displacement(width, rms, wavelength, device, generator=None, num_modes
 MAX_DISPLACEMENT_SLOPE = 1.0
 
 
-def bounded_displacement(width, rms, wavelength, device, generator=None, num_modes=5, max_widen=6):
-    """synth_displacement, widening the wavelength until the realized peak slope is safe.
+def bounded_displacement(width, rms, wavelength, device, generator=None, num_modes=5,
+                         max_widen=6, max_slope=None, preserve="amplitude"):
+    """synth_displacement, backed off until the realized peak slope is safe.
 
     A sum of several modes can locally interfere to a steeper slope than a single sinusoid
     of the same RMS would predict, so this measures the actual result each attempt rather
     than trusting a closed-form estimate. Returns (d, wavelength_used) - the caller needs
     the actual wavelength to report it and to reuse it against the model's output canvas.
+
+    `preserve` picks WHICH of the two requested quantities gives way when the slope is too
+    steep, and the choice matters a great deal:
+
+      "amplitude" (default, the geometric warp path) widens the wavelength and keeps the
+          requested rms. Right when the caller asked for a specific waviness and the
+          wavelength was only ever a stylistic choice.
+      "wavelength" (train.py's augmentation) shrinks the rms and keeps the requested
+          wavelength. Necessary once the wavelength is itself a conditioning LABEL: with
+          "amplitude", the augmentation systematically widened the wave as the requested
+          waviness rose - measured, the median period of augmented crops went 192px at rms
+          0-6 to 384px (the whole frame) at rms 12-18, while real crops go the other way,
+          336px at pH 6.8 down to 136px at pH 8.8. The model learned that inverted coupling
+          exactly, and produced one long arc spanning the frame for any high waviness
+          request (93% of centreline variance in a single arc, against 13% for real crops).
     """
+    limit = MAX_DISPLACEMENT_SLOPE if max_slope is None else max_slope
     for _ in range(max_widen):
         d = synth_displacement(width, rms, wavelength, device, generator=generator,
                                num_modes=num_modes)
         slope = float((d[1:] - d[:-1]).abs().max()) if d.numel() > 1 else 0.0
-        if slope <= MAX_DISPLACEMENT_SLOPE:
+        if slope <= limit:
             break
-        wavelength *= 1.5
+        if preserve == "wavelength":
+            rms *= 0.95 * limit / max(slope, 1e-6)
+        else:
+            wavelength *= 1.5
     return d, wavelength
 
 
@@ -437,16 +457,24 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # otherwise come from has R^2 ~ 0.09 - on the reference this was developed against it
         # claims 3.46px where the crop measures 1.67px, understating the gap by a quarter. The
         # fit is still the right source for the TARGET, which by definition cannot be measured.
-        from img2img import measure_frame_waviness
+        from img2img import measure_frame_waviness, measure_frame_period
         anchor = min(max(target_pH, PH_MIN), PH_MAX)
         target_waviness = predicted_waviness_native(target_pH)
         source_waviness = measure_frame_waviness(ref_image)
         if source_waviness is None:      # no window traced - fall back to the fit
             source_waviness = predicted_waviness_native(source_pH)
+        # The geometry request has TWO halves. Waviness says how far the centreline strays;
+        # period says how often it turns. Asking for waviness alone is degenerate - one arc
+        # across the crop and ten waves of the same amplitude have the same rms - and the
+        # model resolves the degeneracy the cheap way, with a single arc (measured: 93% of the
+        # generated centreline's variance in one frame-wide arc, against 13% for real crops).
+        target_period = predicted_period(target_pH)
+        source_period = measure_frame_period(ref_image) or predicted_period(source_pH)
         out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
                          target_pH=anchor, seed=seed,
                          source_waviness=source_waviness,
-                         target_waviness=target_waviness, **kw)
+                         target_waviness=target_waviness,
+                         source_period=source_period, target_period=target_period, **kw)
         # No _preserve_background here, unlike the warp path below, and deliberately not
         # only outside the trained range either. The warp path needs it because it RESAMPLES
         # the whole frame and invents background rows, so the field around the fibre is
@@ -465,7 +493,9 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # an unlucky draw is visible as a number instead of only by eye.
         achieved = measure_frame_waviness(out * 2 - 1)
         return out, {"mode": "native", "target_waviness": target_waviness,
-                     "source_waviness": source_waviness, "achieved": achieved}
+                     "source_waviness": source_waviness, "achieved": achieved,
+                     "target_period": target_period, "source_period": source_period,
+                     "achieved_period": measure_frame_period(out * 2 - 1)}
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
