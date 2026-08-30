@@ -16,7 +16,7 @@ matplotlib.use("Agg")  # training usually runs headless / over ssh - never try t
 import matplotlib.pyplot as plt
 
 from config import (PH_MIN, PH_MAX, DEVICE, TRAIN_SIZES,
-                    CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH)
+                    CHECKPOINT_PATH, COND_CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH)
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
@@ -78,6 +78,12 @@ PATIENCE = 30        # val loss is noisy (fluctuates ~1e-2 while MIN_DELTA is 1e
                      # validated one - it triples the runway without disabling early
                      # stopping outright.
 MIN_DELTA = 1e-5
+# Separate threshold for the conditioning gap, which lives on a completely different scale
+# from the val loss: measured on trained checkpoints the gap is ~1e-4 where the loss is ~0.58,
+# so MIN_DELTA (1e-5, a tenth of the whole gap) would treat pure jitter as improvement. The
+# gap is deterministic (evaluate uses a fixed generator and identical xt for all three
+# conditioning variants), so this only has to exceed float noise, not sampling noise.
+COND_MIN_DELTA = 2e-6
 SEED = 42
 # Crop geometry (TRAIN_SIZES) now lives in config.py, imported above. It moved there
 # because img2img.py has to frame its editing window inside the same band - it used to
@@ -233,15 +239,31 @@ def val_collate_fn(batch):
 
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
-    """
-    Calculates Flow Matching MSE on the validation dataset.
-    Fully deterministic: a fixed generator supplies x0/t, and val_collate_fn center-crops
-    (rather than random-crops) so the same pixels are scored every time. For each batch the
-    loss is averaged over multiple noise samplings (num_noise_samples) to smooth the curve.
+    """Flow-matching MSE on the validation set, plus how much the model USES its conditioning.
+
+    Returns (val_loss, waviness_gap, pH_gap). Each gap is the loss with that conditioning
+    channel forced to its null embedding MINUS the loss with it supplied - i.e. how much
+    worse the model does when the channel is taken away, which is exactly "how much the
+    channel is being used". Positive means used.
+
+    Why this is measured at all. The MSE alone is nearly blind to conditioning: measured on
+    two trained checkpoints, dropping a channel moves it by ~1e-4 on a loss of ~0.58, i.e.
+    0.02%, while the run-to-run wobble in the same number is ~1e-3 and MIN_DELTA is 1e-5.
+    The entire conditioning signal therefore sits an order of magnitude BELOW the noise floor
+    of the metric that decides both when training stops and which checkpoint is kept - so a
+    checkpoint whose pH/waviness conditioning is still half-developed scores exactly as well
+    as one whose conditioning is mature, and early stopping happily fires on the former. That
+    is not hypothetical: a run that stopped at step 12,375 with its best at 8,625 produced a
+    visibly weaker editor than one that reached 15,625, at an indistinguishable val loss.
+    These gaps do rank the two correctly, so they are logged and fed into early stopping.
+
+    Fully deterministic: a fixed generator supplies x0/t, and val_collate_fn centre-crops
+    (rather than random-crops), so the same pixels are scored every time and the three
+    conditioning variants below see the identical xt.
     """
     model.eval()
-    total_loss = 0.0
-    
+    totals = {"both": 0.0, "no_wav": 0.0, "no_pH": 0.0}
+
     # Set a fixed generator for deterministic validation
     eval_gen = torch.Generator(device=DEVICE)
     eval_gen.manual_seed(12345) 
@@ -250,8 +272,9 @@ def evaluate(model, dataloader, num_noise_samples=3):
         x1 = x_batch.to(DEVICE)
         pH = normalize_pH(pH_batch.to(DEVICE).float())
         wav = wav_batch.to(DEVICE).float()
+        null = torch.full_like(pH, float("nan"))
 
-        batch_loss = 0.0
+        batch = {k: 0.0 for k in totals}
 
         # Average the loss over multiple random samplings for each batch
         for _ in range(num_noise_samples):
@@ -262,34 +285,52 @@ def evaluate(model, dataloader, num_noise_samples=3):
             xt = (1 - t_expand) * x0 + t_expand * x1
             target = x1 - x0
 
+            # Same xt for all three, so the differences are the conditioning and nothing else
+            for key, (pH_in, wav_in) in (("both", (pH, wav)),
+                                         ("no_wav", (pH, null)),
+                                         ("no_pH", (null, wav))):
+                with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
+                    loss = F.mse_loss(model(xt, t, pH_in, wav_in), target)
+                batch[key] += loss.item()
 
-            with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-                pred = model(xt, t, pH, wav)
-                loss = F.mse_loss(pred, target)
-                
-            batch_loss += loss.item()
-            
-        total_loss += batch_loss / num_noise_samples
-        
+        for key in totals:
+            totals[key] += batch[key] / num_noise_samples
+
     model.train()
-    return total_loss / len(dataloader)
+    n = len(dataloader)
+    val_loss = totals["both"] / n
+    return val_loss, totals["no_wav"] / n - val_loss, totals["no_pH"] / n - val_loss
 
-def save_loss_history(train_steps, train_losses, val_steps, val_losses, out_path):
-    """Dump the raw curves next to the plot so they can be re-plotted or compared across runs."""
+def save_loss_history(train_steps, train_losses, val_steps, val_losses, out_path,
+                      wav_gaps=None):
+    """Dump the raw curves next to the plot so they can be re-plotted or compared across runs.
+
+    wav_gaps is evaluate()'s waviness conditioning gap, on the same grid as val_steps. It is
+    written alongside the loss because the two tell different stories and only one of them is
+    about the deliverable - see evaluate().
+    """
     val_lookup = dict(zip(val_steps, val_losses))
+    gap_lookup = dict(zip(val_steps, wav_gaps or []))
+
+    def row(s, tl):
+        return [s, tl,
+                f"{val_lookup[s]:.6f}" if s in val_lookup else "",
+                f"{gap_lookup[s]:.8f}" if s in gap_lookup else ""]
+
     with open(out_path, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["step", "train_loss_live", "val_loss_ema"])
+        writer.writerow(["step", "train_loss_live", "val_loss_ema", "waviness_cond_gap"])
         for s, tl in zip(train_steps, train_losses):
-            writer.writerow([s, f"{tl:.6f}", f"{val_lookup[s]:.6f}" if s in val_lookup else ""])
+            writer.writerow(row(s, f"{tl:.6f}"))
         # val is sampled on a coarser grid than train, so emit any val-only steps too
         for s in val_steps:
             if s not in set(train_steps):
-                writer.writerow([s, "", f"{val_lookup[s]:.6f}"])
+                writer.writerow(row(s, ""))
 
 
 def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_step,
-                      out_path="outputs/training_loss.png"):
+                      out_path="outputs/training_loss.png", wav_gaps=None,
+                      best_cond_step=None):
     """Save the train/val loss curves once training ends (either normally or via early stop)."""
     if not train_steps:
         print("No loss history recorded - skipping plot.")
@@ -336,8 +377,28 @@ def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_ste
     plt.close(fig)
     print(f"Loss curve saved to: {out_path}")
 
+    if wav_gaps:
+        gap_path = os.path.splitext(out_path)[0] + "_conditioning.png"
+        fig2, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(val_steps, wav_gaps, color="tab:green", lw=1.8, marker="o", ms=3,
+                label="waviness conditioning gap (EMA)")
+        ax.axhline(0.0, color="gray", lw=0.8)
+        if best_step is not None:
+            ax.axvline(best_step, color="gray", ls="--", lw=1.2, label=f"best val loss ({best_step})")
+        if best_cond_step is not None:
+            ax.axvline(best_cond_step, color="tab:green", ls=":", lw=1.4,
+                       label=f"best conditioning ({best_cond_step})")
+        ax.set_xlabel("training step")
+        ax.set_ylabel("loss(no waviness) - loss(waviness)")
+        ax.set_title("How much the model uses its waviness conditioning\n"
+                     "(the val loss above is ~blind to this - see evaluate())", fontsize=10)
+        ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        fig2.tight_layout(); fig2.savefig(gap_path, dpi=130); plt.close(fig2)
+        print(f"Conditioning curve saved to: {gap_path}")
+
     csv_path = os.path.splitext(out_path)[0] + ".csv"
-    save_loss_history(train_steps, train_losses, val_steps, val_losses, csv_path)
+    save_loss_history(train_steps, train_losses, val_steps, val_losses, csv_path,
+                      wav_gaps=wav_gaps)
     print(f"Loss history saved to: {csv_path}")
 
 
@@ -480,11 +541,14 @@ def main():
 
     best_val_loss = float('inf')
     best_step = None
+    best_wav_gap = -float('inf')
+    best_cond_step = None
     epochs_without_improvement = 0
 
     # loss history for the end-of-training plot
     train_hist_steps, train_hist_losses = [], []
     val_hist_steps, val_hist_losses = [], []
+    wav_gap_hist = []
 
     model.train()
     step = 0
@@ -567,24 +631,44 @@ def main():
 
             # early stopping
             if step > 0 and step % EVAL_INTERVAL == 0:
-                val_loss = evaluate(ema_model, val_dataloader)
+                val_loss, wav_gap, ph_gap = evaluate(ema_model, val_dataloader)
                 val_hist_steps.append(step)
                 val_hist_losses.append(val_loss)
+                wav_gap_hist.append(wav_gap)
                 # NOTE: train loss is the LIVE model, val loss is the EMA model - early in
                 # training the EMA lags badly, so a large gap here means the EMA hasn't caught
-                # up yet, not necessarily overfitting.
-                print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f} | Val Loss (EMA): {val_loss:.4f}")
+                # up yet, not necessarily overfitting. cond= is how much the model USES its
+                # waviness / pH conditioning (see evaluate) - watch it keep rising long after
+                # the val loss has gone flat.
+                print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f} "
+                      f"| Val Loss (EMA): {val_loss:.4f} | cond wav {wav_gap:+.5f} pH {ph_gap:+.5f}")
 
+                improved = False
                 if val_loss < (best_val_loss - MIN_DELTA):
                     best_val_loss = val_loss
                     best_step = step
-                    epochs_without_improvement = 0
+                    improved = True
                     torch.save(ema_model.state_dict(), CHECKPOINT_PATH)
-                else:
-                    epochs_without_improvement += 1
+                # A separate checkpoint for the best-CONDITIONED model. The two criteria
+                # disagree, and for this project's actual deliverable - editing an image to a
+                # requested pH - the conditioning one is the relevant deliverable, while the
+                # MSE one measures denoising. Saving both costs one extra file and settles the
+                # question by comparison instead of by an arbitrary weighting between two
+                # quantities three orders of magnitude apart.
+                if wav_gap > (best_wav_gap + COND_MIN_DELTA):
+                    best_wav_gap = wav_gap
+                    best_cond_step = step
+                    improved = True
+                    torch.save(ema_model.state_dict(), COND_CHECKPOINT_PATH)
+
+                # Patience counts evals where NEITHER criterion improved. Counting only the
+                # val loss is what let a run stop at step 12,375 with its conditioning still
+                # visibly developing - see evaluate()'s docstring for the numbers.
+                epochs_without_improvement = 0 if improved else epochs_without_improvement + 1
 
                 if epochs_without_improvement >= PATIENCE:
-                    print(f"Early stopping aktivován na kroku {step}. Trénink ukončen.")
+                    print(f"Early stopping aktivován na kroku {step} (val loss ani conditioning "
+                          f"se nezlepšily {PATIENCE}x za sebou). Trénink ukončen.")
                     stop_training = True
                     break
 
@@ -597,10 +681,14 @@ def main():
         torch.save(ema_model.state_dict(), FINAL_CHECKPOINT_PATH)
         print(f"Training completed. Final model saved as {FINAL_CHECKPOINT_PATH!r}.")
     print(f"Best validation loss: {best_val_loss:.4f} at step {best_step}. Model saved as {CHECKPOINT_PATH!r}.")
+    print(f"Best waviness conditioning gap: {best_wav_gap:+.5f} at step {best_cond_step}. "
+          f"Model saved as {COND_CHECKPOINT_PATH!r}. Compare the two - they are selected on "
+          f"different things and the conditioning one is usually the better editor.")
 
     # always plot, whether we finished the full run or stopped early
     plot_loss_history(train_hist_steps, train_hist_losses,
-                      val_hist_steps, val_hist_losses, best_step)
+                      val_hist_steps, val_hist_losses, best_step,
+                      wav_gaps=wav_gap_hist, best_cond_step=best_cond_step)
 
 if __name__ == "__main__":
     main()

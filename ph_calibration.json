@@ -1,12 +1,12 @@
 {
-  "checkpoint": "cfm_best_ema.pt",
+  "checkpoint": "cfm_best_ema_ex.pt",
   "waviness_slope": 1.0930108496843474,
   "waviness_intercept": -3.107756288990195,
   "waviness_r2": 0.06894993647432379,
-  "native_waviness_slope": 1.5979961912289276,
-  "native_waviness_intercept": -6.051626084244387,
-  "native_waviness_r2": 0.1018187753908002,
-  "lambda_per_px": 2.2291627002793213,
+  "native_waviness_slope": 1.4494596166603853,
+  "native_waviness_intercept": -4.951431318928156,
+  "native_waviness_r2": 0.08667887065249036,
+  "lambda_per_px": 2.7219689868406887,
   "max_lambda": 4.0,
   "response_lambdas": [
     0.0,
@@ -17,12 +17,12 @@
     4.0
   ],
   "response_waviness": [
-    4.309906043857328,
-    4.259769759734114,
-    3.9718759633729603,
-    4.024528970664517,
-    4.418880063850419,
-    5.091778457409599
+    4.738750564379612,
+    4.995192140225112,
+    5.29838194265593,
+    5.272173980458829,
+    5.788908131830623,
+    6.265631815131106
   ],
-  "response_monotonic": false
+  "response_monotonic": true
 }

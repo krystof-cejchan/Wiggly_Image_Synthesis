@@ -14,7 +14,7 @@ from model import ConditionalUNet
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
 from framing import pad_height_background, mirror_pad_width
-from waviness import box_blur
+from waviness import box_blur, waviness as measure_waviness
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -226,6 +226,34 @@ def save_repair_diagnostic(original, repaired, gaps, out_path):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
+
+
+@torch.no_grad()
+def measure_frame_waviness(ref_image):
+    """The reference's own waviness, measured in the frames the model will actually see.
+
+    Returns None if no window traces confidently. This is what the native path should feed
+    the CONTRASTIVE pair's source branch: that branch is meant to say "here is what the
+    filament is now", and it can be measured rather than guessed from ph_calibration.json's
+    pH->waviness fit (R^2 ~ 0.09). On the reference this was developed against, the fit says
+    3.46px where the crop actually measures 1.77px - so the fitted value understates the gap
+    the guidance has to close by about a quarter.
+
+    Measured per window and averaged, not on the whole image, because the model is
+    conditioned per frame: a 384px window captures less of a long-wavelength undulation than
+    the full 478px canvas does, so whole-image waviness is a different (larger) number than
+    the one the conditioning is calibrated in.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_waviness(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
 
 
 @torch.no_grad()
@@ -475,9 +503,15 @@ def main():
             print("No geometric pH warp applied: the fibre could not be confidently traced "
                   "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
     elif edit_info.get("mode") == "native":
-        print(f"Native waviness conditioning applied: target waviness "
-              f"{edit_info.get('target_waviness', 0.0):.1f}px (supported by training data to "
-              f"~pH 16; above that compare against --geometry_mode warp)")
+        achieved = edit_info.get("achieved")
+        got = f", achieved {achieved:.1f}px" if achieved is not None else ""
+        print(f"Native waviness conditioning applied: {edit_info.get('source_waviness', 0.0):.1f}px "
+              f"measured on the reference -> {edit_info.get('target_waviness', 0.0):.1f}px requested"
+              f"{got} (supported by training data to ~pH 16; above that compare against "
+              f"--geometry_mode warp)")
+        if achieved is not None and achieved < 0.6 * edit_info.get("target_waviness", 0.0):
+            print("  Note: well short of the request. The anchored edit varies a lot with the "
+                  "noise draw - re-run with a different --seed before concluding anything.")
 
     # compare against the unrepaired source - the repair is an input-side aid, not a result
     visualize_difference(display_ref, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)

@@ -414,21 +414,38 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} (expected 'warp' or 'native')")
 
     if geometry_mode == "native":
-        # Both branches MUST share the same pH anchor. Clamping source_pH and target_pH
-        # independently (the original bug here) leaves the contrastive push varying pH
-        # between them too whenever the real source_pH differs from the target's anchor -
-        # exactly the texture/geometry entanglement this whole mechanism exists to remove.
-        # Pinning both to target_pH's anchor makes waviness the ONLY thing that differs
-        # between the two branches, so v_target - v_source is a clean geometry direction.
-        # predicted_waviness_native, NOT predicted_waviness: the model's conditioning was
-        # trained on per-crop-scale labels, not the whole-image scale predicted_waviness()
-        # is calibrated against (that mismatch is what made waviness conditioning
-        # ineffective in the first place - see ph_control.py's _DEFAULTS).
+        # The contrastive pair is "what the filament is now" vs "what it should become", and
+        # BOTH halves of that are stated as fully as possible:
+        #
+        #   source branch: the REAL source_pH, and the reference's MEASURED waviness
+        #   target branch: target_pH's anchor, and the requested waviness
+        #
+        # An earlier version pinned both branches to the target's anchor so that waviness was
+        # the only difference, on the theory that this keeps v_target - v_source a clean
+        # geometry direction. Measured, that is worse, not better: with the pH difference
+        # removed the ENTIRE push has to come from the waviness axis, and pushing that axis
+        # alone hard is exactly what tips the model into horizontal banding rather than
+        # undulation (the same failure the over-ask experiment produced - requested waviness
+        # 10.7 -> 18 -> 26 raised the traced centreline 7.0 -> 10.0 -> 10.8 while
+        # orientation_spread, which no trace can fool, FELL 1.211 -> 1.147 -> 1.075). Putting
+        # the real pH difference back means less of the work falls on waviness: measured over
+        # two seeds, orientation spread rose 1.220 -> 1.356 and the result went from a
+        # broken-up fibre in banding to a single clean undulating filament.
+        #
+        # measure_frame_waviness, not predicted_waviness_native(source_pH), for the source:
+        # that branch describes THIS crop, which can be measured, and the fit it would
+        # otherwise come from has R^2 ~ 0.09 - on the reference this was developed against it
+        # claims 3.46px where the crop measures 1.67px, understating the gap by a quarter. The
+        # fit is still the right source for the TARGET, which by definition cannot be measured.
+        from img2img import measure_frame_waviness
         anchor = min(max(target_pH, PH_MIN), PH_MAX)
         target_waviness = predicted_waviness_native(target_pH)
-        out = edit_image(model=model, ref_image=ref_image, source_pH=anchor,
+        source_waviness = measure_frame_waviness(ref_image)
+        if source_waviness is None:      # no window traced - fall back to the fit
+            source_waviness = predicted_waviness_native(source_pH)
+        out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
                          target_pH=anchor, seed=seed,
-                         source_waviness=predicted_waviness_native(source_pH),
+                         source_waviness=source_waviness,
                          target_waviness=target_waviness, **kw)
         # No _preserve_background here, unlike the warp path below, and deliberately not
         # only outside the trained range either. The warp path needs it because it RESAMPLES
@@ -441,7 +458,14 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # thing being asked for. It also had to re-trace the fibre in generated content to
         # place its mask, which the warp path documents as unreliable and which showed here
         # as rectangular blocks of kept-canvas where the trace jumped.
-        return out, {"mode": "native", "target_waviness": target_waviness}
+        # Report what actually came out. The anchored edit varies a lot with the noise draw -
+        # measured over three seeds at a fixed request, centreline rms ranged 2.35-3.58px at
+        # pH 8.8 and 6.31-7.04px at pH 10.8, i.e. the seed-to-seed spread is comparable to the
+        # pH-to-pH difference. Printing the achieved number (the warp path already does) means
+        # an unlucky draw is visible as a number instead of only by eye.
+        achieved = measure_frame_waviness(out * 2 - 1)
+        return out, {"mode": "native", "target_waviness": target_waviness,
+                     "source_waviness": source_waviness, "achieved": achieved}
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,

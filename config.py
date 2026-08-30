@@ -31,4 +31,8 @@ TRAIN_MAX_W = max(w for _, w in TRAIN_SIZES)
 # waviness_* tensors and will NOT load into today's ConditionalUNet, so the two generations
 # deliberately do not share a name.
 CHECKPOINT_PATH = "checkpoints/cfm_best_ema_ex.pt"
+# Selected on how much the model USES its conditioning rather than on flow-matching MSE
+# - see train.py's evaluate(). The two criteria disagree, and this is the one that
+# tracks the actual deliverable (editing to a requested pH).
+COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_ex.pt"
 FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_ex.pt"
