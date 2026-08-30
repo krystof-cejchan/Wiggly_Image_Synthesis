@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import torchvision.transforms.v2.functional as TF
 from config import (PH_MIN, PH_MAX, DEVICE, CHECKPOINT_PATH,
                     TRAIN_MIN_H, TRAIN_MIN_W, TRAIN_MAX_W)
-from model import ConditionalUNet
+from model import from_state_dict
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
 from framing import pad_height_background, mirror_pad_width
@@ -311,9 +311,24 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     win_w = min(target_w, TRAIN_MAX_W if window_size is None else window_size)
     starts = plan_window_starts(target_w, win_w, win_w // 2 if stride is None else stride)
 
-    t_start = 1.0 - denoising_strength
-    noise = torch.randn_like(padded_ref)
-    x = (1 - t_start) * noise + t_start * padded_ref
+    # A SOURCE-CONDITIONED checkpoint (model.py, in_channels == 2) is trained on the editing
+    # task itself: the reference goes in through its own input channel, clean, at every step.
+    # So the trajectory starts from PURE NOISE and runs the whole way - there is no anchor to
+    # set a level for and `denoising_strength` does not apply. That is the point of it: mixing
+    # the source into the noise (SDEdit, below) made one knob govern both how much texture is
+    # redrawn and how far the geometry may move, and no setting satisfied both - at strength
+    # 0.8 the requested waviness was reached but the fibre was lost in 16% of columns, and at
+    # 0.7 the fibre was perfect at 6px of a 10.7px request. Starting from noise also means the
+    # old straight filament is never present to be half-erased, which is what produced the
+    # gaps and ghosting.
+    source_canvas = padded_ref if getattr(model, "source_conditioned", False) else None
+    if source_canvas is not None:
+        t_start = 0.0
+        x = torch.randn_like(padded_ref)
+    else:
+        t_start = 1.0 - denoising_strength
+        noise = torch.randn_like(padded_ref)
+        x = (1 - t_start) * noise + t_start * padded_ref
 
     start_step = int(t_start * num_steps)
     # one full-height window, sliding horizontally only: no vertical taper needed
@@ -333,12 +348,15 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
         for x_idx in starts:
             x_patch = x_in[:, :, :, x_idx:x_idx+win_w]
+            src_patch = (None if source_canvas is None
+                         else source_canvas[:, :, :, x_idx:x_idx+win_w])
 
             v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
-                                          rescale=ph_rescale, waviness=source_waviness)
+                                          rescale=ph_rescale, waviness=source_waviness,
+                                          source=src_patch)
             v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
                                           rescale=ph_rescale, lam_override=ph_lambda,
-                                          waviness=target_waviness)
+                                          waviness=target_waviness, source=src_patch)
 
             v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
             v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask
@@ -449,14 +467,17 @@ def main():
         print(f"Reference image {args.ref_image} not found. Please check the provided path.")
         return
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
     
     os.makedirs("outputs_img2img", exist_ok=True)
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
+    if getattr(model, "source_conditioned", False):
+        print(f"Source-conditioned checkpoint: the reference goes in through its own input "
+              f"channel and the trajectory starts from pure noise, so --strength "
+              f"({args.strength:g}) is ignored.")
     print(describe_pH(args.target_pH, geometry_mode=args.geometry_mode))
 
     display_ref = ref_image

@@ -2,7 +2,7 @@ import os
 import argparse
 import torch
 import torchvision.utils as vutils
-from model import ConditionalUNet
+from model import from_state_dict
 from config import PH_MIN, PH_MAX, DEVICE, CHECKPOINT_PATH
 from ph_control import normalize_pH, velocity_for_pH, predicted_waviness_native, describe as describe_pH
 
@@ -92,8 +92,7 @@ def main():
         print(f"Checkpoint {args.checkpoint} nenalezen!")
         return
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
 
     os.makedirs("outputs", exist_ok=True)

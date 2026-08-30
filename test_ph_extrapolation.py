@@ -25,7 +25,7 @@ import ph_control
 from config import DEVICE, PH_MAX, PH_MIN, CHECKPOINT_PATH
 from img2img import load_and_preprocess_image
 from ph_warp import edit_to_pH
-from model import ConditionalUNet
+from model import from_state_dict
 from waviness import waviness
 
 DATA_DIR = "data/cropped/cropped_output"
@@ -71,8 +71,7 @@ def main():
                          "'native' needs a waviness-conditioned checkpoint.")
     args = ap.parse_args()
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
     os.makedirs(args.out_dir, exist_ok=True)
 

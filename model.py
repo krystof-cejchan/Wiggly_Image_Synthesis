@@ -271,6 +271,17 @@ class ConditionalUNet(nn.Module):
     ):
         super().__init__()
 
+        # in_channels == 2 means the network is SOURCE-CONDITIONED: the second channel carries
+        # the image being edited, clean and undamaged, at every step of the trajectory. That is
+        # what removes img2img's strength knob. With in_channels == 1 the model can only turn
+        # noise into an image, so editing has to be faked by stirring noise into the source
+        # (SDEdit) - and that one knob then controls both how much texture is redrawn AND how
+        # far the geometry may move, which are opposite requirements when the job is to
+        # displace a 3px filament by 15px while keeping it continuous. See train.py's
+        # _make_pair for how the supervision is built.
+        self.in_channels = in_channels
+        self.source_conditioned = in_channels > 1
+
         self.t_embed = ScalarEmbedding(emb_dim)
         # Lower frequency range than t_embed: t is sampled densely and continuously
         # over [0,1] during training, but pH only ever takes one of 7 discrete,
@@ -329,12 +340,12 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
     
-    def forward(self, x, t, pH, waviness=None):
+    def forward(self, x, t, pH, waviness=None, source=None):
         """
         Forward pass for conditional U-Net.
 
         Args:
-            x: image tensor (B, C_in, H, W)
+            x: image tensor (B, 1, H, W) - the noisy state being integrated
             t: scalar tensor for time/step (B,)
             pH: scalar tensor for conditional pH (B,) or NaN for null condition
             waviness: scalar tensor for conditional RAW (pixel-unit, not pre-normalized)
@@ -342,10 +353,17 @@ class ConditionalUNet(nn.Module):
                 default keeps every call site that predates this argument (e.g. the
                 embedding-space extrapolation path in ph_control.py) working unchanged,
                 falling back to whatever geometry signal pH's own channel carries alone.
+            source: the image being edited (B, 1, H, W), for a source-conditioned model
+                (in_channels == 2). None means "no source", encoded as an all-zero channel -
+                train.py drops the source at rate SOURCE_DROPOUT so that encoding is trained
+                rather than merely tolerated, which is what keeps sample.py's from-noise
+                generation working on the same checkpoint. Ignored by a 1-channel model.
 
         Returns:
             output tensor (B, C_out, H, W)
         """
+        if self.source_conditioned:
+            x = torch.cat([x, torch.zeros_like(x) if source is None else source], dim=1)
         # embed time and pH scalars
         t_emb = self.t_embed(t)
 
@@ -393,3 +411,28 @@ class ConditionalUNet(nn.Module):
         x = F.silu(self.norm_out(x))
         x = self.conv_out(x)
         return x
+
+def from_state_dict(state_dict, device=None):
+    """Build the ConditionalUNet a checkpoint was saved from, and load it.
+
+    The architecture has changed twice - waviness conditioning added tensors, and source
+    conditioning changed conv_in's input width - so a bare ConditionalUNet() no longer loads
+    every checkpoint in the wild, and the failure is an unhelpful wall of missing keys. Both
+    changes are visible in the state_dict itself, so infer rather than guess:
+
+        conv_in.weight  (64, 1, 3, 3)   ->  from-noise model, editing needs SDEdit
+        conv_in.weight  (64, 2, 3, 3)   ->  source-conditioned, editing is a direct render
+        waviness_mean present            ->  has the waviness conditioning channel
+
+    waviness_mean/std are constructor arguments only because they are registered buffers; the
+    values in the checkpoint immediately overwrite whatever is passed, so the defaults here
+    are irrelevant to the loaded model.
+    """
+    in_channels = state_dict["conv_in.weight"].shape[1]
+    kwargs = {"in_channels": in_channels}
+    if "waviness_mean" in state_dict:
+        kwargs["waviness_mean"] = float(state_dict["waviness_mean"])
+        kwargs["waviness_std"] = float(state_dict["waviness_std"])
+    model = ConditionalUNet(**kwargs)
+    model.load_state_dict(state_dict)
+    return model if device is None else model.to(device)

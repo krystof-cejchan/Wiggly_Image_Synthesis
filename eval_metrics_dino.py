@@ -23,7 +23,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
 from config import DEVICE, CHECKPOINT_PATH
-from model import ConditionalUNet
+from model import from_state_dict
 from dataset import MicrotubuleDataset
 from img2img import edit_image, load_and_preprocess_image
 from dino_features import DinoV2Features
@@ -71,8 +71,7 @@ def main():
         print(f"Chybí checkpoint {CHECKPOINT_PATH} (viz checkpoints/download_trained_model.txt).")
         return
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model = from_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE), DEVICE)
     model.eval()
 
     # C) sdílený DINOv2 backbone pro reálné i falešné vzorky

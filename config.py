@@ -36,3 +36,12 @@ CHECKPOINT_PATH = "checkpoints/cfm_best_ema_ex.pt"
 # tracks the actual deliverable (editing to a requested pH).
 COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_ex.pt"
 FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_ex.pt"
+
+# The source-conditioned (paired-edit) generation of the architecture: conv_in takes two
+# channels, the second being the image being edited. Trained by train.py on before/after
+# pairs, and rendered by img2img without any strength/anchor at all. Kept under its own name
+# because it will not load into the 1-channel model and vice versa - model.from_state_dict
+# infers which one a file is.
+PAIR_CHECKPOINT_PATH = "checkpoints/cfm_best_ema_pair.pt"
+PAIR_COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_pair.pt"
+PAIR_FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_pair.pt"

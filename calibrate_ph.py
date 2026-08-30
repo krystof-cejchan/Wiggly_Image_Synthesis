@@ -36,7 +36,7 @@ import ph_control
 import train as T
 from config import DEVICE, PH_MAX, PH_MIN, CHECKPOINT_PATH
 from img2img import edit_image, load_and_preprocess_image
-from model import ConditionalUNet
+from model import from_state_dict
 from waviness import waviness
 
 DATA_DIR = "data/cropped/cropped_output"
@@ -106,7 +106,7 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
                     continue
                 ref, _ = load_and_preprocess_image(os.path.join(path, name))
                 for _ in range(crops_per_image):
-                    _, _, wav = T.dynamic_collate_fn(
+                    _, _, _, wav = T.dynamic_collate_fn(
                         [(ref.squeeze(0).cpu(), torch.tensor(ph))])
                     value = wav.item()
                     if not math.isnan(value):
@@ -159,15 +159,25 @@ def measure_response(model, sources, lambdas, steps, strength, seed):
     return out
 
 
-def _fit_physics(per_ph):
-    """Linear fit of rms_dev vs pH over a measure_real*-style {ph: [values]} dict.
-    Returns (slope, intercept, r2)."""
+def _fit_physics(per_ph, label):
+    """Fit the pH->waviness law over a measure_real*-style {ph: [values]} dict.
+
+    The FUNCTIONAL FORM is selected from the data by held-out extrapolation error rather
+    than assumed - see ph_control.fit_waviness_law. Returns (law, diagnostics, slope,
+    intercept, r2), where the last three are the plain linear fit, kept so the written
+    calibration stays readable by older code that expects slope/intercept.
+    """
     flat_ph = np.concatenate([[ph] * len(v) for ph, v in sorted(per_ph.items())])
     flat_w = np.concatenate([v for _, v in sorted(per_ph.items())])
-    slope, intercept = np.polyfit(flat_ph, flat_w, 1)
-    resid = flat_w - (slope * flat_ph + intercept)
-    r2 = 1 - resid.var() / flat_w.var()
-    return float(slope), float(intercept), float(r2)
+    law, diagnostics = ph_control.fit_waviness_law(flat_ph, flat_w)
+    print(f"  candidate laws for {label} (selection is by hold-out extrapolation, NOT R^2 - "
+          f"a quadratic fits in-sample as well as a line and extrapolates disastrously):")
+    print(f"    {'form':12s} {'R^2':>9} {'hold-out err':>13}")
+    for form, d in diagnostics.items():
+        mark = "  <- selected" if form == law["form"] else ""
+        print(f"    {form:12s} {d['r2']:9.4f} {d['holdout_error']:13.3f}{mark}")
+    lin = diagnostics["linear"]
+    return law, diagnostics, float(lin["coeffs"][0]), float(lin["coeffs"][1]), float(lin["r2"])
 
 
 def main():
@@ -190,8 +200,8 @@ def main():
     for ph in sorted(per_ph):
         vals = np.array(per_ph[ph])
         print(f"  {ph:5.1f} {len(vals):4d} {vals.mean():13.2f}")
-    slope, intercept, r2 = _fit_physics(per_ph)
-    print(f"  fit: rms_dev = {slope:.3f}*pH {intercept:+.3f}   (R^2 = {r2:.3f})")
+    law, law_diag, slope, intercept, r2 = _fit_physics(per_ph, "whole-image waviness")
+    print(f"  selected law: {law['form']} {np.round(law['coeffs'], 4).tolist()}")
 
     print("\n[2/4] measuring per-crop waviness the same way training sees it (feeds "
           "native waviness conditioning)")
@@ -200,14 +210,14 @@ def main():
     for ph in sorted(per_ph_native):
         vals = np.array(per_ph_native[ph])
         print(f"  {ph:5.1f} {len(vals):4d} {vals.mean():13.2f}")
-    native_slope, native_intercept, native_r2 = _fit_physics(per_ph_native)
-    print(f"  fit: rms_dev = {native_slope:.3f}*pH {native_intercept:+.3f}   "
-          f"(R^2 = {native_r2:.3f} - expect this much lower than [1/4]'s: an individual "
-          f"small crop is noisy around the pH trend the way any small random window is)")
+    (native_law, native_diag, native_slope, native_intercept,
+     native_r2) = _fit_physics(per_ph_native, "per-crop waviness")
+    print(f"  selected law: {native_law['form']} {np.round(native_law['coeffs'], 4).tolist()}")
+    print(f"  (R^2 is much lower than [1/4]'s: an individual small crop is noisy around the "
+          f"pH trend the way any small random window is)")
 
     print("\n[3/4] measuring the generator's response to lambda")
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
     sources = pick_sources(DATA_DIR, args.per_bucket)
     print(f"  {len(sources)} sources x {len(args.lambdas)} lambdas")
@@ -229,6 +239,11 @@ def main():
 
     cal = {
         "checkpoint": os.path.basename(args.checkpoint),
+        "waviness_law": law,
+        "native_waviness_law": native_law,
+        "waviness_law_diagnostics": law_diag,
+        "native_waviness_law_diagnostics": native_diag,
+        # the plain linear fit is still written so an older checkout can read this file
         "waviness_slope": slope,
         "waviness_intercept": intercept,
         "waviness_r2": r2,
@@ -249,7 +264,7 @@ def main():
         print("  WARNING: waviness did not rise monotonically with lambda - the "
               "extrapolation is unreliable past the point where it turns over.")
 
-    def _physics_panel(ax, per_ph_dict, slope_v, intercept_v, r2_v, title):
+    def _physics_panel(ax, per_ph_dict, law_v, r2_v, title):
         flat_ph = np.concatenate([[ph] * len(v) for ph, v in sorted(per_ph_dict.items())])
         flat_w = np.concatenate([v for _, v in sorted(per_ph_dict.items())])
         phs = sorted(per_ph_dict)
@@ -258,17 +273,18 @@ def main():
                   s=7, alpha=.2, color="#0f8177", linewidths=0)
         ax.plot(phs, means, "o-", color="#0f8177", lw=2, label="bucket mean")
         grid = np.linspace(min(phs) - 2, max(phs) + 3, 100)
-        ax.plot(grid, slope_v * grid + intercept_v, "--", color="#b06a12",
-               label=f"fit (R²={r2_v:.2f}), extrapolated")
+        ax.plot(grid, [ph_control.eval_law(law_v, float(g)) for g in grid], "--",
+               color="#b06a12",
+               label=f"{law_v['form']} fit (R²={r2_v:.2f}), extrapolated")
         ax.axvspan(PH_MIN, PH_MAX, color="#0f8177", alpha=.07)
         ax.set_xlabel("pH"); ax.set_ylabel("rms centreline deviation (px)")
         ax.set_title(title, fontsize=10); ax.legend(fontsize=8)
         ax.grid(alpha=.25)
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
-    _physics_panel(axes[0], per_ph, slope, intercept, r2,
+    _physics_panel(axes[0], per_ph, law, r2,
                   "physics: whole-image (-> ph_warp.py warp)")
-    _physics_panel(axes[1], per_ph_native, native_slope, native_intercept, native_r2,
+    _physics_panel(axes[1], per_ph_native, native_law, native_r2,
                   "physics: per-crop (-> native conditioning)")
 
     axes[2].plot(lam_x, lam_y, "o-", color="#6f4aa0", lw=2)

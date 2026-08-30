@@ -16,7 +16,9 @@ matplotlib.use("Agg")  # training usually runs headless / over ssh - never try t
 import matplotlib.pyplot as plt
 
 from config import (PH_MIN, PH_MAX, DEVICE, TRAIN_SIZES,
-                    CHECKPOINT_PATH, COND_CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH)
+                    PAIR_CHECKPOINT_PATH as CHECKPOINT_PATH,
+                    PAIR_COND_CHECKPOINT_PATH as COND_CHECKPOINT_PATH,
+                    PAIR_FINAL_CHECKPOINT_PATH as FINAL_CHECKPOINT_PATH)
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
@@ -110,6 +112,22 @@ SEED = 42
 WARP_AUG_PROB = 0.5
 WARP_AUG_MAX_WAVINESS = 26.0
 
+# The model is trained on the EDITING task directly, not on "turn noise into an image": every
+# sample is a (source, target) pair and the source goes into the network's second input
+# channel, clean, at every step. The pairs come from the warp augmentation above, which
+# already produces a real crop and a bent version of it - so the supervision costs nothing
+# extra. This is what lets img2img drop `--strength` entirely: that one knob had to trade
+# "keep the filament continuous" against "let the geometry move 15px", which are opposite
+# requirements, and no value satisfied both (measured: strength 0.8 reached the requested
+# waviness but lost the fibre in 16% of columns with 13px gaps; 0.7 kept it perfectly
+# continuous at 6px of a 10.7px request).
+#
+# 1 - WARP_AUG_PROB of the pairs are IDENTITY pairs (source == target). Those are not filler:
+# they are what teaches "the requested waviness already matches, so reproduce the input", and
+# without them the model would learn that an edit is always demanded.
+SOURCE_DROPOUT = 0.1   # replace the source with the all-zero "no source" encoding, so the
+                       # same checkpoint can still generate from noise (see sample.py)
+
 # A frame can only physically show so much waviness before the fibre leaves it: roughly
 # (H/2 - margin)/sqrt(2), i.e. ~12px at H=48, ~18px at H=64, ~24px at H=80, ~30px at H=96.
 # Reaching the pH 15.8-20 targets therefore needs the taller frames - but padding a 28px
@@ -167,6 +185,45 @@ def _warp_augment(img4):
     return warped
 
 
+def _make_pair(img4):
+    """(source, target) for the paired editing task, both framed identically.
+
+    The direction is randomised: the model has to learn to STRAIGHTEN as well as to bend, or
+    it would only ever be able to push waviness up and requests below the source's own
+    waviness would have no training support at all.
+    """
+    if random.random() >= WARP_AUG_PROB:
+        return img4, img4                      # identity - "already as requested"
+    warped = _warp_augment(img4)
+    if warped is img4:                         # untraceable, or already at the ceiling
+        return img4, img4
+    if random.random() < 0.5:
+        return warped, img4                    # straighten
+    return img4, warped                        # bend
+
+
+def _val_pair(img4, index):
+    """Deterministic (source, target) for validation: a fixed bend of +6px, fixed seed.
+
+    Validation has to exercise the EDIT task rather than plain reconstruction, or the
+    conditioning gap evaluate() selects on would be measuring the wrong thing - but it also
+    has to be identical on every call, or early stopping fires on augmentation noise. A fixed
+    displacement seeded per sample gives both.
+    """
+    current = measure_waviness(img4)
+    if current is None:
+        return img4, img4
+    target = min(WARP_AUG_MAX_WAVINESS, current + 6.0)
+    needed = math.sqrt(max(0.0, target ** 2 - current ** 2))
+    if needed < 0.5:
+        return img4, img4
+    gen = torch.Generator(device=img4.device).manual_seed(4321 + index)
+    displacement, _ = bounded_displacement(img4.shape[3], needed, 240.0, img4.device,
+                                           generator=gen)
+    warped, _ = warp_filament(img4, displacement, extend=False)
+    return img4, warped
+
+
 def dynamic_collate_fn(batch):
     """Pick an aspect ratio the batch can support, then crop/pad every sample to it.
 
@@ -187,17 +244,20 @@ def dynamic_collate_fn(batch):
         T.ColorJitter(brightness=0.1, contrast=0.1),
     ])
 
-    images, wavs = [], []
+    sources, targets, wavs = [], [], []
     for item in batch:
         img = fit_frame(item[0].unsqueeze(0), target_h, target_w)
+        # photometric jitter BEFORE pairing, so source and target share it - the pair must
+        # differ in geometry only, or the model would learn to "fix" brightness too
         img = photometric(img)
-        if random.random() < WARP_AUG_PROB:
-            img = _warp_augment(img)
-        images.append(img.squeeze(0))
-        wavs.append(_measure(img))
+        source, target = _make_pair(img)
+        sources.append(source.squeeze(0))
+        targets.append(target.squeeze(0))
+        wavs.append(_measure(target))          # the label describes what is to be PRODUCED
 
     phs = [item[1] for item in batch]
-    return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
+    return (torch.stack(sources), torch.stack(targets), torch.stack(phs),
+            torch.tensor(wavs, dtype=torch.float32))
 
 
 def val_collate_fn(batch):
@@ -209,8 +269,8 @@ def val_collate_fn(batch):
     it gets a fixed-seed generator rather than the global RNG.
     """
     target_h, target_w = 64, 256
-    images, wavs = [], []
-    for item in batch:
+    sources, targets, wavs = [], [], []
+    for index, item in enumerate(batch):
         img = item[0].unsqueeze(0)
         # Centre window, taken from the SOURCE - the same dead-code trap fit_frame had:
         # mirror_pad_width returns exactly target_w, so cropping after it could never move
@@ -230,11 +290,14 @@ def val_collate_fn(batch):
         elif h < target_h:
             gen = torch.Generator().manual_seed(1234)
             img = pad_height_background(img, target_h, generator=gen, jitter=0.0)
-        images.append(img.squeeze(0))
-        wavs.append(_measure(img))
+        source, target = _val_pair(img, index)
+        sources.append(source.squeeze(0))
+        targets.append(target.squeeze(0))
+        wavs.append(_measure(target))
 
     phs = [item[1] for item in batch]
-    return torch.stack(images), torch.stack(phs), torch.tensor(wavs, dtype=torch.float32)
+    return (torch.stack(sources), torch.stack(targets), torch.stack(phs),
+            torch.tensor(wavs, dtype=torch.float32))
 
 
 @torch.no_grad()
@@ -268,8 +331,9 @@ def evaluate(model, dataloader, num_noise_samples=3):
     eval_gen = torch.Generator(device=DEVICE)
     eval_gen.manual_seed(12345) 
     
-    for x_batch, pH_batch, wav_batch in dataloader:
+    for src_batch, x_batch, pH_batch, wav_batch in dataloader:
         x1 = x_batch.to(DEVICE)
+        source = src_batch.to(DEVICE)
         pH = normalize_pH(pH_batch.to(DEVICE).float())
         wav = wav_batch.to(DEVICE).float()
         null = torch.full_like(pH, float("nan"))
@@ -290,7 +354,7 @@ def evaluate(model, dataloader, num_noise_samples=3):
                                          ("no_wav", (pH, null)),
                                          ("no_pH", (null, wav))):
                 with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
-                    loss = F.mse_loss(model(xt, t, pH_in, wav_in), target)
+                    loss = F.mse_loss(model(xt, t, pH_in, wav_in, source=source), target)
                 batch[key] += loss.item()
 
         for key in totals:
@@ -496,13 +560,13 @@ def main():
     _crop_wavs = []
     for _ in range(50):
         idx = torch.randint(0, len(train_dataset), (BATCH_SIZE,), generator=_sample_gen).tolist()
-        _, _, _wav_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
+        _, _, _, _wav_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
         _crop_wavs.append(_wav_batch)
     # the stratified sampler also emits all-tall batches, which reach frame heights (and so
     # waviness values) a uniformly-sampled batch never can - include some or the
     # normalization scale would be fit to only the shorter half of the real distribution
     for _ in range(20):
-        _, _, _wav_batch = dynamic_collate_fn(
+        _, _, _, _wav_batch = dynamic_collate_fn(
             [train_dataset[i] for i in train_sampler._draw(train_sampler.tall_pool)])
         _crop_wavs.append(_wav_batch)
     random.setstate(_random_state); torch.set_rng_state(_torch_state)
@@ -528,7 +592,11 @@ def main():
     )
 
     
-    model = ConditionalUNet(waviness_mean=WAV_MEAN, waviness_std=WAV_STD).to(DEVICE)
+    # in_channels=2: the second channel is the source image being edited - see model.py and
+    # _make_pair above for why the editing task is trained directly instead of faked at
+    # inference time with SDEdit.
+    model = ConditionalUNet(in_channels=2, waviness_mean=WAV_MEAN,
+                            waviness_std=WAV_STD).to(DEVICE)
     ema_model = deepcopy(model).eval()
     for p in ema_model.parameters():
         p.requires_grad = False
@@ -559,11 +627,17 @@ def main():
     print(f"validation images: {len(val_dataset)}")
 
     while step < ITERATIONS and not stop_training:
-        for x_batch, pH_batch, wav_batch in train_dataloader:
+        for src_batch, x_batch, pH_batch, wav_batch in train_dataloader:
             if step >= ITERATIONS:
                 break
 
             x1 = x_batch.to(DEVICE)
+            source = src_batch.to(DEVICE)
+            # Drop the source to the all-zero "no source" encoding sometimes, so the same
+            # checkpoint can still generate from noise (sample.py) and so guidance ON the
+            # source stays available at inference if it is ever wanted.
+            keep_source = (torch.rand(x1.shape[0], device=DEVICE) >= SOURCE_DROPOUT)
+            source = source * keep_source.view(-1, 1, 1, 1)
             pH_raw = pH_batch.to(DEVICE).float()
             pH_jittered = (pH_raw + torch.randn_like(pH_raw) * PH_JITTER_STD).clamp(PH_MIN, PH_MAX)
             pH = normalize_pH(pH_jittered)
@@ -594,7 +668,7 @@ def main():
 
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
-                pred = model(xt, t, pH_input, wav_input)
+                pred = model(xt, t, pH_input, wav_input, source=source)
                 loss = F.mse_loss(pred, target)
                 
             # keep the unscaled value for logging - the scaled one is 1/ACCUMULATION_STEPS of

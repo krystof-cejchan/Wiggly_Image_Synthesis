@@ -4,7 +4,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
 from config import DEVICE, CHECKPOINT_PATH
-from model import ConditionalUNet
+from model import from_state_dict
 from dataset import MicrotubuleDataset
 from sample import sample, normalize_pH  # normalize_pH is used by the model inputs
 from img2img import load_and_preprocess_image
@@ -73,8 +73,7 @@ def main():
         return
 
     # Initialize model
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model = from_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE), DEVICE)
     model.eval()
 
     # Initialize FID metric

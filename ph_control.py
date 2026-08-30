@@ -40,6 +40,7 @@ to the lambda that reproduces the physically extrapolated waviness. Constants li
 ph_calibration.json so a new checkpoint can be recalibrated without touching this file.
 """
 import json
+import math
 import os
 
 import torch
@@ -96,6 +97,104 @@ def _calibration():
     return dict(_DEFAULTS)
 
 
+# ---------------------------------------------------------------------------------------
+# The pH -> waviness law. Its FUNCTIONAL FORM is chosen from the data rather than assumed,
+# because the choice is unconstrained inside the trained range and dominates everything
+# outside it: linear and exponential fits of the real crops are statistically
+# indistinguishable over 5.8-8.8 (R^2 0.812 vs 0.798 on bucket means) yet differ by 1.67x at
+# pH 12.8 and 6x at pH 20. Assuming one would be picking the answer rather than measuring it.
+#
+# Selection is by HELD-OUT EXTRAPOLATION error, not by in-sample fit: each form is refitted
+# with an end bucket removed and scored on how well it predicts that bucket's mean. That
+# tests the only thing we actually use the law for. Measured on the current dataset:
+#
+#     form           R^2 (all crops)   hold-out 8.8   hold-out 5.8   mean |err|
+#     linear             0.087            0.865          0.880          0.872   <- winner
+#     exponential       -0.041            0.348          1.922          1.135
+#     quadratic          0.087            6.051          2.499          4.275
+#
+# Quadratic fits in-sample as well as linear and extrapolates disastrously, which is the
+# whole reason the criterion is held-out rather than R^2.
+WAVINESS_FORMS = ("linear", "exponential", "quadratic")
+
+# The training distribution reaches WARP_AUG_MAX_WAVINESS (26px, see train.py), so a request
+# past that asks for geometry the model has never been shown. Extrapolated laws are clamped
+# here rather than allowed to run away - an exponential law would ask for 152px at pH 20.
+MAX_SUPPORTED_WAVINESS = 26.0
+
+
+def _fit_form(form, ph, w):
+    """Least-squares coefficients for one candidate form. numpy is imported lazily so this
+    module stays cheap to import for the inference path, which only ever evaluates."""
+    import numpy as np
+    ph = np.asarray(ph, dtype=float)
+    w = np.asarray(w, dtype=float)
+    if form == "linear":
+        return np.polyfit(ph, w, 1).tolist()
+    if form == "exponential":
+        # fitted in log space, so it can never predict a negative waviness
+        return np.polyfit(ph, np.log(np.clip(w, 1e-3, None)), 1).tolist()
+    if form == "quadratic":
+        return np.polyfit(ph, w, 2).tolist()
+    raise ValueError(f"Unknown waviness law form: {form!r} (expected one of {WAVINESS_FORMS})")
+
+
+def eval_law(law, pH):
+    """Evaluate a stored {"form": ..., "coeffs": [...]} law at one pH."""
+    form, c = law["form"], law["coeffs"]
+    if form == "linear":
+        return c[0] * pH + c[1]
+    if form == "exponential":
+        return math.exp(c[0] * pH + c[1])
+    if form == "quadratic":
+        return c[0] * pH * pH + c[1] * pH + c[2]
+    raise ValueError(f"Unknown waviness law form: {form!r} (expected one of {WAVINESS_FORMS})")
+
+
+def fit_waviness_law(ph, w, forms=WAVINESS_FORMS):
+    """Pick the functional form the data supports, and return (law, diagnostics).
+
+    ph/w are per-measurement (NOT per-bucket) so well-sampled pH levels carry more weight,
+    matching how the old single-form fit worked. Scoring is the mean absolute error on the
+    two end buckets when each is held out of the fit - see this section's header.
+    """
+    import numpy as np
+    ph = np.asarray(ph, dtype=float)
+    w = np.asarray(w, dtype=float)
+    keep = w > 0
+    ph, w = ph[keep], w[keep]
+    buckets = np.unique(ph)
+    means = {float(b): float(w[ph == b].mean()) for b in buckets}
+
+    diagnostics = {}
+    for form in forms:
+        coeffs = _fit_form(form, ph, w)
+        law = {"form": form, "coeffs": coeffs}
+        pred = np.array([eval_law(law, float(p)) for p in ph])
+        r2 = float(1 - ((w - pred) ** 2).sum() / ((w - w.mean()) ** 2).sum())
+        errors = []
+        for held in (float(buckets[-1]), float(buckets[0])):
+            mask = ph != held
+            if len(np.unique(ph[mask])) < 3:      # not enough levels left to refit
+                continue
+            held_law = {"form": form, "coeffs": _fit_form(form, ph[mask], w[mask])}
+            errors.append(abs(eval_law(held_law, held) - means[held]))
+        diagnostics[form] = {"coeffs": coeffs, "r2": r2,
+                             "holdout_error": float(np.mean(errors)) if errors else float("inf")}
+
+    best = min(diagnostics, key=lambda f: diagnostics[f]["holdout_error"])
+    return {"form": best, "coeffs": diagnostics[best]["coeffs"]}, diagnostics
+
+
+def _law(cal, key, legacy_slope, legacy_intercept):
+    """The stored law, falling back to the pre-law slope/intercept pair for older
+    ph_calibration.json files (and, through _DEFAULTS, to the hardcoded constants)."""
+    law = cal.get(key)
+    if isinstance(law, dict) and "form" in law:
+        return law
+    return {"form": "linear", "coeffs": [cal[legacy_slope], cal[legacy_intercept]]}
+
+
 def normalize_pH(pH):
     """Map the trained pH range onto [-1, 1]. Out-of-range values are NOT meaningful here;
     they are handled by extrapolation, never by feeding them through the embedding."""
@@ -104,7 +203,8 @@ def normalize_pH(pH):
 
 def predicted_waviness(pH):
     """RMS centreline excursion in pixels that a real filament at this pH would have,
-    from the linear fit over the measured dataset, continued past the ends.
+    from the fitted pH->waviness law over the measured dataset, continued past the ends.
+    The law's functional form is chosen from the data - see WAVINESS_FORMS.
 
     Whole-image scale - use this for ph_warp.py's geometric warp, which measures its
     `current` waviness the same way. For the model's native waviness conditioning, use
@@ -114,7 +214,8 @@ def predicted_waviness(pH):
     below that, but even a perfectly straight filament traces with some excursion.
     """
     cal = _calibration()
-    return max(0.5, cal["waviness_slope"] * pH + cal["waviness_intercept"])
+    law = _law(cal, "waviness_law", "waviness_slope", "waviness_intercept")
+    return min(MAX_SUPPORTED_WAVINESS, max(0.5, eval_law(law, pH)))
 
 
 def predicted_waviness_native(pH):
@@ -125,7 +226,8 @@ def predicted_waviness_native(pH):
     undershoot what the model was actually trained to respond to.
     """
     cal = _calibration()
-    return max(0.5, cal["native_waviness_slope"] * pH + cal["native_waviness_intercept"])
+    law = _law(cal, "native_waviness_law", "native_waviness_slope", "native_waviness_intercept")
+    return min(MAX_SUPPORTED_WAVINESS, max(0.5, eval_law(law, pH)))
 
 
 def ph_to_lambda(pH_query):
@@ -150,11 +252,11 @@ def ph_to_lambda(pH_query):
     return float(max(-limit, min(limit, lam)))
 
 
-def anchor_velocities(model, x, t):
+def anchor_velocities(model, x, t, source=None):
     """The velocity fields at the two ends of the trained range."""
     lo = torch.full((x.shape[0],), normalize_pH(PH_ANCHOR_LO), device=x.device)
     hi = torch.full((x.shape[0],), normalize_pH(PH_ANCHOR_HI), device=x.device)
-    return model(x, t, lo), model(x, t, hi)
+    return model(x, t, lo, source=source), model(x, t, hi, source=source)
 
 
 def extrapolate(v_lo, v_hi, lam, rescale=True):
@@ -173,7 +275,8 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
     return v
 
 
-def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None):
+def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None,
+                    source=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
@@ -186,17 +289,20 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
     wrapping. Requires a checkpoint trained with the waviness-conditioned ConditionalUNet;
     a checkpoint predating that silently ignores `waviness` via forward()'s default (None),
     so this argument is always safe to pass, it just does nothing on an old checkpoint.
+
+    `source` is the image being edited, for a source-conditioned checkpoint (model.py's
+    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too.
     """
     if waviness is not None:
         anchor = min(max(pH_query, PH_MIN), PH_MAX)
         ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
         wav = torch.full((x.shape[0],), float(waviness), device=x.device)
-        return model(x, t, ph, wav)
+        return model(x, t, ph, wav, source=source)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)
-        return model(x, t, ph)
-    v_lo, v_hi = anchor_velocities(model, x, t)
+        return model(x, t, ph, source=source)
+    v_lo, v_hi = anchor_velocities(model, x, t, source=source)
     return extrapolate(v_lo, v_hi, lam, rescale=rescale)
 
 

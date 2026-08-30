@@ -27,7 +27,7 @@ from PIL import Image
 from config import PH_MIN, PH_MAX, DEVICE, TRAIN_MIN_W, CHECKPOINT_PATH
 from img2img import (edit_image, load_and_preprocess_image, repair_fibre_gaps,
                      save_repair_diagnostic)
-from model import ConditionalUNet
+from model import from_state_dict
 
 DATA_DIR = "data/cropped/cropped_output"
 DEFAULT_SCALES = [1.0, 2.0, 3.0, 5.0, 7.0]
@@ -151,8 +151,7 @@ def main():
     if not os.path.exists(args.checkpoint):
         raise SystemExit(f"Checkpoint not found: {args.checkpoint}")
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
 
     sources, skipped = discover_sources(
