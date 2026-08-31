@@ -305,7 +305,7 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
                ph_rescale=False, source_waviness=None, target_waviness=None,
                source_period=None, target_period=None,
-               source_ripple=None, target_ripple=None):
+               source_ripple=None, target_ripple=None, geometry=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
@@ -340,6 +340,14 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     Both are needed: rms alone is degenerate between one long arc and many short waves, and a
     model told only the rms produces the arc. ph_warp.edit_to_pH's geometry_mode="native" is what sets
     these; a plain call here still defaults to today's behaviour unchanged.
+
+    `geometry` supersedes all of the scalars above on an in_channels == 3 checkpoint: it is
+    the target centreline rendered as a full-canvas ridge (waviness.centreline_map), i.e. the
+    actual curve rather than statistics about it, and it is windowed alongside the source. It
+    goes to BOTH contrastive branches deliberately - the pair should differ in pH texture
+    only, so the shape stays pinned by the channel instead of being pushed by
+    contrastive_scale, which would reintroduce the very hedging this channel removes. Must be
+    (1, 1, H, W) matching ref_image before any framing; it is framed here the same way.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -376,6 +384,20 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     # 0.7 the fibre was perfect at 6px of a 10.7px request. Starting from noise also means the
     # old straight filament is never present to be half-erased, which is what produced the
     # gaps and ghosting.
+    # The geometry canvas has to go through the SAME two framing operations the image does,
+    # or the curve stops lining up with the pixels it describes. Height grows with zeros
+    # rather than synthesised background: a blank row means "no fibre requested here", which
+    # is exactly true of rows the request never covered.
+    geometry_canvas = None
+    if geometry is not None and getattr(model, "geometry_conditioned", False):
+        geometry_canvas = geometry
+        if frame_h > geometry_canvas.shape[2]:
+            padded = torch.zeros(1, 1, frame_h, geometry_canvas.shape[3],
+                                 device=geometry_canvas.device)
+            padded[:, :, top_offset:top_offset + geometry_canvas.shape[2], :] = geometry_canvas
+            geometry_canvas = padded
+        geometry_canvas = mirror_pad_width(geometry_canvas, target_w)
+
     source_canvas = padded_ref if getattr(model, "source_conditioned", False) else None
     if source_canvas is not None:
         t_start = 0.0
@@ -405,15 +427,19 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
             x_patch = x_in[:, :, :, x_idx:x_idx+win_w]
             src_patch = (None if source_canvas is None
                          else source_canvas[:, :, :, x_idx:x_idx+win_w])
+            # The same curve goes to both branches - see the docstring.
+            geo_patch = (None if geometry_canvas is None
+                         else geometry_canvas[:, :, :, x_idx:x_idx+win_w])
 
             v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
                                           rescale=ph_rescale, waviness=source_waviness,
                                           source=src_patch, period=source_period,
-                                          ripple=source_ripple)
+                                          ripple=source_ripple, geometry=geo_patch)
             v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
                                           rescale=ph_rescale, lam_override=ph_lambda,
                                           waviness=target_waviness, source=src_patch,
-                                          period=target_period, ripple=target_ripple)
+                                          period=target_period, ripple=target_ripple,
+                                          geometry=geo_patch)
 
             v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
             v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask
@@ -507,17 +533,23 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
-    parser.add_argument("--geometry_mode", type=str, default="warp", choices=["warp", "native"],
-                        help="'warp' (default) holds the fibre still while the model "
+    parser.add_argument("--geometry_mode", type=str, default="auto",
+                        choices=["auto", "warp", "native"],
+                        help="'auto' (default) follows the checkpoint: a geometry-conditioned "
+                             "one (in_channels==3) gets 'native', anything older gets 'warp'. "
+                             "'native' hands the model the target CURVE as a third input "
+                             "channel and lets it draw every pixel - no pixel warping at all, "
+                             "and pH stays inside its trained range because the shape arrives "
+                             "as geometry rather than as an out-of-range pH. "
+                             "'warp' holds the fibre still while the model "
                              "re-renders pH texture, then moves REAL PIXELS into the "
                              "requested shape - a broadband displacement carrying the "
                              "requested waviness and ripple. Use it: the fibre keeps the "
                              "source's contrast and continuity because it is the source's "
-                             "own fibre. 'native' instead asks the model to redraw the "
-                             "filament where the conditioning says it should be; the "
-                             "geometry comes out right but the fibre renders at ~40%% of a "
-                             "real crop's contrast and breaks up, because the model is "
-                             "inventing it at a location it has to guess.")
+                             "own fibre, but the shape is imposed outside the network. On a "
+                             "pre-geometry checkpoint 'native' falls back to driving shape "
+                             "through the waviness/ripple SCALARS, which state how much wave "
+                             "but never where - keep that for comparison only.")
 
     args = parser.parse_args()
     

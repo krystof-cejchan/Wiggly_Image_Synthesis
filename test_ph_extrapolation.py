@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--contrast", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default="outputs_img2img/ph_range")
-    ap.add_argument("--geometry_mode", default="warp", choices=["warp", "native"],
+    ap.add_argument("--geometry_mode", default="auto", choices=["auto", "warp", "native"],
                     help="Which out-of-range mechanism to exercise - see ph_warp.edit_to_pH. "
                          "'native' needs a waviness-conditioned checkpoint.")
     args = ap.parse_args()

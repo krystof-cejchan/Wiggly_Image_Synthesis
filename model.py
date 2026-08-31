@@ -285,8 +285,26 @@ class ConditionalUNet(nn.Module):
         # far the geometry may move, which are opposite requirements when the job is to
         # displace a 3px filament by 15px while keeping it continuous. See train.py's
         # _make_pair for how the supervision is built.
+        # in_channels == 3 adds the GEOMETRY channel: a soft ridge rendered along the
+        # centreline the filament is supposed to end up on (waviness.centreline_map). This
+        # exists because waviness and ripple are statistics, not a shape - infinitely many
+        # curves share an rms and a ripple share, so a model given only those has to average
+        # over a phase it was never told, and the average of many possible filament
+        # positions is a smear. Measured on the 2-channel checkpoint: 0.35-0.39 fibre depth
+        # when the filament has to move, against 0.86 for a real crop and 0.98 for the same
+        # model asked to leave the filament where the source channel already shows it. The
+        # geometry channel makes a NEW position known in that same unambiguous way.
+        #
+        # It is also what makes pH extrapolation work. With the shape supplied as pixels the
+        # pH scalar never has to leave [PH_MIN, PH_MAX], where its Fourier embedding is
+        # valid - out of range that embedding aliases, and pH 11.8 sits exactly as close to
+        # 8.8 as 5.8 does. The extrapolation moves onto the geometry axis instead, and
+        # train.py's warp augmentation already populates that axis to WARP_AUG_MAX_WAVINESS
+        # (26px) - far past the 6.5px a real pH 8.8 crop has, and past the ~13px a pH 14.8
+        # request asks for. So an out-of-range pH becomes an IN-distribution geometry.
         self.in_channels = in_channels
         self.source_conditioned = in_channels > 1
+        self.geometry_conditioned = in_channels > 2
 
         self.t_embed = ScalarEmbedding(emb_dim)
         # Lower frequency range than t_embed: t is sampled densely and continuously
@@ -397,7 +415,8 @@ class ConditionalUNet(nn.Module):
         real = embed(safe)
         return torch.where(is_null.unsqueeze(-1), null_emb.expand_as(real), real)
 
-    def forward(self, x, t, pH, waviness=None, source=None, period=None, ripple=None):
+    def forward(self, x, t, pH, waviness=None, source=None, period=None, ripple=None,
+                geometry=None):
         """
         Forward pass for conditional U-Net.
 
@@ -421,12 +440,23 @@ class ConditionalUNet(nn.Module):
                 so it is always safe to pass.
             period: legacy undulation-period channel, only present on checkpoints trained
                 before `ripple` replaced it. Ignored otherwise.
+            geometry: (B, 1, H, W) ridge marking where the filament should end up, from
+                waviness.centreline_map, for a geometry-conditioned model (in_channels == 3).
+                None means "no geometry requested", encoded as an all-zero channel and
+                trained at rate GEOMETRY_DROPOUT so the model still works without it (which
+                is what keeps sample.py's from-noise generation alive on the same
+                checkpoint). Ignored by a checkpoint without the channel, so it is always
+                safe to pass. Unlike `waviness`/`ripple`, this says exactly WHERE the fibre
+                goes, which is why the model can render it sharply instead of hedging.
 
         Returns:
             output tensor (B, C_out, H, W)
         """
         if self.source_conditioned:
             x = torch.cat([x, torch.zeros_like(x) if source is None else source], dim=1)
+        if self.geometry_conditioned:
+            geom = torch.zeros_like(x[:, :1]) if geometry is None else geometry
+            x = torch.cat([x, geom], dim=1)
         # embed time and pH scalars
         t_emb = self.t_embed(t)
 
@@ -493,6 +523,7 @@ def from_state_dict(state_dict, device=None):
 
         conv_in.weight  (64, 1, 3, 3)   ->  from-noise model, editing needs SDEdit
         conv_in.weight  (64, 2, 3, 3)   ->  source-conditioned, editing is a direct render
+        conv_in.weight  (64, 3, 3, 3)   ->  + geometry channel, the target centreline as pixels
         waviness_mean present            ->  has the waviness conditioning channel
         ripple_mean present              ->  also has the fine-undulation (ripple) channel
         log_period_mean present          ->  has the LEGACY undulation-period channel that

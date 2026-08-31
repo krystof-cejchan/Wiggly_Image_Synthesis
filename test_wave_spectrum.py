@@ -136,7 +136,7 @@ def main():
     ap.add_argument("--num_steps", type=int, default=100)
     ap.add_argument("--contrastive_scale", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--geometry_mode", default="warp", choices=["warp", "native"],
+    ap.add_argument("--geometry_mode", default="auto", choices=["auto", "warp", "native"],
                     help="Which mechanism to measure - the same flag img2img.py takes. "
                          "'warp' (default) is the product path: the model re-renders "
                          "texture with the fibre held still and a broadband pixel warp "
@@ -171,13 +171,13 @@ def main():
     target_ripple = predicted_ripple(args.target_pH)
     source_waviness = measure_frame_waviness(ref) or predicted_waviness_native(args.source_pH)
     source_ripple = measure_frame_ripple(ref) or predicted_ripple(args.source_pH)
-    if args.geometry_mode == "native":
+    if args.geometry_mode == "native" and not getattr(model, "geometry_conditioned", False):
         print(f"requested: waviness {source_waviness:.2f} -> {target_waviness:.2f}px, "
               f"ripple {source_ripple:.2f} -> {target_ripple:.2f}px "
               f"(share {target_ripple / max(target_waviness, 1e-6):.2f})")
 
     with torch.no_grad():
-        if args.geometry_mode == "native":
+        if args.geometry_mode == "native" and not getattr(model, "geometry_conditioned", False):
             out = edit_image(model=model, ref_image=ref, source_pH=args.source_pH,
                              target_pH=args.target_pH, num_steps=args.num_steps,
                              contrastive_scale=args.contrastive_scale, seed=args.seed,
@@ -190,7 +190,8 @@ def main():
             out, info = edit_to_pH(model=model, ref_image=ref, source_pH=args.source_pH,
                                    target_pH=args.target_pH, num_steps=args.num_steps,
                                    contrastive_scale=args.contrastive_scale, seed=args.seed,
-                                   contrast=1.0, solver="heun", geometry_mode="warp")
+                                   contrast=1.0, solver="heun",
+                                   geometry_mode=args.geometry_mode)
             if not info.get("warped"):
                 print("warp: NOT APPLIED - the fibre could not be traced in this crop")
             elif info.get("mode_detail") == "straighten":

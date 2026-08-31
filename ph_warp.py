@@ -44,10 +44,11 @@ import math
 import torch
 import torch.nn.functional as F
 
-from config import PH_MAX, PH_MIN
+from config import PH_MAX, PH_MIN, WARP_AUG_MAX_SLOPE
 from ph_control import (predicted_waviness, predicted_waviness_native,
                         predicted_period, predicted_ripple)
-from waviness import box_blur, ripple_rms, trace_fibre, waviness
+from waviness import (box_blur, centreline_map, line_stats, ripple_rms, trace_fibre,
+                      waviness)
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
 _WL_LOG_SLOPE = -0.2477
@@ -428,6 +429,90 @@ def _added_ripple_fraction(needed_rms, current_ripple, target_ripple):
     return min(1.0, max(0.0, extra / max(needed_rms, 1e-6)))
 
 
+def plan_target_line(line, target_pH, seed=None, max_slope=None,
+                     attempts=WARP_CORRECTION_ATTEMPTS):
+    """The centreline a filament at `target_pH` should have, given the one it has now.
+
+    This is the geometry computation, isolated from what consumes it. The pixel warp applies
+    (target_line - line) to real pixels; the model's geometry channel renders target_line and
+    asks the network to draw on it. Same fitted law, same broadband synthesiser, same slope
+    budget, same correction loop - the two mechanisms differ only in who does the drawing.
+
+    Scoring here is done on the CURVE (waviness.line_stats) rather than by warping an image
+    and re-tracing it. That is both cheaper and more accurate: no grid_sample, no tracer
+    noise, so the loop converges on the waviness that was actually requested instead of on
+    the tracer's opinion of it.
+
+    The slope budget defaults to config.WARP_AUG_MAX_SLOPE, NOT to WARP_MAX_SLOPE, and the
+    difference matters. WARP_MAX_SLOPE bounds what grid_sample can resample without tearing
+    texture - a constraint that simply does not exist here, because nothing is resampled:
+    the curve is handed to the model as pixels and the model draws on it. What does bind is
+    what the model was TRAINED on, which is exactly the augmentation's own cap. Using the
+    resampling budget here would cap a pH 14.8 request at about 7px of a 13px request for a
+    reason that does not apply to it.
+
+    Returns (target_line, info). `line` is a (W,) tensor of y positions as centreline()
+    returns; the result is in the same frame and may fall outside it, which is the caller's
+    cue to grow the canvas (see required_pad).
+    """
+    if max_slope is None:
+        max_slope = WARP_AUG_MAX_SLOPE
+    stats = line_stats(line.detach().cpu().numpy())
+    info = {"warped": False, "applied_rms": 0.0, "ripple_fraction": None}
+    if stats is None:
+        return line, info
+    current, current_ripple = stats
+    target = predicted_waviness(target_pH)
+    target_ripple = target_ripple_whole(target_pH, target)
+    info.update({"current": current, "target": target,
+                 "current_ripple": current_ripple, "target_ripple": target_ripple})
+
+    if target < current:
+        # Straighten by shrinking the deviation ABOUT ITS OWN MEAN, so the filament flattens
+        # in place instead of sliding up the frame. _straighten scales absolute y because it
+        # has to build a shear for grid_sample; here the curve is stated directly and there
+        # is no reason to inherit that.
+        k = target / max(current, 1e-6)
+        centre = line.mean()
+        out = centre + (line - centre) * k
+        achieved = line_stats(out.detach().cpu().numpy())
+        info.update({"warped": True, "mode_detail": "straighten",
+                     "applied_rms": float((out - line).std()),
+                     "achieved": None if achieved is None else achieved[0],
+                     "achieved_ripple": None if achieved is None else achieved[1]})
+        return out, info
+
+    needed = math.sqrt(max(0.0, target ** 2 - current ** 2))
+    fraction = _added_ripple_fraction(needed, current_ripple, target_ripple)
+    info["ripple_fraction"] = fraction
+
+    best, best_err, applied = None, float("inf"), needed
+    for attempt in range(attempts):
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=line.device).manual_seed(seed + attempt * 1000)
+        d, applied_rms = bounded_broadband(int(line.numel()), applied, fraction, line.device,
+                                           generator=gen, max_slope=max_slope)
+        candidate = line + d
+        got = line_stats(candidate.detach().cpu().numpy())
+        if got is None:
+            break
+        achieved, achieved_ripple = got
+        err = abs(achieved - target)
+        if err < best_err:
+            best, best_err = candidate, err
+            info.update({"applied_rms": applied_rms, "achieved": achieved,
+                         "achieved_ripple": achieved_ripple})
+        if err <= 0.05 * target:
+            break
+        applied *= max(0.4, min(2.5, target / max(achieved, 1e-3)))
+
+    if best is None:
+        return line, info
+    info["warped"] = True
+    return best, info
+
+
 def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None,
                       measured_ripple=None, max_slope=WARP_MAX_SLOPE):
     """Re-shape a filament image to the waviness a given pH calls for.
@@ -633,8 +718,60 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
     """
     from img2img import edit_image
 
-    if geometry_mode not in ("warp", "native"):
-        raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} (expected 'warp' or 'native')")
+    if geometry_mode not in ("warp", "native", "auto"):
+        raise ValueError(f"Unknown geometry_mode: {geometry_mode!r} "
+                         f"(expected 'warp', 'native' or 'auto')")
+    if geometry_mode == "auto":
+        # Follow the checkpoint. A geometry-conditioned one can be handed the curve directly
+        # and draws every pixel itself; anything older has no channel to put it in, and its
+        # scalar-only native path is the weak mechanism, so those fall back to the warp.
+        geometry_mode = ("native" if getattr(model, "geometry_conditioned", False)
+                         else "warp")
+
+    if geometry_mode == "native" and getattr(model, "geometry_conditioned", False):
+        # THE CURVE ITSELF, handed to the model as pixels. This is the same geometry the
+        # warp path computes - same fitted law, same broadband synthesiser, same correction
+        # loop (plan_target_line) - but instead of applying it to the source's pixels with
+        # grid_sample, it is rendered as a ridge and the network draws the filament on it.
+        #
+        # The two things that were wrong with the scalar native path are both gone. It could
+        # not render sharply, because waviness and ripple are statistics and a model given
+        # only those has to average over a phase it was never told; the curve removes that
+        # ambiguity entirely. And it could not extrapolate, because the request had to travel
+        # through the pH embedding, which aliases out of range; here pH is pinned to its
+        # anchor for texture and the shape arrives as pixels, so the extrapolation happens on
+        # the geometry axis, where the augmentation has real training support to
+        # WARP_AUG_MAX_SLOPE.
+        from img2img import edit_image as _edit
+        line = centreline(ref_image)
+        if line is None:
+            out = _edit(model=model, ref_image=ref_image, source_pH=source_pH,
+                        target_pH=min(max(target_pH, PH_MIN), PH_MAX), seed=seed, **kw)
+            return out, {"mode": "native", "warped": False,
+                         "reason": "no centreline traced"}
+
+        target_line, plan = plan_target_line(line, target_pH, seed=seed)
+        # Grow the canvas only if the requested curve actually leaves the frame - the same
+        # overshoot rule the warp uses, for the same reason (every added row is synthesised
+        # background). The source channel needs those rows to exist; the model fills them.
+        canvas = ref_image
+        pad = required_pad(line, target_line - line, ref_image.shape[2])
+        if extend_frame and pad:
+            canvas = _extend_frame(ref_image, pad)
+            target_line = target_line + pad
+        target_line = target_line.clamp(0, canvas.shape[2] - 1)
+
+        geometry = centreline_map(target_line, canvas.shape[2])
+        anchor = min(max(target_pH, PH_MIN), PH_MAX)
+        out = _edit(model=model, ref_image=canvas, source_pH=source_pH, target_pH=anchor,
+                    seed=seed, geometry=geometry, **kw)
+        from img2img import measure_frame_waviness, measure_frame_ripple
+        info = {"mode": "native", "geometry": "curve", **plan}
+        info.pop("displacement", None)
+        info["canvas_grew"] = canvas.shape[2] - ref_image.shape[2]
+        info["rendered"] = measure_frame_waviness(out * 2 - 1)
+        info["rendered_ripple"] = measure_frame_ripple(out * 2 - 1)
+        return out, info
 
     if geometry_mode == "native":
         # The contrastive pair is "what the filament is now" vs "what it should become", and

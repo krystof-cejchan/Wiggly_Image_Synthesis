@@ -344,7 +344,7 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
 
 
 def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None,
-                    source=None, period=None, ripple=None):
+                    source=None, period=None, ripple=None, geometry=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
@@ -362,7 +362,20 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
     in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too. So are
     `ripple` (the fine-undulation half of the geometry request) and `period` (the legacy
     channel it replaced): a checkpoint without either simply drops it.
+
+    `geometry` is the target centreline rendered as pixels (waviness.centreline_map), for an
+    in_channels == 3 checkpoint. When it is supplied the pH anchoring above matters more,
+    not less: the whole point is that the SHAPE arrives as pixels, so pH never has to leave
+    the range its Fourier embedding is valid over. Passing `geometry` therefore also pins pH
+    to the nearest anchor, exactly as `waviness` does, and for the same reason.
     """
+    if geometry is not None and waviness is None:
+        # geometry alone is a complete request - pin pH to its anchor and hand the curve over
+        anchor = min(max(pH_query, PH_MIN), PH_MAX)
+        ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
+        rip = (None if ripple is None
+               else torch.full((x.shape[0],), float(ripple), device=x.device))
+        return model(x, t, ph, None, source=source, ripple=rip, geometry=geometry)
     if waviness is not None:
         anchor = min(max(pH_query, PH_MIN), PH_MAX)
         ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
@@ -371,7 +384,8 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
                else torch.full((x.shape[0],), float(period), device=x.device))
         rip = (None if ripple is None
                else torch.full((x.shape[0],), float(ripple), device=x.device))
-        return model(x, t, ph, wav, source=source, period=per, ripple=rip)
+        return model(x, t, ph, wav, source=source, period=per, ripple=rip,
+                     geometry=geometry)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)

@@ -16,12 +16,13 @@ matplotlib.use("Agg")  # training usually runs headless / over ssh - never try t
 import matplotlib.pyplot as plt
 
 from config import (PH_MIN, PH_MAX, DEVICE, TRAIN_SIZES,
-                    CHECKPOINT_PATH, COND_CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH)
+                    CHECKPOINT_PATH, COND_CHECKPOINT_PATH, FINAL_CHECKPOINT_PATH, WARP_AUG_MAX_SLOPE)
 import torchvision.transforms.v2 as T
 from model import ConditionalUNet
 from dataset import MicrotubuleDataset
 from PIL import Image
-from waviness import waviness as measure_waviness, ripple_rms as measure_ripple
+from waviness import (waviness as measure_waviness, ripple_rms as measure_ripple,
+                      geometry_channel)
 from framing import fit_frame, mirror_pad_width, pad_height_background
 from ph_warp import bounded_broadband, warp_filament
 
@@ -135,12 +136,14 @@ WARP_AUG_MAX_WAVINESS = 26.0
 # the axis the model has to follow actually moves.
 WARP_AUG_MIN_RIPPLE_FRACTION = 0.05
 WARP_AUG_MAX_RIPPLE_FRACTION = 0.98
-# Slightly above ph_warp.MAX_DISPLACEMENT_SLOPE (1.0). That constant guards the INFERENCE
-# warp, where grid_sample tears the background into a comb at high slope; ph_warp's own notes
-# put the clean boundary nearer 1.2 (pH 10-11 renders clean, pH 12 at slope 2.5 does not).
-# The extra headroom is what lets a short period coexist with a large amplitude at all -
-# a 60px period caps the rms at 6.7px under a slope of 1.0.
-WARP_AUG_MAX_SLOPE = 1.5
+# WARP_AUG_MAX_SLOPE lives in config.py: inference reads it too, as the ceiling on what
+# curves a geometry-conditioned checkpoint may legitimately be asked to draw. It was 1.5
+# here, on the theory that grid_sample tears the background into a comb above that - which
+# turned out not to be true of a BROADBAND displacement (the earlier figure came from the
+# narrowband synthesiser, where every column sits on the same steep shear at once). Measured
+# directly, the comb ratio is flat from cap 1.5 to 5.0. The old value held the augmentation
+# to about 6px of rms excursion, so the model was never shown the shapes a pH 10+ request
+# needs, which is exactly the ceiling that made every high request come back the same.
 
 # The model is trained on the EDITING task directly, not on "turn noise into an image": every
 # sample is a (source, target) pair and the source goes into the network's second input
@@ -155,6 +158,12 @@ WARP_AUG_MAX_SLOPE = 1.5
 # 1 - WARP_AUG_PROB of the pairs are IDENTITY pairs (source == target). Those are not filler:
 # they are what teaches "the requested waviness already matches, so reproduce the input", and
 # without them the model would learn that an edit is always demanded.
+GEOMETRY_DROPOUT = 0.15  # zero the geometry channel this often, so "no curve requested" is a
+# trained encoding rather than merely tolerated. It has to stay well below the source's rate:
+# the geometry channel is the ONLY thing that says where a moved filament goes, and a model
+# that saw it dropped too often would keep the hedging habit the channel exists to remove.
+# It is also what keeps sample.py's from-noise generation alive on the same checkpoint, and
+# what leaves the waviness/ripple scalars a job on the samples where the curve is absent.
 SOURCE_DROPOUT = 0.1   # replace the source with the all-zero "no source" encoding, so the
                        # same checkpoint can still generate from noise (see sample.py)
 
@@ -201,6 +210,26 @@ def _measure_ripple(img4):
     """
     value = measure_ripple(img4)
     return float(value) if value is not None else float("nan")
+
+
+def _geometry(img4, height, width):
+    """The geometry channel for a training TARGET: where its filament actually is.
+
+    The supervision costs nothing to obtain and is exact. _make_pair already produces the
+    target frame; tracing it gives the curve the model is being asked to draw, crest by
+    crest, rather than the rms summary the waviness/ripple labels carry. Because the label
+    always describes the TARGET, it works unchanged in both directions - the pair's
+    direction is randomised, and "draw the fibre here" is the same instruction whether that
+    means bending a straight filament or straightening a bent one.
+
+    Untraceable frames get the all-zero "no geometry requested" encoding, which is the same
+    thing GEOMETRY_DROPOUT injects deliberately, so they train the null path instead of
+    being wasted.
+    """
+    geom = geometry_channel(img4)
+    if geom is None:
+        return torch.zeros(1, height, width)
+    return geom.squeeze(0)
 
 
 def _warp_augment(img4):
@@ -300,13 +329,28 @@ def dynamic_collate_fn(batch):
     allowed = [s for s in TRAIN_SIZES if s[0] <= cap] or [min(TRAIN_SIZES)]
     target_h, target_w = random.choice(allowed)
 
-    photometric = T.Compose([
+    # ColorJitter operates on the [0, 1] convention and CLAMPS to it, while dataset.py
+    # normalizes to [-1, 1]. Applied directly it therefore crushed every negative pixel to
+    # zero - 31.7% of a typical crop, and specifically the dark half, which is the filament.
+    # Measured over 40 crops: fibre depth fell 0.87 -> 0.28, i.e. every training target the
+    # model ever saw had its filament at a third of the contrast a real crop has. The model
+    # then reproduced exactly that, which is what generated fibres measuring 0.35 depth
+    # against real crops' 0.86 actually were - not a limit of the architecture, and not the
+    # hedging it was first attributed to. The waviness labels were measured off the crushed
+    # image too, adding a median 0.52px of error to a 5.77px typical value, and val_collate_fn
+    # applies no jitter at all, so training and validation were scoring different pixel
+    # distributions. Flips are sign-agnostic and stay where they are; only the photometric
+    # part has to be round-tripped through [0, 1].
+    flips = T.Compose([
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.5),
-        T.ColorJitter(brightness=0.1, contrast=0.1),
     ])
+    jitter = T.ColorJitter(brightness=0.1, contrast=0.1)
 
-    sources, targets, wavs, ripples = [], [], [], []
+    def photometric(img):
+        return jitter((flips(img) + 1) / 2) * 2 - 1
+
+    sources, targets, wavs, ripples, geoms = [], [], [], [], []
     for item in batch:
         img = fit_frame(item[0].unsqueeze(0), target_h, target_w)
         # photometric jitter BEFORE pairing, so source and target share it - the pair must
@@ -317,11 +361,13 @@ def dynamic_collate_fn(batch):
         targets.append(target.squeeze(0))
         wavs.append(_measure(target))          # the labels describe what is to be PRODUCED
         ripples.append(_measure_ripple(target))
+        geoms.append(_geometry(target, target_h, target_w))
 
     phs = [item[1] for item in batch]
     return (torch.stack(sources), torch.stack(targets), torch.stack(phs),
             torch.tensor(wavs, dtype=torch.float32),
-            torch.tensor(ripples, dtype=torch.float32))
+            torch.tensor(ripples, dtype=torch.float32),
+            torch.stack(geoms))
 
 
 def val_collate_fn(batch):
@@ -333,7 +379,7 @@ def val_collate_fn(batch):
     it gets a fixed-seed generator rather than the global RNG.
     """
     target_h, target_w = 64, 256
-    sources, targets, wavs, ripples = [], [], [], []
+    sources, targets, wavs, ripples, geoms = [], [], [], [], []
     for index, item in enumerate(batch):
         img = item[0].unsqueeze(0)
         # Centre window, taken from the SOURCE - the same dead-code trap fit_frame had:
@@ -359,18 +405,20 @@ def val_collate_fn(batch):
         targets.append(target.squeeze(0))
         wavs.append(_measure(target))
         ripples.append(_measure_ripple(target))
+        geoms.append(_geometry(target, target_h, target_w))
 
     phs = [item[1] for item in batch]
     return (torch.stack(sources), torch.stack(targets), torch.stack(phs),
             torch.tensor(wavs, dtype=torch.float32),
-            torch.tensor(ripples, dtype=torch.float32))
+            torch.tensor(ripples, dtype=torch.float32),
+            torch.stack(geoms))
 
 
 @torch.no_grad()
 def evaluate(model, dataloader, num_noise_samples=3):
     """Flow-matching MSE on the validation set, plus how much the model USES its conditioning.
 
-    Returns (val_loss, waviness_gap, pH_gap, ripple_gap). Each gap is the loss with that conditioning
+    Returns (val_loss, waviness_gap, pH_gap, ripple_gap, geometry_gap). Each gap is the loss with that conditioning
     channel forced to its null embedding MINUS the loss with it supplied - i.e. how much
     worse the model does when the channel is taken away, which is exactly "how much the
     channel is being used". Positive means used.
@@ -391,19 +439,23 @@ def evaluate(model, dataloader, num_noise_samples=3):
     conditioning variants below see the identical xt.
     """
     model.eval()
-    totals = {"all": 0.0, "no_wav": 0.0, "no_pH": 0.0, "no_ripple": 0.0}
+    totals = {"all": 0.0, "no_wav": 0.0, "no_pH": 0.0, "no_ripple": 0.0, "no_geom": 0.0}
 
     # Set a fixed generator for deterministic validation
     eval_gen = torch.Generator(device=DEVICE)
     eval_gen.manual_seed(12345) 
     
-    for src_batch, x_batch, pH_batch, wav_batch, ripple_batch in dataloader:
+    for src_batch, x_batch, pH_batch, wav_batch, ripple_batch, geom_batch in dataloader:
         x1 = x_batch.to(DEVICE)
         source = src_batch.to(DEVICE)
         pH = normalize_pH(pH_batch.to(DEVICE).float())
         wav = wav_batch.to(DEVICE).float()
         ripple = ripple_batch.to(DEVICE).float()
+        geom = geom_batch.to(DEVICE).float()
         null = torch.full_like(pH, float("nan"))
+        # the geometry channel's null is the all-zero image, not NaN - it is pixels, not a
+        # scalar routed through a null embedding
+        null_geom = torch.zeros_like(geom)
 
         batch = {k: 0.0 for k in totals}
 
@@ -418,13 +470,15 @@ def evaluate(model, dataloader, num_noise_samples=3):
 
             # Same xt for every variant, so the differences are the conditioning and
             # nothing else
-            for key, (pH_in, wav_in, rip_in) in (("all", (pH, wav, ripple)),
-                                                 ("no_wav", (pH, null, ripple)),
-                                                 ("no_pH", (null, wav, ripple)),
-                                                 ("no_ripple", (pH, wav, null))):
+            for key, (pH_in, wav_in, rip_in, geom_in) in (
+                    ("all", (pH, wav, ripple, geom)),
+                    ("no_wav", (pH, null, ripple, geom)),
+                    ("no_pH", (null, wav, ripple, geom)),
+                    ("no_ripple", (pH, wav, null, geom)),
+                    ("no_geom", (pH, wav, ripple, null_geom))):
                 with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
                     loss = F.mse_loss(model(xt, t, pH_in, wav_in, source=source,
-                                            ripple=rip_in), target)
+                                            ripple=rip_in, geometry=geom_in), target)
                 batch[key] += loss.item()
 
         for key in totals:
@@ -436,10 +490,11 @@ def evaluate(model, dataloader, num_noise_samples=3):
     return (val_loss,
             totals["no_wav"] / n - val_loss,
             totals["no_pH"] / n - val_loss,
-            totals["no_ripple"] / n - val_loss)
+            totals["no_ripple"] / n - val_loss,
+            totals["no_geom"] / n - val_loss)
 
 def save_loss_history(train_steps, train_losses, val_steps, val_losses, out_path,
-                      wav_gaps=None, ripple_gaps=None):
+                      wav_gaps=None, ripple_gaps=None, shape_gaps=None):
     """Dump the raw curves next to the plot so they can be re-plotted or compared across runs.
 
     The gaps are evaluate()'s per-channel conditioning gaps, on the same grid as val_steps.
@@ -453,17 +508,19 @@ def save_loss_history(train_steps, train_losses, val_steps, val_losses, out_path
     val_lookup = dict(zip(val_steps, val_losses))
     gap_lookup = dict(zip(val_steps, wav_gaps or []))
     rip_lookup = dict(zip(val_steps, ripple_gaps or []))
+    shape_lookup = dict(zip(val_steps, shape_gaps or []))
 
     def row(s, tl):
         return [s, tl,
                 f"{val_lookup[s]:.6f}" if s in val_lookup else "",
                 f"{gap_lookup[s]:.8f}" if s in gap_lookup else "",
-                f"{rip_lookup[s]:.8f}" if s in rip_lookup else ""]
+                f"{rip_lookup[s]:.8f}" if s in rip_lookup else "",
+                f"{shape_lookup[s]:.8f}" if s in shape_lookup else ""]
 
     with open(out_path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["step", "train_loss_live", "val_loss_ema",
-                         "waviness_cond_gap", "ripple_cond_gap"])
+                         "waviness_cond_gap", "ripple_cond_gap", "geometry_cond_gap"])
         for s, tl in zip(train_steps, train_losses):
             writer.writerow(row(s, f"{tl:.6f}"))
         # val is sampled on a coarser grid than train, so emit any val-only steps too
@@ -474,7 +531,7 @@ def save_loss_history(train_steps, train_losses, val_steps, val_losses, out_path
 
 def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_step,
                       out_path="outputs/training_loss.png", wav_gaps=None,
-                      best_cond_step=None, ripple_gaps=None):
+                      best_cond_step=None, ripple_gaps=None, shape_gaps=None):
     """Save the train/val loss curves once training ends (either normally or via early stop)."""
     if not train_steps:
         print("No loss history recorded - skipping plot.")
@@ -526,6 +583,9 @@ def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_ste
         fig2, ax = plt.subplots(figsize=(9, 4))
         ax.plot(val_steps, wav_gaps, color="tab:green", lw=1.8, marker="o", ms=3,
                 label="waviness gap (EMA)")
+        if shape_gaps:
+            ax.plot(val_steps, shape_gaps, color="tab:red", lw=2.2, marker="^", ms=4,
+                    label="geometry channel (the one that matters)")
         if ripple_gaps:
             ax.plot(val_steps, ripple_gaps, color="tab:purple", lw=1.8, marker="s", ms=3,
                     label="ripple gap (EMA)")
@@ -545,7 +605,7 @@ def plot_loss_history(train_steps, train_losses, val_steps, val_losses, best_ste
 
     csv_path = os.path.splitext(out_path)[0] + ".csv"
     save_loss_history(train_steps, train_losses, val_steps, val_losses, csv_path,
-                      wav_gaps=wav_gaps, ripple_gaps=ripple_gaps)
+                      wav_gaps=wav_gaps, ripple_gaps=ripple_gaps, shape_gaps=shape_gaps)
     print(f"Loss history saved to: {csv_path}")
 
 
@@ -643,13 +703,13 @@ def main():
     _crop_wavs, _crop_ripples = [], []
     for _ in range(50):
         idx = torch.randint(0, len(train_dataset), (BATCH_SIZE,), generator=_sample_gen).tolist()
-        _, _, _, _wav_batch, _rip_batch = dynamic_collate_fn([train_dataset[i] for i in idx])
+        _, _, _, _wav_batch, _rip_batch, _ = dynamic_collate_fn([train_dataset[i] for i in idx])
         _crop_wavs.append(_wav_batch); _crop_ripples.append(_rip_batch)
     # the stratified sampler also emits all-tall batches, which reach frame heights (and so
     # waviness values) a uniformly-sampled batch never can - include some or the
     # normalization scale would be fit to only the shorter half of the real distribution
     for _ in range(20):
-        _, _, _, _wav_batch, _rip_batch = dynamic_collate_fn(
+        _, _, _, _wav_batch, _rip_batch, _ = dynamic_collate_fn(
             [train_dataset[i] for i in train_sampler._draw(train_sampler.tall_pool)])
         _crop_wavs.append(_wav_batch); _crop_ripples.append(_rip_batch)
     random.setstate(_random_state); torch.set_rng_state(_torch_state)
@@ -689,7 +749,7 @@ def main():
     # in_channels=2: the second channel is the source image being edited - see model.py and
     # _make_pair above for why the editing task is trained directly instead of faked at
     # inference time with SDEdit.
-    model = ConditionalUNet(in_channels=2, waviness_mean=WAV_MEAN, waviness_std=WAV_STD,
+    model = ConditionalUNet(in_channels=3, waviness_mean=WAV_MEAN, waviness_std=WAV_STD,
                             ripple_mean=RIPPLE_MEAN, ripple_std=RIPPLE_STD).to(DEVICE)
     ema_model = deepcopy(model).eval()
     for p in ema_model.parameters():
@@ -703,14 +763,14 @@ def main():
 
     best_val_loss = float('inf')
     best_step = None
-    best_wav_gap = -float('inf')
+    best_shape_gap = -float('inf')
     best_cond_step = None
     epochs_without_improvement = 0
 
     # loss history for the end-of-training plot
     train_hist_steps, train_hist_losses = [], []
     val_hist_steps, val_hist_losses = [], []
-    wav_gap_hist, ripple_gap_hist = [], []
+    wav_gap_hist, ripple_gap_hist, shape_gap_hist = [], [], []
 
     model.train()
     step = 0
@@ -721,7 +781,7 @@ def main():
     print(f"validation images: {len(val_dataset)}")
 
     while step < ITERATIONS and not stop_training:
-        for src_batch, x_batch, pH_batch, wav_batch, ripple_batch in train_dataloader:
+        for src_batch, x_batch, pH_batch, wav_batch, ripple_batch, geom_batch in train_dataloader:
             if step >= ITERATIONS:
                 break
 
@@ -762,11 +822,18 @@ def main():
             rip_drop_mask = torch.rand(x1.shape[0], device=DEVICE) < RIPPLE_CFG_DROPOUT
             ripple_input = torch.where(rip_drop_mask, torch.full_like(ripple_raw, float("nan")),
                                        ripple_raw)
+            # The geometry channel's "null" is the all-zero image, not NaN: it is pixels, so
+            # dropping it means handing over a blank canvas, the same encoding an untraceable
+            # target already produces in the collate.
+            geometry = geom_batch.to(DEVICE).float()
+            keep_geom = (torch.rand(x1.shape[0], device=DEVICE) >= GEOMETRY_DROPOUT)
+            geometry = geometry * keep_geom.view(-1, 1, 1, 1)
 
 
             device_type_autocast = "cuda" if "cuda" in DEVICE else "cpu"
             with torch.autocast(device_type=device_type_autocast, dtype=torch.bfloat16):
-                pred = model(xt, t, pH_input, wav_input, source=source, ripple=ripple_input)
+                pred = model(xt, t, pH_input, wav_input, source=source, ripple=ripple_input,
+                             geometry=geometry)
                 loss = F.mse_loss(pred, target)
                 
             # keep the unscaled value for logging - the scaled one is 1/ACCUMULATION_STEPS of
@@ -803,23 +870,26 @@ def main():
 
             # early stopping
             if step > 0 and step % EVAL_INTERVAL == 0:
-                val_loss, wav_gap, ph_gap, ripple_gap = evaluate(ema_model, val_dataloader)
-                # Both geometry channels matter to the deliverable and both are losses in the
-                # same units, so summing them is not an arbitrary weighting the way mixing a
-                # loss with a gap would be.
-                geom_gap = wav_gap + ripple_gap
+                val_loss, wav_gap, ph_gap, ripple_gap, shape_gap = evaluate(ema_model,
+                                                                             val_dataloader)
+                # The GEOMETRY channel is what the deliverable now rests on, so it alone
+                # selects the conditioning checkpoint. The waviness/ripple scalars are
+                # largely redundant once the target curve is supplied as pixels - a small or
+                # even vanishing gap on them is the expected outcome here, not a failure, and
+                # summing them in would let a redundant channel outvote the load-bearing one.
                 val_hist_steps.append(step)
                 val_hist_losses.append(val_loss)
                 wav_gap_hist.append(wav_gap)
                 ripple_gap_hist.append(ripple_gap)
+                shape_gap_hist.append(shape_gap)
                 # NOTE: train loss is the LIVE model, val loss is the EMA model - early in
                 # training the EMA lags badly, so a large gap here means the EMA hasn't caught
                 # up yet, not necessarily overfitting. cond= is how much the model USES its
                 # waviness / pH conditioning (see evaluate) - watch it keep rising long after
                 # the val loss has gone flat.
                 print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f} "
-                      f"| Val Loss (EMA): {val_loss:.4f} | cond wav {wav_gap:+.5f} "
-                      f"ripple {ripple_gap:+.5f} pH {ph_gap:+.5f}")
+                      f"| Val Loss (EMA): {val_loss:.4f} | cond GEOM {shape_gap:+.5f} "
+                      f"wav {wav_gap:+.5f} ripple {ripple_gap:+.5f} pH {ph_gap:+.5f}")
 
                 improved = False
                 if val_loss < (best_val_loss - MIN_DELTA):
@@ -833,8 +903,8 @@ def main():
                 # MSE one measures denoising. Saving both costs one extra file and settles the
                 # question by comparison instead of by an arbitrary weighting between two
                 # quantities three orders of magnitude apart.
-                if geom_gap > (best_wav_gap + COND_MIN_DELTA):
-                    best_wav_gap = geom_gap
+                if shape_gap > (best_shape_gap + COND_MIN_DELTA):
+                    best_shape_gap = shape_gap
                     best_cond_step = step
                     improved = True
                     torch.save(ema_model.state_dict(), COND_CHECKPOINT_PATH)
@@ -859,7 +929,7 @@ def main():
         torch.save(ema_model.state_dict(), FINAL_CHECKPOINT_PATH)
         print(f"Training completed. Final model saved as {FINAL_CHECKPOINT_PATH!r}.")
     print(f"Best validation loss: {best_val_loss:.4f} at step {best_step}. Model saved as {CHECKPOINT_PATH!r}.")
-    print(f"Best geometry conditioning gap (waviness + ripple): {best_wav_gap:+.5f} at step {best_cond_step}. "
+    print(f"Best geometry-channel conditioning gap: {best_shape_gap:+.5f} at step {best_cond_step}. "
           f"Model saved as {COND_CHECKPOINT_PATH!r}. Compare the two - they are selected on "
           f"different things and the conditioning one is usually the better editor.")
 
@@ -868,26 +938,29 @@ def main():
     # trained an undulation-period channel to completion and only a direct sweep afterwards
     # revealed it moved the velocity field by 0.05-0.15%. Say so here rather than let it be
     # discovered by eye months later.
-    if ripple_gap_hist:
-        peak_ripple = max(ripple_gap_hist)
+    if shape_gap_hist:
+        peak_shape = max(shape_gap_hist)
+        peak_ripple = max(ripple_gap_hist) if ripple_gap_hist else 0.0
         peak_wav = max(wav_gap_hist) if wav_gap_hist else 0.0
-        if peak_ripple < 10 * COND_MIN_DELTA:
-            print(f"\nWARNING: the ripple conditioning gap never rose above "
-                  f"{peak_ripple:+.6f} (waviness reached {peak_wav:+.6f}). The model is "
-                  f"probably ignoring the ripple channel, which means it can still only "
-                  f"produce one long arc rather than many small waves - check "
+        if peak_shape < 10 * COND_MIN_DELTA:
+            print(f"\nWARNING: the GEOMETRY conditioning gap never rose above "
+                  f"{peak_shape:+.6f}. The model is ignoring the curve it is handed, which "
+                  f"is the one channel this generation exists for - it will still hedge "
+                  f"over where to put the filament and render it as a faint smear. Check "
                   f"outputs/training_loss_conditioning.png and run test_wave_spectrum.py "
-                  f"before trusting this checkpoint.")
+                  f"--geometry_mode native before trusting this checkpoint.")
         else:
-            print(f"\nripple conditioning gap peaked at {peak_ripple:+.6f} "
-                  f"(waviness {peak_wav:+.6f}) - the channel is being used. Confirm the "
-                  f"SHAPE with: python3 test_wave_spectrum.py")
+            print(f"\ngeometry conditioning gap peaked at {peak_shape:+.6f} - the channel "
+                  f"is being used. The scalar gaps (waviness {peak_wav:+.6f}, ripple "
+                  f"{peak_ripple:+.6f}) are EXPECTED to be small here: the curve makes them "
+                  f"redundant. Confirm the result with:\n"
+                  f"  python3 test_wave_spectrum.py --geometry_mode native")
 
     # always plot, whether we finished the full run or stopped early
     plot_loss_history(train_hist_steps, train_hist_losses,
                       val_hist_steps, val_hist_losses, best_step,
                       wav_gaps=wav_gap_hist, best_cond_step=best_cond_step,
-                      ripple_gaps=ripple_gap_hist)
+                      ripple_gaps=ripple_gap_hist, shape_gaps=shape_gap_hist)
 
 if __name__ == "__main__":
     main()

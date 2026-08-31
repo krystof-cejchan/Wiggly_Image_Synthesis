@@ -273,6 +273,76 @@ def band_profile(ref_image, bands):
     return out
 
 
+def line_stats(line):
+    """(total rms, ripple rms) of a centreline given DIRECTLY, without tracing an image.
+
+    The same two numbers waviness() and ripple_rms() report, computed from a (W,) array of
+    y positions instead of from pixels. This exists so a *planned* curve can be scored
+    before it is ever drawn: ph_warp sizes its displacement by trial and correction, and
+    scoring a candidate by warping an image and re-tracing it costs a grid_sample plus a
+    trace and re-measures through the tracer's own noise. Scoring the curve itself is exact
+    and effectively free, so the plan converges on what was actually asked for.
+
+    Detrending is linear, matching _detrended_trace, so the numbers are comparable to the
+    ones measured off a real crop.
+    """
+    ys = np.asarray(line, dtype=float)
+    n = len(ys)
+    if n < 8:
+        return None
+    grid = np.arange(n)
+    ys = ys - np.polyval(np.polyfit(grid, ys, 1), grid)
+    spec = np.fft.rfft(ys)
+    freqs = np.fft.rfftfreq(n, d=1.0)
+    periods = np.divide(1.0, freqs, out=np.full_like(freqs, np.inf), where=freqs > 0)
+    keep = (periods >= RIPPLE_MIN_WAVELENGTH) & (periods <= RIPPLE_MAX_WAVELENGTH)
+    filtered = np.zeros_like(spec)
+    filtered[keep] = spec[keep]
+    return (float(np.sqrt(np.mean(ys ** 2))),
+            float(np.sqrt(np.mean(np.fft.irfft(filtered, n=n) ** 2))))
+
+
+# Width of the soft ridge that renders a centreline into the model's geometry channel.
+# About the half-width of a real filament in these crops: wide enough that the ridge is a
+# few pixels of gradient rather than a hairline the convolutions can miss, narrow enough
+# that it says "the fibre is HERE" rather than "somewhere in this band". The point of the
+# channel is to remove positional ambiguity, so a wide ridge would defeat it.
+GEOM_SIGMA = 2.0
+
+
+def centreline_map(line, height, sigma=GEOM_SIGMA):
+    """Render a traced centreline as a soft ridge image - "draw the fibre HERE".
+
+    `line` is a (W,) tensor of y positions, one per column, as ph_warp.centreline returns.
+    Returns (1, 1, height, W) in [0, 1].
+
+    This is the conditioning that lets the model draw a filament somewhere it has to invent
+    without hedging. waviness and ripple are STATISTICS - infinitely many curves have the
+    same rms and the same ripple share, so a model given only those has to average over the
+    phase it was never told, and a flow-matching average of many possible filament positions
+    is a smear. Measured, that smear renders at 0.35-0.39 fibre depth against 0.86 for a
+    real crop, and no inference-side knob recovers it; the same model asked to keep the
+    filament where it already is (position known from the source channel) renders at 0.98.
+    A rendered curve makes the target position known in exactly that way.
+    """
+    ys = torch.arange(height, device=line.device, dtype=torch.float32).view(-1, 1)
+    ridge = torch.exp(-0.5 * ((ys - line.view(1, -1)) / sigma) ** 2)
+    return ridge.unsqueeze(0).unsqueeze(0)
+
+
+def geometry_channel(img4, sigma=GEOM_SIGMA):
+    """The geometry channel describing where the fibre sits in `img4`, or None if untraceable.
+
+    None is the caller's cue to use the all-zero "no geometry requested" encoding, the same
+    sentinel convention the source channel uses for "no source".
+    """
+    from ph_warp import centreline           # lazy: ph_warp imports this module
+    line = centreline(img4)
+    if line is None:
+        return None
+    return centreline_map(line, img4.shape[2], sigma)
+
+
 def ripple_rms(ref_image):
     """How much of the filament's excursion is FINE undulation, in pixels, or None.
 
