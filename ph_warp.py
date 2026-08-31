@@ -45,7 +45,8 @@ import torch
 import torch.nn.functional as F
 
 from config import PH_MAX, PH_MIN
-from ph_control import predicted_waviness, predicted_waviness_native, predicted_period
+from ph_control import (predicted_waviness, predicted_waviness_native,
+                        predicted_period, predicted_ripple)
 from waviness import box_blur, trace_fibre, waviness
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
@@ -74,6 +75,82 @@ def synth_displacement(width, rms, wavelength, device, generator=None, num_modes
     d = d - d.mean()
     std = d.std().clamp(min=1e-6)
     return d * (rms / std)
+
+
+def broadband_displacement(width, rms, ripple_fraction, device, generator=None,
+                           ripple_band=(24.0, 96.0), min_long=96.0, tilt=1.0):
+    """A displacement with a REQUESTED SPECTRAL SHAPE, not just a requested amplitude.
+
+    synth_displacement puts all of its energy within +-40% of one wavelength, so the only
+    thing a caller can vary is where that single bump sits. That is what made the old period
+    conditioning degenerate: amplitude and wavelength were the only two knobs, the warp could
+    not produce "a big slow bend AND fine ripple on top", and the real crops - which spread
+    their centreline energy almost evenly over every scale - were never actually imitated.
+
+    Here the spectrum is built directly. `rms` fixes the total excursion and
+    `ripple_fraction` fixes how much of it (in quadrature) lands in `ripple_band`, the band
+    waviness.ripple_rms measures:
+
+        rms(ripple band)  = ripple_fraction * rms
+        rms(longer waves) = sqrt(1 - ripple_fraction**2) * rms
+
+    so the two conditioning labels can be driven INDEPENDENTLY, which is the whole point -
+    a label the augmentation cannot vary on its own is a label the model can ignore. Within
+    each band the energy is spread over all available bins with a 1/L**tilt profile times a
+    per-realisation random jitter, and the phases are random, so the result reads as
+    irregular buckling rather than a manufactured wave.
+
+    Nothing is placed below the ripple band: content finer than ~24px is at the tracer's own
+    noise floor (a dead-straight fibre already measures 0.71px there) and grid_sample's
+    resampling would not survive it cleanly anyway.
+    """
+    lo_wl, hi_wl = ripple_band
+    n = int(width)
+    freqs = torch.fft.rfftfreq(n, d=1.0).to(device)
+    periods = torch.where(freqs > 0, 1.0 / freqs.clamp(min=1e-9),
+                          torch.full_like(freqs, float("inf")))
+
+    ripple_bins = (periods >= lo_wl) & (periods <= hi_wl)
+    long_bins = (periods > min_long) & torch.isfinite(periods)
+    if not bool(ripple_bins.any()) or not bool(long_bins.any()):
+        # frame too narrow to resolve both bands - fall back to the narrowband synthesiser
+        return synth_displacement(width, rms, max(lo_wl, min(hi_wl, width / 3.0)),
+                                  device, generator=generator)
+
+    def band_signal(mask):
+        shape = torch.zeros_like(freqs)
+        p = periods[mask]
+        jitter = 0.5 + torch.rand(int(mask.sum()), generator=generator, device=device)
+        shape[mask] = (p ** tilt) * jitter
+        phase = 2 * math.pi * torch.rand(n // 2 + 1, generator=generator, device=device)
+        spec = shape * torch.exp(1j * phase)
+        d = torch.fft.irfft(spec, n=n)
+        d = d - d.mean()
+        return d / d.std().clamp(min=1e-6)
+
+    f = float(min(max(ripple_fraction, 0.0), 1.0))
+    d = f * band_signal(ripple_bins) + math.sqrt(max(0.0, 1.0 - f * f)) * band_signal(long_bins)
+    d = d - d.mean()
+    return d * (rms / d.std().clamp(min=1e-6))
+
+
+def bounded_broadband(width, rms, ripple_fraction, device, generator=None, max_slope=None,
+                      max_backoff=6, **kw):
+    """broadband_displacement, backed off in AMPLITUDE until the peak slope is safe.
+
+    Amplitude is what gives way, never the spectral shape: the shape is the conditioning
+    label here, so widening the wave to fit a slope budget would re-introduce exactly the
+    amplitude/wavelength coupling this replaces (see bounded_displacement's `preserve`).
+    """
+    limit = MAX_DISPLACEMENT_SLOPE if max_slope is None else max_slope
+    for _ in range(max_backoff):
+        d = broadband_displacement(width, rms, ripple_fraction, device,
+                                   generator=generator, **kw)
+        slope = float((d[1:] - d[:-1]).abs().max()) if d.numel() > 1 else 0.0
+        if slope <= limit:
+            return d, rms
+        rms *= 0.95 * limit / max(slope, 1e-6)
+    return d, rms
 
 
 # Safety bound on the synthesized displacement's steepness (peak px of vertical shift per
@@ -457,7 +534,8 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # otherwise come from has R^2 ~ 0.09 - on the reference this was developed against it
         # claims 3.46px where the crop measures 1.67px, understating the gap by a quarter. The
         # fit is still the right source for the TARGET, which by definition cannot be measured.
-        from img2img import measure_frame_waviness, measure_frame_period
+        from img2img import (measure_frame_waviness, measure_frame_period,
+                             measure_frame_ripple)
         anchor = min(max(target_pH, PH_MIN), PH_MAX)
         target_waviness = predicted_waviness_native(target_pH)
         source_waviness = measure_frame_waviness(ref_image)
@@ -470,11 +548,21 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         # generated centreline's variance in one frame-wide arc, against 13% for real crops).
         target_period = predicted_period(target_pH)
         source_period = measure_frame_period(ref_image) or predicted_period(source_pH)
+        # The half of the geometry request that decides whether the result is many small
+        # waves or one long arc. Measured on the reference for the source branch (it
+        # describes this crop, which can be measured) and fitted for the target (which by
+        # definition cannot). A ripple-conditioned checkpoint uses these and ignores the
+        # period pair above; a _pair-generation checkpoint does the reverse.
+        target_ripple = predicted_ripple(target_pH)
+        source_ripple = measure_frame_ripple(ref_image)
+        if source_ripple is None:
+            source_ripple = predicted_ripple(source_pH)
         out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
                          target_pH=anchor, seed=seed,
                          source_waviness=source_waviness,
                          target_waviness=target_waviness,
-                         source_period=source_period, target_period=target_period, **kw)
+                         source_period=source_period, target_period=target_period,
+                         source_ripple=source_ripple, target_ripple=target_ripple, **kw)
         # No _preserve_background here, unlike the warp path below, and deliberately not
         # only outside the trained range either. The warp path needs it because it RESAMPLES
         # the whole frame and invents background rows, so the field around the fibre is
@@ -495,6 +583,8 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         return out, {"mode": "native", "target_waviness": target_waviness,
                      "source_waviness": source_waviness, "achieved": achieved,
                      "target_period": target_period, "source_period": source_period,
+                     "target_ripple": target_ripple, "source_ripple": source_ripple,
+                     "achieved_ripple": measure_frame_ripple(out * 2 - 1),
                      "achieved_period": measure_frame_period(out * 2 - 1)}
 
     anchor = min(max(target_pH, PH_MIN), PH_MAX)

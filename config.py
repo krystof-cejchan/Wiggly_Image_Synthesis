@@ -26,22 +26,39 @@ TRAIN_MAX_W = max(w for _, w in TRAIN_SIZES)
 
 # The checkpoint every script reads and train.py writes, in one place for the same reason
 # TRAIN_SIZES is: a filename that each script spells out for itself is a filename that goes
-# stale in some of them. The "_ex" suffix marks the waviness-conditioned architecture (see
-# model.py's WavinessEmbedding) - a checkpoint saved before that embedding existed has no
-# waviness_* tensors and will NOT load into today's ConditionalUNet, so the two generations
-# deliberately do not share a name.
-CHECKPOINT_PATH = "checkpoints/cfm_best_ema_ex.pt"
+# stale in some of them.
+#
+# The suffix marks the ARCHITECTURE GENERATION, and the generations deliberately do not
+# share a name because they do not load into each other - model.from_state_dict infers which
+# one a file is from its tensors:
+#
+#   (no suffix) pre-waviness            1-channel, pH only
+#   _ex         waviness-conditioned    adds WavinessEmbedding (waviness_* tensors)
+#   _pair       source-conditioned      conv_in takes 2 channels; adds the undulation-PERIOD
+#                                       channel (log_period_* tensors)
+#   _ripple     current                 replaces period with the fine-undulation RIPPLE rms
+#                                       (ripple_* tensors). Period was measured dead on the
+#                                       _pair checkpoint - sweeping it over its whole range
+#                                       moved the velocity field 0.05-0.15% - and the model
+#                                       put 3x too much centreline energy into one long wave
+#                                       and 4x too little into fine ripple. See train.py's
+#                                       WARP_AUG_*_RIPPLE_FRACTION and model.py's
+#                                       ripple_conditioned.
+#
+# CHECKPOINT_PATH is what train.py WRITES and what every script's --checkpoint defaults to.
+# Those two used to disagree - train.py wrote the _pair names while every reader defaulted to
+# a _ex path that did not exist on disk at all, so the CLI could not run on its own defaults.
+CHECKPOINT_PATH = "checkpoints/cfm_best_ema_ripple.pt"
 # Selected on how much the model USES its conditioning rather than on flow-matching MSE
 # - see train.py's evaluate(). The two criteria disagree, and this is the one that
-# tracks the actual deliverable (editing to a requested pH).
-COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_ex.pt"
-FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_ex.pt"
+# tracks the actual deliverable (editing to a requested geometry).
+COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_ripple.pt"
+FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_ripple.pt"
 
-# The source-conditioned (paired-edit) generation of the architecture: conv_in takes two
-# channels, the second being the image being edited. Trained by train.py on before/after
-# pairs, and rendered by img2img without any strength/anchor at all. Kept under its own name
-# because it will not load into the 1-channel model and vice versa - model.from_state_dict
-# infers which one a file is.
+# Previous generations. Nothing defaults to these any more; they exist so an older
+# checkpoint can still be named explicitly (--checkpoint) and so the names are not
+# accidentally reused by a future run.
+EX_CHECKPOINT_PATH = "checkpoints/cfm_best_ema_ex.pt"
 PAIR_CHECKPOINT_PATH = "checkpoints/cfm_best_ema_pair.pt"
 PAIR_COND_CHECKPOINT_PATH = "checkpoints/cfm_best_cond_pair.pt"
 PAIR_FINAL_CHECKPOINT_PATH = "checkpoints/cfm_final_ema_pair.pt"

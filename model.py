@@ -270,7 +270,10 @@ class ConditionalUNet(nn.Module):
         waviness_std=1.0,
         log_period_mean=0.0,
         log_period_std=1.0,
-        period_conditioned=True,
+        period_conditioned=False,
+        ripple_mean=0.0,
+        ripple_std=1.0,
+        ripple_conditioned=True,
     ):
         super().__init__()
 
@@ -309,15 +312,35 @@ class ConditionalUNet(nn.Module):
         self.waviness_embed = WavinessEmbedding(emb_dim)
         self.null_waviness_emb = nn.Parameter(torch.zeros(emb_dim))
 
-        # SECOND geometry channel: the dominant undulation period, in log pixels. Waviness is
-        # an RMS deviation and says nothing about wavelength - a wave of amplitude A scores
-        # A/sqrt(2) whether it makes one arc across the crop or ten - while the bending cost
-        # goes as A/L, so a model told only the rms draws the cheapest thing that satisfies
-        # it: one long arc. Measured on a checkpoint conditioned on rms alone, 93% of the
-        # generated centreline's variance was a single arc spanning the whole frame, against
-        # 13% for real crops at the same pH. Period is what makes "many small waves"
-        # expressible. Log, because real periods span 40-400px; monotone embedding for the
-        # same reason waviness uses one - it has to extrapolate without aliasing.
+        # SECOND geometry channel: how much of the excursion is FINE undulation, as an rms
+        # in pixels over waviness.RIPPLE_MIN/MAX_WAVELENGTH (24-96px). Waviness alone is
+        # degenerate - a wave of amplitude A scores A/sqrt(2) whether it makes one arc across
+        # the crop or ten - while the bending cost goes as A/L, so a model told only the rms
+        # draws the cheapest thing that satisfies it: one long arc. Measured on the
+        # period-conditioned checkpoint, a pH 5.8->8.8 edit put 8.60px of centreline rms into
+        # the 96-192px band where real crops have 2.75, and 0.73px into 24-48px where real
+        # crops have 2.83 - one huge wave in place of many small ones. Conditioning on the
+        # total AND the ripple pins that balance, since whatever is not ripple is left over in
+        # quadrature.
+        #
+        # This REPLACES the earlier undulation-period channel, which is retained below only so
+        # checkpoints trained with it still load. Period was a spectral peak - a single bin,
+        # carrying no magnitude - and it never learned to matter: sweeping a requested period
+        # across its whole 50-400px range moved the trained velocity field by 0.05-0.15%,
+        # against 1-5.7% for the waviness channel, and requesting 50px vs 240px produced
+        # numerically identical images. An rms in a fixed band is a magnitude in the same
+        # physical units as the waviness label that does work, and (unlike a peak) it is
+        # something the warp augmentation can be made to vary independently - see train.py's
+        # broadband_displacement, without which this channel would be just as degenerate.
+        self.ripple_conditioned = ripple_conditioned
+        if ripple_conditioned:
+            self.register_buffer("ripple_mean", torch.tensor(float(ripple_mean)))
+            self.register_buffer("ripple_std", torch.tensor(float(ripple_std)))
+            self.ripple_embed = WavinessEmbedding(emb_dim)
+            self.null_ripple_emb = nn.Parameter(torch.zeros(emb_dim))
+
+        # Legacy: the undulation-period channel. Only constructed for checkpoints that were
+        # trained with it (from_state_dict detects the buffers); new runs use ripple instead.
         self.period_conditioned = period_conditioned
         if period_conditioned:
             self.register_buffer("log_period_mean", torch.tensor(float(log_period_mean)))
@@ -329,6 +352,8 @@ class ConditionalUNet(nn.Module):
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.pH_proj = nn.Linear(emb_dim, emb_dim)
         self.waviness_proj = nn.Linear(emb_dim, emb_dim)
+        if ripple_conditioned:
+            self.ripple_proj = nn.Linear(emb_dim, emb_dim)
         if period_conditioned:
             self.period_proj = nn.Linear(emb_dim, emb_dim)
 
@@ -372,7 +397,7 @@ class ConditionalUNet(nn.Module):
         real = embed(safe)
         return torch.where(is_null.unsqueeze(-1), null_emb.expand_as(real), real)
 
-    def forward(self, x, t, pH, waviness=None, source=None, period=None):
+    def forward(self, x, t, pH, waviness=None, source=None, period=None, ripple=None):
         """
         Forward pass for conditional U-Net.
 
@@ -390,6 +415,12 @@ class ConditionalUNet(nn.Module):
                 train.py drops the source at rate SOURCE_DROPOUT so that encoding is trained
                 rather than merely tolerated, which is what keeps sample.py's from-noise
                 generation working on the same checkpoint. Ignored by a 1-channel model.
+            ripple: scalar tensor for the RAW (pixel-unit) ripple rms (B,) - how much of the
+                requested excursion should be fine undulation rather than one long arc. NaN
+                for null, None for "all null". Ignored by a checkpoint without the channel,
+                so it is always safe to pass.
+            period: legacy undulation-period channel, only present on checkpoints trained
+                before `ripple` replaced it. Ignored otherwise.
 
         Returns:
             output tensor (B, C_out, H, W)
@@ -416,6 +447,12 @@ class ConditionalUNet(nn.Module):
 
         # The merged embedding is then used to modulate the feature maps in the U-Net via FiLM layers.
         emb = self.t_proj(t_emb) + self.pH_proj(pH_emb) + self.waviness_proj(wav_emb)
+        if self.ripple_conditioned:
+            if ripple is None:
+                ripple = torch.full_like(pH, float("nan"))
+            emb = emb + self.ripple_proj(
+                self._gated(ripple, self.ripple_mean, self.ripple_std,
+                            self.ripple_embed, self.null_ripple_emb))
         if self.period_conditioned:
             if period is None:
                 period = torch.full_like(pH, float("nan"))
@@ -457,7 +494,9 @@ def from_state_dict(state_dict, device=None):
         conv_in.weight  (64, 1, 3, 3)   ->  from-noise model, editing needs SDEdit
         conv_in.weight  (64, 2, 3, 3)   ->  source-conditioned, editing is a direct render
         waviness_mean present            ->  has the waviness conditioning channel
-        log_period_mean present          ->  also has the undulation-period channel
+        ripple_mean present              ->  also has the fine-undulation (ripple) channel
+        log_period_mean present          ->  has the LEGACY undulation-period channel that
+                                             ripple replaced (see the constructor)
 
     waviness_mean/std are constructor arguments only because they are registered buffers; the
     values in the checkpoint immediately overwrite whatever is passed, so the defaults here
@@ -465,10 +504,14 @@ def from_state_dict(state_dict, device=None):
     """
     in_channels = state_dict["conv_in.weight"].shape[1]
     kwargs = {"in_channels": in_channels,
-              "period_conditioned": "log_period_mean" in state_dict}
+              "period_conditioned": "log_period_mean" in state_dict,
+              "ripple_conditioned": "ripple_mean" in state_dict}
     if "waviness_mean" in state_dict:
         kwargs["waviness_mean"] = float(state_dict["waviness_mean"])
         kwargs["waviness_std"] = float(state_dict["waviness_std"])
+    if kwargs["ripple_conditioned"]:
+        kwargs["ripple_mean"] = float(state_dict["ripple_mean"])
+        kwargs["ripple_std"] = float(state_dict["ripple_std"])
     if kwargs["period_conditioned"]:
         kwargs["log_period_mean"] = float(state_dict["log_period_mean"])
         kwargs["log_period_std"] = float(state_dict["log_period_std"])

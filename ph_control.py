@@ -93,7 +93,19 @@ _DEFAULTS = {
     # crosses zero at no pH at all. calibrate_ph.py re-selects the form from the data anyway;
     # these coefficients are ph_warp.py's original log-linear fit, kept as the fallback.
     "period_law": {"form": "exponential", "coeffs": [-0.2477, 7.142]},
+    # Fine-undulation rms vs pH, per-crop scale, fitted the same way as the native waviness
+    # law over the same windows: ripple = 0.9224*pH - 3.368 (2.14px at pH 5.8 rising to
+    # 4.18px at 8.8). calibrate_ph.py re-fits and re-selects the form; this is the
+    # same-methodology fallback.
+    "ripple_law": {"form": "linear", "coeffs": [0.9224, -3.368]},
 }
+
+# What share of the total excursion is fine undulation, if no ripple law is available at all.
+# Measured per pH bucket over the dataset the share is strikingly flat - 0.66 / 0.58 / 0.50 /
+# 0.72 / 0.68 / 0.64 / 0.61 from pH 5.8 to 8.8 - so a single constant is a sound fallback and
+# an old ph_calibration.json degrades to "keep the real data's average split" rather than to
+# an unconstrained one.
+DEFAULT_RIPPLE_FRACTION = 0.61
 
 
 def _calibration():
@@ -128,10 +140,15 @@ WAVINESS_FORMS = ("linear", "exponential", "quadratic")
 # here rather than allowed to run away - an exponential law would ask for 152px at pH 20.
 MAX_SUPPORTED_WAVINESS = 26.0
 
-# Undulation period, in pixels. Bounded by what train.py's augmentation actually generates
-# (WARP_AUG_MIN_PERIOD/WARP_AUG_MAX_PERIOD) - and at the top end also by the editing frame,
-# since a period longer than the crop is a single arc rather than a wave.
+# Undulation period, in pixels. LEGACY - only the _pair generation of the checkpoint has a
+# period channel, and measured on it that channel turned out to carry no usable response at
+# all (0.05-0.15% velocity change across the whole 50-400px range). predicted_ripple() is
+# what drives the geometry's second axis now.
 MIN_SUPPORTED_PERIOD, MAX_SUPPORTED_PERIOD = 50.0, 400.0
+
+# Fine-undulation rms, in pixels. Bounded below by 0 (a perfectly smooth arc) and above by
+# MAX_SUPPORTED_WAVINESS, since the ripple is a component of the total and cannot exceed it.
+MAX_SUPPORTED_RIPPLE = MAX_SUPPORTED_WAVINESS
 
 
 def _fit_form(form, ph, w):
@@ -257,6 +274,30 @@ def predicted_period(pH):
     return min(MAX_SUPPORTED_PERIOD, max(MIN_SUPPORTED_PERIOD, eval_law(law, pH)))
 
 
+def predicted_ripple(pH):
+    """How much of the excursion should be FINE undulation (waviness.ripple_rms, 24-96px).
+
+    The second half of the geometry request, and the half that decides whether the result
+    looks like a real filament or like one big S-curve. Measured over the dataset the ripple
+    rms rises with pH much as the total does - 2.14px at pH 5.8 to 4.18px at pH 8.8 - so the
+    ratio stays near 0.6 throughout and asking for the total alone leaves that split
+    completely unconstrained. It is exactly that unconstrained split that the
+    period-conditioned checkpoint got wrong: for a pH 8.8 request it produced 8.60px of
+    centreline rms in the 96-192px band against real crops' 2.75, and 0.73px in 24-48px
+    against real crops' 2.83.
+
+    Falls back to the ratio implied by _DEFAULTS when ph_calibration.json predates this law,
+    so an old calibration file degrades to "keep the real data's average split" rather than
+    to nothing.
+    """
+    cal = _calibration()
+    law = cal.get("ripple_law")
+    if law is None:
+        return min(MAX_SUPPORTED_RIPPLE,
+                   max(0.0, DEFAULT_RIPPLE_FRACTION * predicted_waviness_native(pH)))
+    return min(MAX_SUPPORTED_RIPPLE, max(0.0, eval_law(law, pH)))
+
+
 def ph_to_lambda(pH_query):
     """Signed extrapolation strength for a requested pH. 0 inside the trained range.
 
@@ -303,7 +344,7 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
 
 
 def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None,
-                    source=None, period=None):
+                    source=None, period=None, ripple=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
@@ -318,8 +359,9 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
     so this argument is always safe to pass, it just does nothing on an old checkpoint.
 
     `source` is the image being edited, for a source-conditioned checkpoint (model.py's
-    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too. So is
-    `period`, the requested undulation period, which a checkpoint without that channel drops.
+    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too. So are
+    `ripple` (the fine-undulation half of the geometry request) and `period` (the legacy
+    channel it replaced): a checkpoint without either simply drops it.
     """
     if waviness is not None:
         anchor = min(max(pH_query, PH_MIN), PH_MAX)
@@ -327,7 +369,9 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
         wav = torch.full((x.shape[0],), float(waviness), device=x.device)
         per = (None if period is None
                else torch.full((x.shape[0],), float(period), device=x.device))
-        return model(x, t, ph, wav, source=source, period=per)
+        rip = (None if ripple is None
+               else torch.full((x.shape[0],), float(ripple), device=x.device))
+        return model(x, t, ph, wav, source=source, period=per, ripple=rip)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)

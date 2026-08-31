@@ -1,6 +1,6 @@
 """Calibrate the pH extrapolation, and write ph_calibration.json.
 
-Three curves get fitted:
+Four curves get fitted:
 
   1. PHYSICS (whole-image)  waviness of REAL crops vs pH, measured on the whole image  ->
      feeds ph_warp.py's geometric warp, which measures its `current` the same way.
@@ -12,12 +12,16 @@ Three curves get fitted:
      to 82px) - calibrating native conditioning against the whole-image number compressed
      almost its entire learned range into under one training-distribution standard
      deviation of extrapolation request.
-  3. RESPONSE  waviness of GENERATED crops vs lambda  ->  what lambda delivers that, for
+  3. PHYSICS (ripple)  how much of that per-crop excursion is FINE undulation (24-96px,
+     waviness.ripple_rms), on the same crops and the same scale  ->  feeds the model's
+     second geometry channel. Without it the total is degenerate: one frame-wide arc and
+     ten small waves score the same rms, and the model draws the arc because it is cheaper.
+  4. RESPONSE  waviness of GENERATED crops vs lambda  ->  what lambda delivers that, for
      the older embedding-space extrapolation mechanism (ph_control.ph_to_lambda).
 
 Re-run this after training a new checkpoint; nothing else needs to change.
 
-    python3 calibrate_ph.py --checkpoint checkpoints/cfm_best_ema_ex.pt
+    python3 calibrate_ph.py        # defaults to config.CHECKPOINT_PATH
 """
 import argparse
 import json
@@ -79,7 +83,7 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
 
     This is the scale the model's native waviness conditioning is trained on, and it is not
     the same as measure_real's whole-image scale, so the two fits are kept separate - see
-    ph_control.py's _DEFAULTS. Returns (waviness, period) dicts: the geometry request has two
+    ph_control.py's _DEFAULTS. Returns (waviness, ripple) dicts: the geometry request has two
     halves and both are measured here, on the same crops and the same scale.
 
     The warp augmentation is switched OFF here. It exists to populate the conditioning axis
@@ -90,7 +94,7 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
     saved_prob, T.WARP_AUG_PROB = T.WARP_AUG_PROB, 0.0
     T.set_seed(seed)  # dynamic_collate_fn draws from both random's and torch's global RNG
     try:
-        per_ph, per_ph_period = {}, {}
+        per_ph, per_ph_ripple = {}, {}
         for folder in sorted(os.listdir(data_dir)):
             path = os.path.join(data_dir, folder)
             try:
@@ -107,15 +111,15 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
                     continue
                 ref, _ = load_and_preprocess_image(os.path.join(path, name))
                 for _ in range(crops_per_image):
-                    _, _, _, wav, period = T.dynamic_collate_fn(
+                    _, _, _, wav, ripple = T.dynamic_collate_fn(
                         [(ref.squeeze(0).cpu(), torch.tensor(ph))])
                     value = wav.item()
                     if not math.isnan(value):
                         per_ph.setdefault(ph, []).append(value)
-                    period_value = period.item()
-                    if not math.isnan(period_value):
-                        per_ph_period.setdefault(ph, []).append(period_value)
-        return per_ph, per_ph_period
+                    ripple_value = ripple.item()
+                    if not math.isnan(ripple_value):
+                        per_ph_ripple.setdefault(ph, []).append(ripple_value)
+        return per_ph, per_ph_ripple
     finally:
         T.WARP_AUG_PROB = saved_prob
 
@@ -209,7 +213,7 @@ def main():
 
     print("\n[2/4] measuring per-crop waviness the same way training sees it (feeds "
           "native waviness conditioning)")
-    per_ph_native, per_ph_period = measure_real_native(DATA_DIR)
+    per_ph_native, per_ph_ripple = measure_real_native(DATA_DIR)
     print(f"  {'pH':>5} {'n':>4} {'mean rms_dev':>13}")
     for ph in sorted(per_ph_native):
         vals = np.array(per_ph_native[ph])
@@ -220,16 +224,18 @@ def main():
     print(f"  (R^2 is much lower than [1/4]'s: an individual small crop is noisy around the "
           f"pH trend the way any small random window is)")
 
-    print("\n[2b/4] undulation PERIOD vs pH (the other half of the geometry request - "
-          "waviness says how far the centreline strays, period how often it turns)")
-    print(f"  {'pH':>5} {'n':>4} {'median period':>14}")
-    for ph in sorted(per_ph_period):
-        vals = np.array(per_ph_period[ph])
-        print(f"  {ph:5.1f} {len(vals):4d} {np.median(vals):14.0f}px")
-    period_law, period_diag, *_ = _fit_physics(per_ph_period, "undulation period")
-    print(f"  selected law: {period_law['form']} {np.round(period_law['coeffs'], 4).tolist()}")
+    print("\n[2b/4] fine-undulation RIPPLE rms vs pH (the other half of the geometry "
+          "request - waviness says how far the centreline strays in total, ripple how much "
+          "of that is fine wiggle rather than one long arc)")
+    print(f"  {'pH':>5} {'n':>4} {'median ripple':>14} {'share of total':>15}")
+    for ph in sorted(per_ph_ripple):
+        vals = np.array(per_ph_ripple[ph])
+        tot = np.median(per_ph_native.get(ph, [float("nan")]))
+        print(f"  {ph:5.1f} {len(vals):4d} {np.median(vals):13.2f}px {np.median(vals) / tot:15.2f}")
+    ripple_law, ripple_diag, *_ = _fit_physics(per_ph_ripple, "ripple rms")
+    print(f"  selected law: {ripple_law['form']} {np.round(ripple_law['coeffs'], 4).tolist()}")
     print("  extrapolated: " + "  ".join(
-        f"pH{p}:{ph_control.eval_law(period_law, p):.0f}px" for p in (8.8, 10.8, 12.8)))
+        f"pH{p}:{ph_control.eval_law(ripple_law, p):.1f}px" for p in (8.8, 10.8, 12.8)))
 
     print("\n[3/4] measuring the generator's response to lambda")
     model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
@@ -256,8 +262,8 @@ def main():
         "checkpoint": os.path.basename(args.checkpoint),
         "waviness_law": law,
         "native_waviness_law": native_law,
-        "period_law": period_law,
-        "period_law_diagnostics": period_diag,
+        "ripple_law": ripple_law,
+        "ripple_law_diagnostics": ripple_diag,
         "waviness_law_diagnostics": law_diag,
         "native_waviness_law_diagnostics": native_diag,
         # the plain linear fit is still written so an older checkout can read this file

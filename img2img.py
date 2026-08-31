@@ -15,7 +15,7 @@ from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
 from ph_warp import edit_to_pH
 from framing import pad_height_background, mirror_pad_width
 from waviness import (box_blur, waviness as measure_waviness,
-                      wave_period as measure_wave_period)
+                      wave_period as measure_wave_period, ripple_rms as measure_ripple_rms)
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -279,11 +279,33 @@ def measure_frame_period(ref_image):
 
 
 @torch.no_grad()
+def measure_frame_ripple(ref_image):
+    """The reference's own FINE-undulation rms, in the frames the model will see.
+
+    The ripple companion to measure_frame_waviness, and the source branch of the contrastive
+    pair should state it for the same reason it states the waviness: that branch describes
+    what the filament IS, and both halves of that are measurable rather than guessed. Returns
+    None when no window traces.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_ripple_rms(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+@torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
                num_steps=100, contrastive_scale=3.0, seed=None, window_size=None, stride=None,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
                ph_rescale=False, source_waviness=None, target_waviness=None,
-               source_period=None, target_period=None):
+               source_period=None, target_period=None,
+               source_ripple=None, target_ripple=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
 
@@ -306,8 +328,15 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     source_waviness/target_waviness, when given, are forwarded to velocity_for_pH and take
     over from the embedding-space extrapolation above: geometry is driven directly through
     the model's own waviness conditioning instead (needs a checkpoint trained with it - see
-    model.py's WavinessEmbedding). source_period/target_period are the second half of that
-    geometry request - HOW OFTEN the centreline turns, where waviness says how far it strays.
+    model.py's WavinessEmbedding). source_ripple/target_ripple are the second half of that
+    geometry request - HOW MUCH of the excursion is FINE undulation (waviness.ripple_rms,
+    24-96px) rather than one long arc, where waviness says only how far the centreline
+    strays in total. Asking for the total alone is degenerate: one frame-wide arc and ten
+    small waves of the same amplitude score identical rms, the arc is cheaper to draw, and
+    that is exactly what the model produced before this channel existed (8.60px of
+    centreline rms in the 96-192px band against real crops' 2.75, and 0.73px in 24-48px
+    against real crops' 2.83). source_period/target_period drive the LEGACY period channel
+    on a _pair-generation checkpoint and are ignored by a ripple-conditioned one.
     Both are needed: rms alone is degenerate between one long arc and many short waves, and a
     model told only the rms produces the arc. ph_warp.edit_to_pH's geometry_mode="native" is what sets
     these; a plain call here still defaults to today's behaviour unchanged.
@@ -379,11 +408,12 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
 
             v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
                                           rescale=ph_rescale, waviness=source_waviness,
-                                          source=src_patch, period=source_period)
+                                          source=src_patch, period=source_period,
+                                          ripple=source_ripple)
             v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
                                           rescale=ph_rescale, lam_override=ph_lambda,
                                           waviness=target_waviness, source=src_patch,
-                                          period=target_period)
+                                          period=target_period, ripple=target_ripple)
 
             v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
             v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask
@@ -477,12 +507,15 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
-    parser.add_argument("--geometry_mode", type=str, default="warp", choices=["warp", "native"],
-                        help="'warp' (default) is the validated geometric pixel-warp mechanism "
-                             "this CLI has always used outside the trained range. 'native' drives "
-                             "geometry through the model's own waviness conditioning instead - "
-                             "requires a checkpoint trained with it (see model.py's "
-                             "WavinessEmbedding); training support to ~pH 16.")
+    parser.add_argument("--geometry_mode", type=str, default="native", choices=["warp", "native"],
+                        help="'native' (default) states the geometry the model was trained to "
+                             "follow - the requested waviness AND ripple (see model.py). This "
+                             "is the only path that conditions geometry for an IN-RANGE edit "
+                             "at all: 'warp' leaves both channels null there and lets the pH "
+                             "channel decide, which is what produced one frame-wide arc where "
+                             "real crops have many small waves. 'warp' is the older geometric "
+                             "pixel-warp mechanism, still the one with data behind it above "
+                             "roughly pH 16.")
 
     args = parser.parse_args()
     
