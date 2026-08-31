@@ -89,31 +89,34 @@ python3 img2img.py --ref_image <path/to/crop.png> \
 
 ## 5. Requesting a pH outside the trained range (5.8–8.8)
 
-The dataset only covers 5.8–8.8, but you can ask for values outside that. **For editing a real
-image (`img2img.py`'s job), use `ph_warp.edit_to_pH` for *either* direction — not the plain CLI.**
-It's tempting to think the plain `img2img.py` CLI already handles the below-5.8 case correctly,
-since it *will run* with a `--target_pH` below 5.8 without erroring (it's wired through
-`ph_control.py`'s velocity-space extrapolation automatically). But that mechanism was only
-validated for **free generation from noise** (`sample.py`, no reference image). For an actual
-edit, the reference image anchors the ODE trajectory strongly enough that pushing the velocity
-field harder doesn't reliably change the output — measured waviness stayed flat at ~6.5px across
-pH 3.0–7.3 regardless of how hard it was pushed, at typical editing strengths. So the plain CLI's
-out-of-range handling is really only meaningful for `sample.py`; for editing a real photo to any
-out-of-range pH, always go through `ph_warp.edit_to_pH`, which uses a **different, genuinely
-postprocessing mechanism** for editing specifically — see `test_ph_extrapolation.py`:
+The dataset only covers 5.8–8.8, but you can ask for values outside that, and **`img2img.py`'s
+own CLI handles it** — nothing special has to be called. The CLI routes through
+`ph_warp.edit_to_pH`, which edits to whichever trained anchor (5.8 or 8.8) is nearer and then
+reshapes the resulting image's pixels to hit a physically-extrapolated waviness target:
+geometrically warping the traced fiber centreline wavier, or shearing it straighter, whichever
+the requested pH calls for.
+
+The important thing to understand is that **this is the same mechanism used inside the range**
+(step 4's `--geometry_mode warp`, the default). Every edit works this way — the model supplies
+pH texture with the filament held in place, and the warp supplies the shape. So nothing
+discontinuous happens at pH 5.8 or 8.8; only the fitted law's target changes. Measured on a pH
+5.8 crop, requesting 11.8 lands 9.32px of centreline rms against the law's 9.79px target, with
+the fiber still at 0.72 depth and 0.99 continuity (a real crop is 0.87/0.91).
+
+What genuinely does *not* work out-of-range is asking the **network** to extrapolate. That's
+`--geometry_mode native` and `sample.py`'s velocity-space mechanism; see "Why the two directions
+still aren't symmetric" below for which of them fails in which direction, and why.
+
+To sweep several pH values at once and eyeball them together:
 
 ```bash
 python3 test_ph_extrapolation.py --pH 3 4.4 5.8 7.3 8.8 10.3 11.8 13.0
 ```
 
-or call `ph_warp.edit_to_pH(model, ref_image, source_pH, target_pH, ...)` directly. It edits
-normally to whichever trained anchor (5.8 or 8.8) is nearer, then explicitly reshapes the
-resulting image's pixels to hit a physically-extrapolated waviness target — geometrically
-warping the traced fiber centreline wavier, or geometrically shearing it straighter, whichever
-the requested pH calls for. Neither direction is "the network extrapolating on its own" once a
-real reference image is involved; both end up being a direct edit to image geometry.
-
 ### Why the two directions still aren't symmetric under the hood
+
+This is about the *network-side* mechanisms only — the pixel warp above is symmetric, and it is
+what editing actually uses in both directions.
 
 - **Above 8.8 (wavier)**: velocity extrapolation was tried and measured to go the *wrong*
   direction even during free generation (filaments got smoother, not wavier) — because the
@@ -231,11 +234,17 @@ needs internet access to download the backbone weights via `torch.hub`.
   `--strength` explanation in step 4.
 - **A gap/hole in the source fiber doesn't get filled in by the edit** — try `--repair_gaps`
   (step 4); this is a known limitation of anchoring every ODE step to the input image.
-- **`--target_pH` outside 5.8–8.8 through the plain CLI produces something wrong, or barely
-  changed** — expected for editing; see step 5. Above 8.8 goes the *wrong* direction (straighter,
-  not wavier); below 5.8 typically just doesn't move much because the reference image anchors
-  the trajectory too strongly for the CLI's built-in extrapolation to have an effect. Use
-  `ph_warp.edit_to_pH` / `test_ph_extrapolation.py` for either direction instead of the plain CLI.
+- **The edited fiber is a faint grey smear, or breaks into pieces, and the more correct its
+  waviness looks the worse it renders** — you are on `--geometry_mode native`. The model draws
+  the filament well only where it does not have to *invent* its position: asked to relocate it,
+  it hedges and paints a smear at ~40% of a real crop's contrast (measured 0.35–0.39 fiber depth
+  against 0.86 for a real pH 8.8 crop). Use the default `--geometry_mode warp`, which moves the
+  source's own pixels into the requested shape instead — same request, 0.76 depth and 1.00
+  continuity.
+- **`--target_pH` outside 5.8–8.8 barely changes the image, or goes the wrong way** — check you
+  are not on `--geometry_mode native` (see step 5). The network cannot extrapolate pH itself in
+  either direction once a reference image is involved; the default `warp` mode does not rely on
+  it.
 - **Training produces near-white / washed-out samples** — this specific failure mode was caused
   in the past by an EMA bug interacting with gradient accumulation (see `CLAUDE.md`'s training
   section); if you see it again after modifying `train.py`, check that the EMA update still runs

@@ -392,8 +392,18 @@ def describe(pH_query, geometry_mode="warp"):
     and its response has been measured monotonic in the request; it has real training
     support to about pH 16 (see _DEFAULTS), above which "warp" is the mechanism with
     actual data behind it.
+
+    Note that "warp" no longer means "velocity extrapolation below 5.8": editing clamps to
+    the nearest anchor and reshapes pixels in BOTH directions, because velocity
+    extrapolation is smothered by the img2img anchor going acidic and points the wrong way
+    going alkaline. sample.py, which has no anchor, is the one caller for which the acidic
+    velocity path is real - and it passes geometry_mode="native"/its own flag, not this
+    branch. See ph_warp.edit_to_pH.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
+        if geometry_mode == "warp":
+            return (f"pH {pH_query:g} is inside the trained range - direct conditioning for "
+                    f"texture, geometric warp for shape")
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
     direction = "BELOW" if pH_query < PH_ANCHOR_LO else "ABOVE"
     if geometry_mode == "native":
@@ -402,11 +412,10 @@ def describe(pH_query, geometry_mode="warp"):
                 f"{PH_ANCHOR_HI:g}] - NATIVE waviness conditioning: anchoring pH at "
                 f"{anchor:g}, targeting {predicted_waviness_native(pH_query):.1f}px "
                 f"directly through the model's own conditioning")
-    if pH_query < PH_ANCHOR_LO:
-        return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
-                f"{PH_ANCHOR_HI:g}] - extrapolating the velocity field past the acidic "
-                f"anchor with lambda={ph_to_lambda(pH_query):.2f} (straighter)")
-    return (f"pH {pH_query:g} is ABOVE the trained range [{PH_ANCHOR_LO:g}, "
-            f"{PH_ANCHOR_HI:g}] - conditioning at pH {PH_ANCHOR_HI:g}, then imposing "
+    anchor = PH_ANCHOR_LO if pH_query < PH_ANCHOR_LO else PH_ANCHOR_HI
+    how = "straightening" if pH_query < PH_ANCHOR_LO else "imposing"
+    return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+            f"{PH_ANCHOR_HI:g}] - conditioning at pH {anchor:g}, then {how} "
             f"waviness {predicted_waviness(pH_query):.1f}px geometrically "
-            f"(velocity extrapolation does not work in this direction)")
+            f"(the model does not extrapolate pH usefully in either direction under an "
+            f"img2img anchor)")

@@ -235,7 +235,7 @@ def _warp_augment(img4):
     displacement, _ = bounded_broadband(
         img4.shape[3], needed, ripple_fraction, img4.device,
         max_slope=WARP_AUG_MAX_SLOPE)
-    warped, _ = warp_filament(img4, displacement, extend=False)
+    warped, _, _ = warp_filament(img4, displacement, extend=False)
     return warped
 
 
@@ -282,7 +282,7 @@ def _val_pair(img4, index):
     displacement, _ = bounded_broadband(img4.shape[3], needed,
                                         0.30 if index % 2 else 0.80, img4.device,
                                         generator=gen)
-    warped, _ = warp_filament(img4, displacement, extend=False)
+    warped, _, _ = warp_filament(img4, displacement, extend=False)
     return img4, warped
 
 

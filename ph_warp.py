@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from config import PH_MAX, PH_MIN
 from ph_control import (predicted_waviness, predicted_waviness_native,
                         predicted_period, predicted_ripple)
-from waviness import box_blur, trace_fibre, waviness
+from waviness import box_blur, ripple_rms, trace_fibre, waviness
 
 # log-linear fit of dominant undulation wavelength against pH, over the measured buckets
 _WL_LOG_SLOPE = -0.2477
@@ -134,6 +134,31 @@ def broadband_displacement(width, rms, ripple_fraction, device, generator=None,
     return d * (rms / d.std().clamp(min=1e-6))
 
 
+# The slope budget for the EDITING warp, which is not the same regime MAX_DISPLACEMENT_SLOPE
+# was measured in. That constant (1.0) was fitted against the narrowband synth_displacement,
+# where every pixel of the frame is on the same steep shear at once; a broadband displacement
+# of equal peak slope reaches it only at isolated columns. Re-measured directly, warping a
+# real crop with bounded_broadband and comparing column-to-column texture variance against
+# the untouched source, the comb/moire artefact simply does not appear: the ratio sits at
+# 0.73-0.78 (slightly BELOW 1, from grid_sample's own bilinear smoothing) at every cap from
+# 1.0 to 3.0, with no trend. Real filaments are far steeper than either number anyway - the
+# peak slope of a real traced centreline has median 1.8 at pH 6.8 and 3.2 at pH 8.8, p90
+# 4.3-6.7 - so a 1.0 cap was not protecting the render, it was silently cutting the request:
+# it held the applied displacement to ~4.4px rms no matter what was asked, which made every
+# target from pH 8.8 to 14.8 come out at the same waviness. At 2.0 a full pH 8.8 request
+# passes through intact (total 5.76px against real crops' 6.57, ripple 3.94 against 3.85).
+WARP_MAX_SLOPE = 2.0
+
+# How many times apply_ph_waviness re-draws and re-scores the displacement. Each attempt is
+# a warp plus a trace and costs no model calls, so this is cheap; the reason to spend it is
+# that the quadrature estimate of "how much displacement do I need" is only approximate and
+# the random phase draw matters. Measured over two sources x four pH values x five seeds,
+# going from 3 to 5 attempts cut the seed-to-seed spread in achieved waviness from 1.94px
+# median (5.13px worst) to 1.30px (2.26px), and the median distance from the requested
+# waviness from 1.05px to 0.15px. Past 5 it stops helping.
+WARP_CORRECTION_ATTEMPTS = 5
+
+
 def bounded_broadband(width, rms, ripple_fraction, device, generator=None, max_slope=None,
                       max_backoff=6, **kw):
     """broadband_displacement, backed off in AMPLITUDE until the peak slope is safe.
@@ -150,6 +175,16 @@ def bounded_broadband(width, rms, ripple_fraction, device, generator=None, max_s
         if slope <= limit:
             return d, rms
         rms *= 0.95 * limit / max(slope, 1e-6)
+    # Out of attempts and still over budget. Scale the last draw down to hit the limit
+    # exactly rather than returning it as-is: slope is linear in amplitude, so one division
+    # is exact. Returning the over-steep displacement was measurably harmful, not merely
+    # untidy - apply_ph_waviness scores each draw by the waviness it achieves and keeps the
+    # closest, so an over-steep draw that happened to land near the target got SELECTED, and
+    # a single unlucky realisation reached 15.4px where its siblings sat near 11. That is
+    # what made more correction attempts score worse than fewer.
+    if slope > limit and slope > 0:
+        d = d * (limit / slope)
+        rms *= limit / slope
     return d, rms
 
 
@@ -168,6 +203,12 @@ MAX_DISPLACEMENT_SLOPE = 1.0
 def bounded_displacement(width, rms, wavelength, device, generator=None, num_modes=5,
                          max_widen=6, max_slope=None, preserve="amplitude"):
     """synth_displacement, backed off until the realized peak slope is safe.
+
+    NOT on any live path any more - bounded_broadband replaced it everywhere, in both the
+    warp and train.py's augmentation, because a single narrowband bump can only ever draw
+    one regular wave. Kept because it is the readable reference for what `preserve` means
+    below, and because broadband_displacement falls back to its narrowband synthesiser on a
+    frame too short to resolve both bands.
 
     A sum of several modes can locally interfere to a steeper slope than a single sinusoid
     of the same RMS would predict, so this measures the actual result each attempt rather
@@ -256,6 +297,26 @@ def _extend_frame(img, pad, generator=None):
 WARP_MARGIN = 3
 
 
+def required_pad(line, d, height, margin=WARP_MARGIN):
+    """How many background rows the warp actually needs, rather than how far it displaces.
+
+    Not ceil(max|d|), which is what this used to be: that assumes the filament starts flush
+    against both frame edges, and it almost never does. These crops are tight bounding boxes
+    around a filament that still sits somewhere in the middle, so most of a displacement is
+    absorbed by headroom the crop already has. The old figure doubled the canvas height of a
+    47px crop for an ordinary pH 8.8 edit, and every row it added is SYNTHESISED background
+    (framing.synth_background recycling the crop's own residual), which reads as visibly
+    flatter and streakier than the real rows around it. Asking only for the overshoot leaves
+    the real grain covering most of the frame.
+    """
+    if d.numel() == 0:
+        return 0
+    target = line + d
+    lo, hi = float(margin), float(height - 1 - margin)
+    over = max(0.0, float((lo - target).max()), float((target - hi).max()))
+    return int(math.ceil(over))
+
+
 def _envelope_sigma(d):
     """Width of warp_filament's Gaussian envelope for a given displacement, factored out so
     the background-preservation mask (see _preserve_background) can fade over the same span
@@ -279,22 +340,25 @@ def warp_filament(img, d, margin=WARP_MARGIN, extend=True):
 
     Warping locally avoids both. A Gaussian envelope centred on the filament means it moves
     fully, background more than a few sigma away does not move at all, and the transition
-    is a gentle stretch through pure noise where it cannot be seen. The frame is extended by
-    reflection, so the new rows are real background grain rather than anything synthetic.
+    is a gentle stretch through pure noise where it cannot be seen. The frame is grown only
+    by as many rows as the displacement actually overshoots by (required_pad), and those rows
+    are synthesised background, never reflection - reflecting a tight crop stacks a mirror
+    copy of the filament and the per-column trace then hops between them.
 
-    Falls back to the plain global shear if the filament cannot be located.
+    Returns (warped, fit_scale, pad). Falls back to the plain global shear if the filament
+    cannot be located.
     """
     line = centreline(img)
     if line is None:
-        return img, 0.0
+        return img, 0.0, 0
 
     # These crops are tight bounding boxes - a filament being made WAVIER often has no room
     # at all inside the original frame (fit scale 0), so the frame has to grow. A filament
     # being STRAIGHTENED moves inward and needs none, and extending it there is actively
     # harmful: the synthesised bands carry noise that the per-column trace can latch onto
     # instead of the now-flat filament, which reads back as more waviness, not less.
-    if extend:
-        pad = int(math.ceil(float(d.abs().max()))) + margin
+    pad = required_pad(line, d, img.shape[2], margin) if extend else 0
+    if pad:
         img = _extend_frame(img, pad)
         line = line + pad
 
@@ -328,21 +392,65 @@ def warp_filament(img, d, margin=WARP_MARGIN, extend=True):
                         2 * src_y / max(height - 1, 1) - 1], dim=-1).unsqueeze(0)
     warped = F.grid_sample(img, grid, mode="bilinear", padding_mode="reflection",
                            align_corners=True)
-    return warped, scale
+    return warped, scale, pad
 
 
-def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None):
+def target_ripple_whole(target_pH, target_waviness):
+    """The ripple rms a whole crop at this pH should have, in whole-image pixels.
+
+    ph_control.predicted_ripple is fitted on the per-crop (native) scale, alongside
+    predicted_waviness_native, while everything in this module measures on the whole crop
+    (predicted_waviness). The two scales are NOT interchangeable in absolute pixels - see
+    ph_control._DEFAULTS - but the ripple SHARE is a shape statistic, not a size, and does
+    transfer: measured over the dataset it sits near 0.61 at every pH on either scale. So
+    the share implied by the native pair is what gets carried across, applied to the
+    whole-image total.
+    """
+    native = predicted_waviness_native(target_pH)
+    share = min(1.0, max(0.0, predicted_ripple(target_pH) / max(native, 1e-6)))
+    return share * target_waviness
+
+
+def _added_ripple_fraction(needed_rms, current_ripple, target_ripple):
+    """How much of a to-be-added displacement of rms `needed_rms` must be fine undulation.
+
+    Both the total and the ripple add in quadrature against what the filament already has,
+    so the fraction is not the target share - it is the share of the SHORTFALL:
+
+        added_ripple = sqrt(target_ripple^2 - current_ripple^2)
+        fraction     = added_ripple / needed_rms
+
+    Getting this wrong in the obvious way - passing the target share straight through -
+    under-delivers ripple on a source that is already smooth, because the long-wave half of
+    the addition then has to cover a deficit the ripple half was supposed to.
+    """
+    extra = math.sqrt(max(0.0, target_ripple ** 2 - (current_ripple or 0.0) ** 2))
+    return min(1.0, max(0.0, extra / max(needed_rms, 1e-6)))
+
+
+def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None,
+                      measured_ripple=None, max_slope=WARP_MAX_SLOPE):
     """Re-shape a filament image to the waviness a given pH calls for.
 
     img is (1, 1, H, W) in [-1, 1]. Returns (warped, info). Waviness adds roughly in
     quadrature, so the displacement needed on top of what the image already has is
     sqrt(target^2 - current^2); when the image is already wavier than the target this
-    returns it untouched, since a shear can only add undulation, never remove it.
+    hands off to _straighten, since a shear can only add undulation, never remove it.
+
+    The displacement is BROADBAND (bounded_broadband), not a single narrowband bump. It has
+    to be: the shape of the addition is half the request. Real crops spread their centreline
+    energy nearly evenly over every scale and hold the ripple share near 0.61 at every pH,
+    while the old synth_displacement put all of its energy within +-40% of one wavelength -
+    so the only warp it could produce was one long regular wave, the same "one big arc"
+    failure the model's own rms-only conditioning had. `wavelength` is accepted and reported
+    for callers that still pass it, but no longer decides the shape; target_ripple_whole
+    does, via _added_ripple_fraction.
     """
     current = waviness(img) if measured is None else measured
     target = predicted_waviness(target_pH)
     info = {"current": current, "target": target, "applied_rms": 0.0,
-            "wavelength": None, "warped": False}
+            "wavelength": None, "warped": False, "ripple_fraction": None,
+            "displacement": None}
     if current is None:
         return img, info
     if target < current:
@@ -350,20 +458,30 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None)
 
     needed = math.sqrt(max(0.0, target ** 2 - current ** 2))
     lam = predicted_wavelength(target_pH) if wavelength is None else wavelength
+    current_ripple = ripple_rms(img) if measured_ripple is None else measured_ripple
+    target_ripple = target_ripple_whole(target_pH, target)
+    fraction = _added_ripple_fraction(needed, current_ripple, target_ripple)
+    info.update({"current_ripple": current_ripple, "target_ripple": target_ripple,
+                 "ripple_fraction": fraction})
 
     # Adding undulation in quadrature is only an approximation - the synthesised modes
     # partially cancel against the filament's existing shape, which undershot the target by
     # 10-15% in testing. So measure what was actually achieved and correct the amplitude,
     # always re-warping the ORIGINAL rather than the previous attempt: repeated resampling
     # would soften the filament a little more each round.
+    #
+    # The winning DISPLACEMENT is kept, not just its rms. bounded_broadband draws random
+    # phases and backs the amplitude off against a slope budget, so re-synthesising later
+    # from the recorded rms does not reproduce it - and edit_to_pH has to apply the very
+    # same displacement to the model's canvas that was scored here against the source.
     best, best_err, applied = None, float("inf"), needed
-    best_wavelength = lam
-    for attempt in range(3):
+    for attempt in range(WARP_CORRECTION_ATTEMPTS):
         gen = None
         if seed is not None:
             gen = torch.Generator(device=img.device).manual_seed(seed + attempt * 1000)
-        d, lam_used = bounded_displacement(img.shape[3], applied, lam, img.device, generator=gen)
-        candidate, scale = warp_filament(img, d)
+        d, applied_rms = bounded_broadband(img.shape[3], applied, fraction, img.device,
+                                           generator=gen, max_slope=max_slope)
+        candidate, scale, _ = warp_filament(img, d)
         info["fit_scale"] = scale
 
         achieved = waviness(candidate)
@@ -372,14 +490,14 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None)
             break
         err = abs(achieved - target)
         if err < best_err:
-            best, best_err, info["applied_rms"] = candidate, err, applied
-            best_wavelength = lam_used
-            info["achieved"] = achieved
+            best, best_err = candidate, err
+            info.update({"applied_rms": applied_rms, "displacement": d,
+                         "achieved": achieved, "achieved_ripple": ripple_rms(candidate)})
         if err <= 0.05 * target:
             break
         applied *= max(0.4, min(2.5, target / max(achieved, 1e-3)))
 
-    info.update({"wavelength": best_wavelength, "warped": True})
+    info.update({"wavelength": lam, "warped": True})
     return best, info
 
 
@@ -414,7 +532,7 @@ def _straighten(img, current, target, info):
     full = np.convolve(np.pad(full, pad_n, mode="edge"),
                        np.ones(kernel) / kernel, mode="valid")[:width]
     d = torch.from_numpy(full).float().to(img.device) * (target / max(current, 1e-3) - 1.0)
-    out, scale = warp_filament(img, d, extend=False)
+    out, scale, _ = warp_filament(img, d, extend=False)
     info["fit_scale"] = scale
     info.update({"applied_rms": float(d.std()), "warped": True, "mode_detail": "straighten"})
     return out, info
@@ -477,21 +595,29 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
                geometry_mode="warp", **kw):
     """Edit a real crop to ANY pH, dispatching to whichever mechanism works there.
 
-        target_pH < 5.8   velocity extrapolation past the acidic anchor (validated:
-                          orientation spread falls 1.55 -> 1.21 -> 0.97 as it is pushed)
-        5.8 <= pH <= 8.8  ordinary conditioning, exactly as before
-        target_pH > 8.8   edit to the alkaline anchor, then impose the extra undulation
-                          geometrically - velocity extrapolation fails in this direction
+        any target_pH    edit to the nearest in-range anchor with the fibre held in place,
+                         then impose the requested geometry on the PIXELS - a broadband
+                         warp when it has to get wavier, a shear of its own traced
+                         centreline when it has to get straighter.
+
+    The pixel warp is not reserved for out-of-range requests any more. It used to be, and
+    in-range edits were left to the model's own conditioning; see the long comment at the
+    branch for the measurement that moved it (the model renders a relocated fibre at ~40%
+    of a real crop's contrast, on this checkpoint and the last one alike, and no inference
+    knob recovers it). Velocity extrapolation is not used for editing in either direction:
+    it goes the wrong way above pH 8.8 (filaments get smoother, not wavier - the
+    8.8-minus-5.8 velocity direction carries texture and thickness too) and is smothered by
+    the img2img anchor below pH 5.8 (waviness stayed flat at ~6.5px across pH 3.0-7.3 no
+    matter how hard the conditioning was pushed).
 
     extend_frame lets the above-range warp grow the canvas (adding synthesised background
     rows top/bottom) when a thin source crop has no room to express the requested waviness
     otherwise; False caps the warp to whatever fits inside the existing frame instead (see
-    warp_filament's `scale`/fit_scale). Outside the trained range the result is composited
-    back onto the untouched source everywhere except a feathered band around the fiber (see
-    _preserve_background) - both the anchor edit and the warp touch the wider field by
-    default, and only the microtubule itself is meant to change. This composite only applies
-    outside [PH_MIN, PH_MAX]; ordinary in-range conditioning is untouched. See
-    refine_texture's docstring for why a texture touch-up pass is NOT additionally run.
+    warp_filament's `scale`/fit_scale). The result is composited back onto the untouched
+    source everywhere except a feathered band around the fiber (see _preserve_background) -
+    both the anchor edit and the warp touch the wider field by default, and only the
+    microtubule itself is meant to change. See refine_texture's docstring for why a texture
+    touch-up pass is NOT additionally run.
 
     geometry_mode="warp" (default) is everything documented above - unchanged, still what
     every existing caller gets. geometry_mode="native" skips the pixel warp entirely and
@@ -590,19 +716,41 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
     anchor = min(max(target_pH, PH_MIN), PH_MAX)
     out = edit_image(model=model, ref_image=ref_image, source_pH=source_pH,
                      target_pH=anchor, seed=seed, **kw)
-    if PH_MIN <= target_pH <= PH_MAX:
-        return out, {"mode": "conditioned", "warped": False}
-
-    # Outside the range in EITHER direction the geometry is imposed, because the model's
-    # own response is unreliable there: it cannot buckle harder than pH 8.8, and under an
-    # img2img anchor it cannot straighten either.
+    # The geometry is imposed on PIXELS, at EVERY pH - in-range included. This used to
+    # return here for 5.8 <= pH <= 8.8 and leave the shape entirely to the model's own
+    # conditioning, and that is the single change that fixes the "faint, broken, noisy"
+    # in-range result. The model cannot draw a sharp filament in a place it has to invent:
+    # asked to relocate the fibre it hedges over the unresolved phase and paints a smear,
+    # measured at 0.35-0.39 fibre depth against 0.86 for a real pH 8.8 crop - the SAME 40%
+    # on the current checkpoint and on the previous one, so it is not a training
+    # regression. Handed the same edit with its geometry conditioning nulled, so that it
+    # only has to re-render texture around a filament that stays put, it comes back at
+    # source-grade contrast. The old checkpoint got away with the smear because one long
+    # smooth arc still reads as a filament at 40% contrast; a correct multi-scale ripple at
+    # 40% contrast reads as mush, which is why fixing the geometry made the picture LOOK
+    # worse while every measured number improved.
+    #
+    # So the two jobs are split along the line of what each side is good at: the model
+    # supplies pH texture with the fibre held in place (edit_image is called above with no
+    # geometry conditioning at all, which is what "hold it in place" means), and the warp
+    # moves real pixels into the requested shape afterwards. Moving pixels cannot lose
+    # contrast or break the fibre - the filament that arrives is the one that leaves.
+    #
     # Size the displacement against the REAL source, then apply it to the model's output.
     # Measuring the output directly does not work: img2img results are softer and carry
     # faint ghost filaments, so the per-column trace wanders between them and reports ~9px
     # of waviness even for an in-range edit of a 8.4px source. Fed that, the closed loop
     # concludes the filament is already wavy enough and barely warps at all.
     canvas = out * 2 - 1
-    if target_pH < PH_MIN:
+    measured = waviness(ref_image)
+    if measured is None:
+        return out, {"mode": "warp", "warped": False, "reason": "no centreline traced"}
+
+    # Direction, not range, picks the mechanism. Straightening needs the filament's own
+    # traced centreline and bending does not, and both directions occur on either side of
+    # the trained range: 8.8 -> 5.8 is an in-range straighten just as 5.8 -> 3.0 is an
+    # out-of-range one.
+    if predicted_waviness(target_pH) < measured:
         # Straightening scales the filament's OWN traced centreline, so it must read the
         # image it is straightening; a source-derived displacement would not line up.
         straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed)
@@ -613,23 +761,28 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
             straightened = _preserve_background(straightened, ref_image, pad=0,
                                                 sigma=BACKGROUND_MASK_SIGMA,
                                                 new_line=new_line, old_line=old_line)
+        info.pop("displacement", None)   # a width-long tensor; callers print this dict
         return ((straightened + 1) / 2).clamp(0, 1), info
 
     _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed)
     info = {"mode": "warp", **plan}
+    info.pop("displacement", None)
     if not plan.get("warped") or not plan.get("applied_rms"):
         return out, info
 
-    generator = torch.Generator(device=canvas.device).manual_seed(seed or 0)
-    displacement, _ = bounded_displacement(canvas.shape[3], plan["applied_rms"],
-                                           plan["wavelength"] or predicted_wavelength(target_pH),
-                                           canvas.device, generator=generator)
+    # The exact displacement that was scored against the source, not a fresh draw from its
+    # rms: bounded_broadband randomises phase per realisation and backs the amplitude off
+    # against a slope budget, so re-synthesising here would apply a different shape from
+    # the one the closed loop converged on.
+    displacement = plan["displacement"]
+    if displacement is None:
+        return out, info
     warp_extend = extend_frame and plan.get("mode_detail") != "straighten"
-    warped, info["fit_scale"] = warp_filament(canvas, displacement, extend=warp_extend)
+    # `pad` comes back from the warp rather than being re-derived here: it depends on where
+    # the filament sits in ITS frame, so any second guess at it misplaces new_line and the
+    # background mask with it.
+    warped, info["fit_scale"], pad = warp_filament(canvas, displacement, extend=warp_extend)
 
-    pad = 0
-    if warp_extend:
-        pad = int(math.ceil(float(displacement.abs().max()))) + WARP_MARGIN
     old_line = centreline(ref_image)
     new_line = None
     if old_line is not None:

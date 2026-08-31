@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ```
 
 Before running, download the trained model per `checkpoints/download_trained_model.txt` and save
-it as `checkpoints/cfm_best_ema_ex.pt` — `config.CHECKPOINT_PATH`, which every script defaults to.
+it as `checkpoints/cfm_best_ema_ripple.pt` — `config.CHECKPOINT_PATH`, which every script defaults to.
 
 ## Quick start
 
@@ -47,6 +47,15 @@ This opens a comparison plot (original / edited / difference map) and saves the 
 
 --contrastive_scale (default: 3.0)
     How aggressively the target pH's morphology (curviness) is pushed onto the edit.
+
+--geometry_mode (default: warp)
+    Who decides the shape. "warp" splits the job: the model re-renders pH texture with the
+    filament held in place, then a broadband displacement moves real pixels into the requested
+    waviness. Because the fiber that comes out is the source's own fiber, it keeps the source's
+    darkness and continuity. "native" instead asks the model to redraw the filament wherever the
+    conditioning says it belongs; the shape statistics come out right, but the fiber renders at
+    about 40% of a real crop's contrast and breaks up, because the model is inventing it at a
+    position it was never told. Use "native" only to measure the model's own conditioning.
 
 --num_steps (default: 100)
     ODE integration steps. Higher = smoother/more accurate, but slower.
@@ -71,12 +80,19 @@ This opens a comparison plot (original / edited / difference map) and saves the 
 
 ## Requesting pH outside the trained range (5.8–8.8)
 
-The dataset only covers 5.8–8.8, but the tooling supports asking for values outside it. **For
-editing a real image, use `ph_warp.edit_to_pH(...)` for either direction, not `img2img.py`'s
-plain CLI** - passing an out-of-range `--target_pH` directly to `img2img.py` will run without
-error, but the result is wrong or barely changed for both directions once a real reference image
-is involved (its built-in extrapolation is only reliable for pure noise-to-image generation, not
-editing). Use the diagnostic script, or `ph_warp.edit_to_pH(...)` directly:
+The dataset only covers 5.8–8.8, but you can ask for values outside it, and `img2img.py`'s own
+CLI handles it: the CLI routes through `ph_warp.edit_to_pH`, which edits to the nearer trained
+anchor and then imposes the requested geometry on the pixels. That is the same mechanism it uses
+*inside* the range, so nothing special happens at the boundary — only the fitted law's target
+changes. Measured on a pH 5.8 crop: requesting 11.8 lands 9.32px of centreline rms against the
+law's 9.79 target, with the fiber still at 0.72 depth and 0.99 continuity.
+
+What does *not* work out-of-range is asking the network itself to extrapolate. Both
+`--geometry_mode native` and `sample.py`'s velocity extrapolation fail above pH 8.8 (filaments
+get *smoother*, not wavier), and below 5.8 the reference image anchors the trajectory too
+strongly for it to matter. Neither is used for editing.
+
+To sweep a range of pH values at once:
 
 ```bash
 python3 test_ph_extrapolation.py --pH 3 4 5 6 7 8 9 10 11 12

@@ -34,7 +34,8 @@ from img2img import (edit_image, frame_height, load_and_preprocess_image,
                      measure_frame_ripple, measure_frame_waviness, plan_window_starts)
 from model import from_state_dict
 from ph_control import predicted_ripple, predicted_waviness_native
-from waviness import (RIPPLE_MAX_WAVELENGTH, RIPPLE_MIN_WAVELENGTH, band_profile)
+from ph_warp import edit_to_pH
+from waviness import (RIPPLE_MAX_WAVELENGTH, RIPPLE_MIN_WAVELENGTH, band_profile, box_blur)
 
 DATA_DIR = "data/cropped/cropped_output"
 # Boundaries chosen so the ripple band (24-96px) is two of them and the rest split what is
@@ -85,6 +86,41 @@ def real_profile(data_dir, pH, min_w=200, min_h=24):
     return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
 
 
+def _render_row(label, img01):
+    """Fibre darkness and continuity - the half of the result a band profile cannot see.
+
+    depth: median over columns of (background level - darkest pixel), on a [-1,1] image, so
+    a real crop's near-black filament on mid-grey noise scores ~0.9 and a faint smear ~0.35.
+    cont:  fraction of columns whose depth reaches half the strong-column depth, i.e. how
+           much of the fibre's length is actually drawn rather than broken.
+    """
+    if img01 is None:
+        return f"{label:>16}  (no example available)"
+    x = img01 * 2 - 1
+    smoothed = box_blur(x, 3)[0, 0]
+    background = smoothed.median(dim=0).values
+    darkest, _ = smoothed.min(dim=0)
+    depth = background - darkest
+    strong = torch.quantile(depth, 0.75)
+    continuity = float((depth > 0.5 * strong).float().mean())
+    return f"{label:>16}  depth {float(depth.median()):.2f}   continuity {continuity:.2f}"
+
+
+def _real_example(data_dir, pH, min_w=200, min_h=24):
+    """One real crop at this pH, for the rendering comparison - the widest that qualifies."""
+    folder = os.path.join(data_dir, f"{pH:g}")
+    if not os.path.isdir(folder):
+        return None
+    best = None
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".png"):
+            continue
+        img, (w, h) = load_and_preprocess_image(os.path.join(folder, name))
+        if w >= min_w and h >= min_h and (best is None or w > best[0]):
+            best = (w, img)
+    return None if best is None else (best[1] + 1) / 2
+
+
 def _row(label, prof, keys):
     return f"{label:>22} " + " ".join(f"{prof[k]:>8.2f}" for k in keys)
 
@@ -100,6 +136,13 @@ def main():
     ap.add_argument("--num_steps", type=int, default=100)
     ap.add_argument("--contrastive_scale", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--geometry_mode", default="warp", choices=["warp", "native"],
+                    help="Which mechanism to measure - the same flag img2img.py takes. "
+                         "'warp' (default) is the product path: the model re-renders "
+                         "texture with the fibre held still and a broadband pixel warp "
+                         "imposes the shape. 'native' measures the model's own geometry "
+                         "conditioning in isolation, which is what this script was "
+                         "originally written to check.")
     args = ap.parse_args()
 
     if not os.path.exists(args.checkpoint):
@@ -128,17 +171,50 @@ def main():
     target_ripple = predicted_ripple(args.target_pH)
     source_waviness = measure_frame_waviness(ref) or predicted_waviness_native(args.source_pH)
     source_ripple = measure_frame_ripple(ref) or predicted_ripple(args.source_pH)
-    print(f"requested: waviness {source_waviness:.2f} -> {target_waviness:.2f}px, "
-          f"ripple {source_ripple:.2f} -> {target_ripple:.2f}px "
-          f"(share {target_ripple / max(target_waviness, 1e-6):.2f})")
+    if args.geometry_mode == "native":
+        print(f"requested: waviness {source_waviness:.2f} -> {target_waviness:.2f}px, "
+              f"ripple {source_ripple:.2f} -> {target_ripple:.2f}px "
+              f"(share {target_ripple / max(target_waviness, 1e-6):.2f})")
 
     with torch.no_grad():
-        out = edit_image(model=model, ref_image=ref, source_pH=args.source_pH,
-                         target_pH=args.target_pH, num_steps=args.num_steps,
-                         contrastive_scale=args.contrastive_scale, seed=args.seed,
-                         contrast=1.0, solver="heun",
-                         source_waviness=source_waviness, target_waviness=target_waviness,
-                         source_ripple=source_ripple, target_ripple=target_ripple)
+        if args.geometry_mode == "native":
+            out = edit_image(model=model, ref_image=ref, source_pH=args.source_pH,
+                             target_pH=args.target_pH, num_steps=args.num_steps,
+                             contrastive_scale=args.contrastive_scale, seed=args.seed,
+                             contrast=1.0, solver="heun",
+                             source_waviness=source_waviness, target_waviness=target_waviness,
+                             source_ripple=source_ripple, target_ripple=target_ripple)
+        else:
+            # edit_to_pH, not edit_image: the warp lives there, and measuring edit_image
+            # alone would score a mechanism the CLI no longer uses on its own.
+            out, info = edit_to_pH(model=model, ref_image=ref, source_pH=args.source_pH,
+                                   target_pH=args.target_pH, num_steps=args.num_steps,
+                                   contrastive_scale=args.contrastive_scale, seed=args.seed,
+                                   contrast=1.0, solver="heun", geometry_mode="warp")
+            if not info.get("warped"):
+                print("warp: NOT APPLIED - the fibre could not be traced in this crop")
+            elif info.get("mode_detail") == "straighten":
+                # The source is already wavier than the target pH calls for, so the warp
+                # shears its own traced centreline down instead of adding to it; there is
+                # no synthesised displacement and so no ripple fraction to report.
+                print(f"warp: STRAIGHTEN {info.get('current', 0.0):.2f} -> "
+                      f"{info.get('target', 0.0):.2f}px total, by shearing the traced "
+                      f"centreline (rms of the shear {info.get('applied_rms', 0.0):.2f}px)")
+            else:
+                print(f"warp: {info.get('current', 0.0):.2f} -> {info.get('target', 0.0):.2f}px "
+                      f"total and {info.get('current_ripple') or 0.0:.2f} -> "
+                      f"{info.get('target_ripple') or 0.0:.2f}px ripple, via a "
+                      f"{info.get('applied_rms', 0.0):.2f}px displacement that is "
+                      f"{(info.get('ripple_fraction') or 0.0) * 100:.0f}% ripple")
+
+    # How DARK and how CONTINUOUS the fibre came out, alongside its shape. Both matter and
+    # they fail independently: the geometry can land exactly on the real per-band profile
+    # while the fibre itself renders as a faint broken smear, which is precisely what the
+    # model's own conditioning does when it has to draw the filament somewhere it must
+    # invent (measured 0.35-0.39 depth against 0.86 for a real crop at the same pH).
+    print(f"\nfibre rendering:  {_render_row('generated', out)}")
+    print(f"                  {_render_row(f'real pH {args.target_pH:g}', _real_example(DATA_DIR, args.target_pH))}")
+    print(f"                  {_render_row('source', (ref + 1) / 2)}")
 
     keys = [name for _, _, name in BANDS] + ["ripple", "total"]
     print(f"\nrms of the traced centreline, per wavelength band (px). "

@@ -507,15 +507,17 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
-    parser.add_argument("--geometry_mode", type=str, default="native", choices=["warp", "native"],
-                        help="'native' (default) states the geometry the model was trained to "
-                             "follow - the requested waviness AND ripple (see model.py). This "
-                             "is the only path that conditions geometry for an IN-RANGE edit "
-                             "at all: 'warp' leaves both channels null there and lets the pH "
-                             "channel decide, which is what produced one frame-wide arc where "
-                             "real crops have many small waves. 'warp' is the older geometric "
-                             "pixel-warp mechanism, still the one with data behind it above "
-                             "roughly pH 16.")
+    parser.add_argument("--geometry_mode", type=str, default="warp", choices=["warp", "native"],
+                        help="'warp' (default) holds the fibre still while the model "
+                             "re-renders pH texture, then moves REAL PIXELS into the "
+                             "requested shape - a broadband displacement carrying the "
+                             "requested waviness and ripple. Use it: the fibre keeps the "
+                             "source's contrast and continuity because it is the source's "
+                             "own fibre. 'native' instead asks the model to redraw the "
+                             "filament where the conditioning says it should be; the "
+                             "geometry comes out right but the fibre renders at ~40%% of a "
+                             "real crop's contrast and breaks up, because the model is "
+                             "inventing it at a location it has to guess.")
 
     args = parser.parse_args()
     
@@ -577,9 +579,27 @@ def main():
             extra = f", canvas grew {grown}px to fit it" if grown > 0 else ""
             print(f"Geometric pH warp applied: target waviness {edit_info.get('target', 0.0):.1f}px "
                   f"({detail}{extra})")
+            # The ripple half of the request. Reported next to the total because the total
+            # alone cannot distinguish one frame-wide arc from many small waves, and telling
+            # them apart is the whole reason the warp is broadband.
+            tgt_r, got_r = edit_info.get("target_ripple"), edit_info.get("achieved_ripple")
+            if tgt_r is not None:
+                got = f" -> {got_r:.1f}px" if got_r is not None else ""
+                print(f"  Fine undulation (24-96px band): {edit_info.get('current_ripple') or 0.0:.1f}px "
+                      f"on the source, {tgt_r:.1f}px requested{got}")
             if edit_info.get("fit_scale", 1.0) < 0.999:
                 print(f"  Note: source crop limited the warp to "
                       f"{edit_info['fit_scale'] * 100:.0f}% of the requested displacement.")
+            target_rms = edit_info.get("target") or 0.0
+            if achieved is not None and target_rms and achieved < 0.7 * target_rms:
+                # Not a bug and not a bad seed: a displacement steep enough to reach a very
+                # large request tears the texture under grid_sample, so ph_warp backs the
+                # amplitude off against WARP_MAX_SLOPE. Far above pH 8.8 the fitted law asks
+                # for more excursion than a crop this tall can carry cleanly, and what comes
+                # out is the steepest clean warp rather than the requested one.
+                print(f"  Note: only {achieved / target_rms * 100:.0f}% of the requested "
+                      f"waviness was reachable without over-steepening the warp - the law "
+                      f"asks for more than a {ref_image.shape[2]}px-tall crop can carry.")
         else:
             print("No geometric pH warp applied: the fibre could not be confidently traced "
                   "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
