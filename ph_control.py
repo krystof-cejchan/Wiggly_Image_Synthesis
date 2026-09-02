@@ -430,8 +430,8 @@ def describe(pH_query, geometry_mode="warp", geometry_channel=False):
         # geometry axis where the augmentation has real training support.
         return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
                 f"{PH_ANCHOR_HI:g}] - pH pinned to {min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI):g} "
-                f"for texture, and {predicted_waviness(pH_query):.1f}px of centreline rms "
-                f"handed to the model as a CURVE for it to draw (no pixel warping)")
+                f"for texture, and the shape handed to the model as a CURVE for it to draw "
+                f"(no pixel warping); the requested rms is printed below")
     if geometry_mode == "native":
         anchor = min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI)
         return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "

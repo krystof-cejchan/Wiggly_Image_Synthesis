@@ -533,6 +533,16 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
+    parser.add_argument("--waviness_mode", type=str, default="relative",
+                        choices=["relative", "absolute"],
+                        help="Whose waviness the target pH sets. 'relative' (default) scales "
+                             "THIS filament's own excursion by the ratio the fitted law "
+                             "predicts between source and target pH - so an X->X edit is the "
+                             "identity and a flat crop stays relatively flat. 'absolute' "
+                             "targets the population average at the requested pH, which "
+                             "discards the individual filament: real crops at one pH span "
+                             "0.69-9.33px around a 4.12px mean, so roughly half of them get "
+                             "BENT even when the request lowers the pH.")
     parser.add_argument("--geometry_mode", type=str, default="auto",
                         choices=["auto", "warp", "native"],
                         help="'auto' (default) follows the checkpoint: a geometry-conditioned "
@@ -609,6 +619,7 @@ def main():
         contrast_mode=args.contrast_mode,
         extend_frame=True,
         geometry_mode=args.geometry_mode,
+        waviness_mode=args.waviness_mode,
     )
     if edit_info.get("mode") == "warp":
         if edit_info.get("warped"):
@@ -652,8 +663,11 @@ def main():
         rendered = edit_info.get("rendered")
         grown = edit_info.get("canvas_grew", 0)
         extra = f", canvas grew {grown}px to fit it" if grown else ""
+        basis = ("scaled from this crop" if args.waviness_mode == "relative"
+                 else "population average")
         print(f"Geometry channel: pH {args.target_pH:g} calls for "
-              f"{edit_info.get('target', 0.0):.1f}px of centreline rms; curve synthesised at "
+              f"{edit_info.get('target', 0.0):.1f}px of centreline rms ({basis}); "
+              f"curve synthesised at "
               f"{edit_info.get('achieved') or 0.0:.1f}px"
               + (f", model drew {rendered:.1f}px" if rendered is not None else "")
               + extra)

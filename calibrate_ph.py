@@ -111,7 +111,10 @@ def measure_real_native(data_dir, min_w=128, min_h=32, crops_per_image=8, seed=4
                     continue
                 ref, _ = load_and_preprocess_image(os.path.join(path, name))
                 for _ in range(crops_per_image):
-                    _, _, _, wav, ripple = T.dynamic_collate_fn(
+                    # dynamic_collate_fn returns 6 values since the geometry channel was
+                    # added (source, target, pH, waviness, ripple, geometry); only the two
+                    # scalar labels are wanted here.
+                    _, _, _, wav, ripple, _ = T.dynamic_collate_fn(
                         [(ref.squeeze(0).cpu(), torch.tensor(ph))])
                     value = wav.item()
                     if not math.isnan(value):

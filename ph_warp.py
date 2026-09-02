@@ -45,8 +45,8 @@ import torch
 import torch.nn.functional as F
 
 from config import PH_MAX, PH_MIN, WARP_AUG_MAX_SLOPE
-from ph_control import (predicted_waviness, predicted_waviness_native,
-                        predicted_period, predicted_ripple)
+from ph_control import (MAX_SUPPORTED_WAVINESS, predicted_waviness,
+                        predicted_waviness_native, predicted_period, predicted_ripple)
 from waviness import (box_blur, centreline_map, line_stats, ripple_rms, trace_fibre,
                       waviness)
 
@@ -396,6 +396,41 @@ def warp_filament(img, d, margin=WARP_MARGIN, extend=True):
     return warped, scale, pad
 
 
+def target_waviness_for(target_pH, current, source_pH=None, mode="relative"):
+    """How wavy THIS filament should be at target_pH - absolutely, or relative to itself.
+
+    "absolute" returns the fitted population average at target_pH. That is the right answer
+    to "what does a typical filament at this pH look like", and it is what every caller used
+    to get unconditionally.
+
+    "relative" scales the filament's OWN excursion by the ratio the law predicts between the
+    two pH values:
+
+        target = current * predicted_waviness(target_pH) / predicted_waviness(source_pH)
+
+    That is the right answer to "what does THIS filament look like at another pH", which is
+    what an editor is actually asked. The difference is not cosmetic. Real crops at one pH
+    span an enormous range - 0.69 to 9.33px at pH 5.8 against a 4.12px mean - so the absolute
+    target snaps every input to the population centre and DISCARDS the individual filament.
+    Two visible consequences: an X -> X edit was not the identity, and any crop flatter than
+    the mean at the requested pH got BENT, even when the request lowered the pH. Roughly half
+    of all real crops are on that side of the mean.
+
+    Relative also removes most of the conflict between the two input channels. The source
+    channel shows the model a filament of `current` rms while the geometry channel asks for
+    the target; when those disagree sharply the model splits the difference rather than
+    following the curve (measured: handed a 3.23px curve for a 9.33px source it drew 6.37px).
+    Scaling from the source keeps the two requests compatible.
+    """
+    absolute = predicted_waviness(target_pH)
+    if mode == "absolute" or source_pH is None or current is None:
+        return absolute
+    base = predicted_waviness(source_pH)
+    if base <= 1e-6:
+        return absolute
+    return min(MAX_SUPPORTED_WAVINESS, max(0.5, current * (absolute / base)))
+
+
 def target_ripple_whole(target_pH, target_waviness):
     """The ripple rms a whole crop at this pH should have, in whole-image pixels.
 
@@ -430,7 +465,8 @@ def _added_ripple_fraction(needed_rms, current_ripple, target_ripple):
 
 
 def plan_target_line(line, target_pH, seed=None, max_slope=None,
-                     attempts=WARP_CORRECTION_ATTEMPTS):
+                     attempts=WARP_CORRECTION_ATTEMPTS, source_pH=None,
+                     waviness_mode="relative"):
     """The centreline a filament at `target_pH` should have, given the one it has now.
 
     This is the geometry computation, isolated from what consumes it. The pixel warp applies
@@ -462,7 +498,7 @@ def plan_target_line(line, target_pH, seed=None, max_slope=None,
     if stats is None:
         return line, info
     current, current_ripple = stats
-    target = predicted_waviness(target_pH)
+    target = target_waviness_for(target_pH, current, source_pH, waviness_mode)
     target_ripple = target_ripple_whole(target_pH, target)
     info.update({"current": current, "target": target,
                  "current_ripple": current_ripple, "target_ripple": target_ripple})
@@ -514,7 +550,8 @@ def plan_target_line(line, target_pH, seed=None, max_slope=None,
 
 
 def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None,
-                      measured_ripple=None, max_slope=WARP_MAX_SLOPE):
+                      measured_ripple=None, max_slope=WARP_MAX_SLOPE, source_pH=None,
+                      waviness_mode="relative"):
     """Re-shape a filament image to the waviness a given pH calls for.
 
     img is (1, 1, H, W) in [-1, 1]. Returns (warped, info). Waviness adds roughly in
@@ -532,7 +569,7 @@ def apply_ph_waviness(img, target_pH, measured=None, seed=None, wavelength=None,
     does, via _added_ripple_fraction.
     """
     current = waviness(img) if measured is None else measured
-    target = predicted_waviness(target_pH)
+    target = target_waviness_for(target_pH, current, source_pH, waviness_mode)
     info = {"current": current, "target": target, "applied_rms": 0.0,
             "wavelength": None, "warped": False, "ripple_fraction": None,
             "displacement": None}
@@ -677,7 +714,7 @@ def _preserve_background(edited, ref_image, pad, sigma, new_line, old_line, edge
 
 
 def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=True,
-               geometry_mode="warp", **kw):
+               geometry_mode="warp", waviness_mode="relative", **kw):
     """Edit a real crop to ANY pH, dispatching to whichever mechanism works there.
 
         any target_pH    edit to the nearest in-range anchor with the fibre held in place,
@@ -750,7 +787,9 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
             return out, {"mode": "native", "warped": False,
                          "reason": "no centreline traced"}
 
-        target_line, plan = plan_target_line(line, target_pH, seed=seed)
+        target_line, plan = plan_target_line(line, target_pH, seed=seed,
+                                            source_pH=source_pH,
+                                            waviness_mode=waviness_mode)
         # Grow the canvas only if the requested curve actually leaves the frame - the same
         # overshoot rule the warp uses, for the same reason (every added row is synthesised
         # background). The source channel needs those rows to exist; the model fills them.
@@ -887,10 +926,12 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
     # traced centreline and bending does not, and both directions occur on either side of
     # the trained range: 8.8 -> 5.8 is an in-range straighten just as 5.8 -> 3.0 is an
     # out-of-range one.
-    if predicted_waviness(target_pH) < measured:
+    if target_waviness_for(target_pH, measured, source_pH, waviness_mode) < measured:
         # Straightening scales the filament's OWN traced centreline, so it must read the
         # image it is straightening; a source-derived displacement would not line up.
-        straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed)
+        straightened, plan = apply_ph_waviness(canvas, target_pH, seed=seed,
+                                               source_pH=source_pH,
+                                               waviness_mode=waviness_mode)
         info = {"mode": "warp", **plan}
         if plan.get("warped"):
             old_line = centreline(ref_image)
@@ -901,7 +942,8 @@ def edit_to_pH(model, ref_image, source_pH, target_pH, seed=None, extend_frame=T
         info.pop("displacement", None)   # a width-long tensor; callers print this dict
         return ((straightened + 1) / 2).clamp(0, 1), info
 
-    _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed)
+    _, plan = apply_ph_waviness(ref_image, target_pH, seed=seed, source_pH=source_pH,
+                                waviness_mode=waviness_mode)
     info = {"mode": "warp", **plan}
     info.pop("displacement", None)
     if not plan.get("warped") or not plan.get("applied_rms"):
