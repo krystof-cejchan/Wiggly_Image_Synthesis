@@ -192,17 +192,19 @@ def main():
                                    contrastive_scale=args.contrastive_scale, seed=args.seed,
                                    contrast=1.0, solver="heun",
                                    geometry_mode=args.geometry_mode)
+            how = ("geometry channel (model draws the curve)"
+                   if info.get("geometry") == "curve" else "warp (pixels moved)")
             if not info.get("warped"):
-                print("warp: NOT APPLIED - the fibre could not be traced in this crop")
+                print(f"{how}: NOT APPLIED - the fibre could not be traced in this crop")
             elif info.get("mode_detail") == "straighten":
                 # The source is already wavier than the target pH calls for, so the warp
                 # shears its own traced centreline down instead of adding to it; there is
                 # no synthesised displacement and so no ripple fraction to report.
-                print(f"warp: STRAIGHTEN {info.get('current', 0.0):.2f} -> "
+                print(f"{how}: STRAIGHTEN {info.get('current', 0.0):.2f} -> "
                       f"{info.get('target', 0.0):.2f}px total, by shearing the traced "
                       f"centreline (rms of the shear {info.get('applied_rms', 0.0):.2f}px)")
             else:
-                print(f"warp: {info.get('current', 0.0):.2f} -> {info.get('target', 0.0):.2f}px "
+                print(f"{how}: {info.get('current', 0.0):.2f} -> {info.get('target', 0.0):.2f}px "
                       f"total and {info.get('current_ripple') or 0.0:.2f} -> "
                       f"{info.get('target_ripple') or 0.0:.2f}px ripple, via a "
                       f"{info.get('applied_rms', 0.0):.2f}px displacement that is "

@@ -394,7 +394,7 @@ def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, wavi
     return extrapolate(v_lo, v_hi, lam, rescale=rescale)
 
 
-def describe(pH_query, geometry_mode="warp"):
+def describe(pH_query, geometry_mode="warp", geometry_channel=False):
     """One-line summary for CLI output, so an extrapolated request is never silent.
 
     geometry_mode must match whatever the caller is actually about to run (img2img.py's and
@@ -415,11 +415,23 @@ def describe(pH_query, geometry_mode="warp"):
     branch. See ph_warp.edit_to_pH.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
+        if geometry_mode == "native" and geometry_channel:
+            return (f"pH {pH_query:g} is inside the trained range - direct conditioning for "
+                    f"texture, and the shape handed to the model as a curve to draw")
         if geometry_mode == "warp":
             return (f"pH {pH_query:g} is inside the trained range - direct conditioning for "
                     f"texture, geometric warp for shape")
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
     direction = "BELOW" if pH_query < PH_ANCHOR_LO else "ABOVE"
+    if geometry_mode == "native" and geometry_channel:
+        # The geometry-channel checkpoint. Nothing is imposed on pixels and nothing is
+        # extrapolated through the pH embedding: pH is pinned to its anchor for texture and
+        # the shape is handed over as a rendered curve, which lands the request on the
+        # geometry axis where the augmentation has real training support.
+        return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+                f"{PH_ANCHOR_HI:g}] - pH pinned to {min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI):g} "
+                f"for texture, and {predicted_waviness(pH_query):.1f}px of centreline rms "
+                f"handed to the model as a CURVE for it to draw (no pixel warping)")
     if geometry_mode == "native":
         anchor = min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI)
         return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "

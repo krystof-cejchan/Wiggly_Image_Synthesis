@@ -572,7 +572,15 @@ def main():
         print(f"Source-conditioned checkpoint: the reference goes in through its own input "
               f"channel and the trajectory starts from pure noise, so --strength "
               f"({args.strength:g}) is ignored.")
-    print(describe_pH(args.target_pH, geometry_mode=args.geometry_mode))
+    # Resolve "auto" the same way ph_warp.edit_to_pH will, so the description matches the
+    # mechanism that is actually about to run - describing the wrong one is worse than
+    # describing neither (see ph_control.describe).
+    resolved_mode = args.geometry_mode
+    if resolved_mode == "auto":
+        resolved_mode = ("native" if getattr(model, "geometry_conditioned", False)
+                         else "warp")
+    print(describe_pH(args.target_pH, geometry_mode=resolved_mode,
+                      geometry_channel=getattr(model, "geometry_conditioned", False)))
 
     display_ref = ref_image
     if args.repair_gaps:
@@ -635,13 +643,40 @@ def main():
         else:
             print("No geometric pH warp applied: the fibre could not be confidently traced "
                   "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
+    elif edit_info.get("geometry") == "curve":
+        # The geometry-channel path: the model drew every pixel, following the curve it was
+        # handed. Three numbers matter and they are different things - what the fitted law
+        # asked for, what curve was actually synthesised for it, and what the model then drew.
+        # Reporting the middle one separately is what distinguishes "the plan fell short" from
+        # "the model did not follow the plan".
+        rendered = edit_info.get("rendered")
+        grown = edit_info.get("canvas_grew", 0)
+        extra = f", canvas grew {grown}px to fit it" if grown else ""
+        print(f"Geometry channel: pH {args.target_pH:g} calls for "
+              f"{edit_info.get('target', 0.0):.1f}px of centreline rms; curve synthesised at "
+              f"{edit_info.get('achieved') or 0.0:.1f}px"
+              + (f", model drew {rendered:.1f}px" if rendered is not None else "")
+              + extra)
+        r_t, r_g = edit_info.get("target_ripple"), edit_info.get("rendered_ripple")
+        if r_t is not None:
+            print(f"  Fine undulation (24-96px band): {r_t:.1f}px requested"
+                  + (f" -> {r_g:.1f}px drawn" if r_g is not None else ""))
+        planned = edit_info.get("achieved")
+        # The 2px floor keeps this quiet on straightening requests: at a planned 0.5px the
+        # tracer's own noise is larger than the shortfall being complained about (a
+        # dead-straight fibre already measures ~0.7px in the sub-24px band), so a relative
+        # threshold alone cries wolf on every request below the trained range.
+        if rendered is not None and planned and planned > 2.0 and rendered < 0.7 * planned:
+            print("  Note: the model fell well short of the curve it was given - that is a "
+                  "model failure, not a planning one. Re-run with a different --seed, and "
+                  "check the geometry conditioning gap in outputs/training_loss.csv.")
     elif edit_info.get("mode") == "native":
         achieved = edit_info.get("achieved")
         got = f", achieved {achieved:.1f}px" if achieved is not None else ""
-        print(f"Native waviness conditioning applied: {edit_info.get('source_waviness', 0.0):.1f}px "
+        print(f"Native waviness conditioning applied (SCALAR path - pre-geometry checkpoint): "
+              f"{edit_info.get('source_waviness', 0.0):.1f}px "
               f"measured on the reference -> {edit_info.get('target_waviness', 0.0):.1f}px requested"
-              f"{got} (supported by training data to ~pH 16; above that compare against "
-              f"--geometry_mode warp)")
+              f"{got}")
         if achieved is not None and achieved < 0.6 * edit_info.get("target_waviness", 0.0):
             print("  Note: well short of the request. The anchored edit varies a lot with the "
                   "noise draw - re-run with a different --seed before concluding anything.")
