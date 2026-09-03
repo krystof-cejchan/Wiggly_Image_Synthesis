@@ -55,7 +55,7 @@ def warmup_gpu(model, num_runs=5):
     with torch.no_grad():
         for _ in range(num_runs):
             _ = model(dummy_x, dummy_t, dummy_ph)
-    # bugfix: na stroji bez CUDA (Mac/CPU) by holé synchronize() spadlo
+    # bugfix: on a machine without CUDA (Mac/CPU) a bare synchronize() would crash
     if "cuda" in DEVICE:
         torch.cuda.synchronize()
     print("Hardware warmed up and ready.")
@@ -77,9 +77,9 @@ def main():
     model.eval()
 
     # Initialize FID metric
-    # A) feature=64 místo 2048: kovarianci 64x64 jde z desítek vzorků odhadnout
-    #    řádově lépe než 2048x2048. FID i tak zůstává při malém n biased -> ber
-    #    ho relativně, primární metrika je KID (viz DOPORUCENI_METRIKY.md).
+    # A) feature=64 instead of 2048: a 64x64 covariance can be estimated from a few
+    #    dozen samples orders of magnitude better than a 2048x2048 one. FID stays biased
+    #    at small n regardless -> read it only relatively; the primary metric is KID.
     fid = FrechetInceptionDistance(feature=64, normalize=False).to(DEVICE)
 
     # Warm up the model and GPU before we start collecting stats

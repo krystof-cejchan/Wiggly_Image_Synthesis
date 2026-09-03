@@ -72,11 +72,11 @@ def main():
     MAX_SAMPLES = 1000
 
     # ==========================================
-    # OPTIMALIZOVANÉ PARAMETRY PRO LEPŠÍ FID
+    # PARAMETERS TUNED FOR A BETTER FID
     # ==========================================
-    STRENGTH = 0.80   # Sníženo pro zachování reálné textury pozadí
-    SCALE = 5.0       # Sníženo pro omezení přesaturace pixelů
-    NUM_STEPS = 100   # Zvýšeno pro hladší integraci a méně mikro-šumu
+    STRENGTH = 0.80   # lowered, to preserve the real background texture
+    SCALE = 5.0       # lowered, to limit pixel oversaturation
+    NUM_STEPS = 100   # raised, for smoother integration and less micro-noise
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"Error: Checkpoint {CHECKPOINT_PATH} was not found.")
@@ -86,7 +86,8 @@ def main():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     model.eval()
 
-    # A) feature=64 místo 2048 (viz DOPORUCENI_METRIKY.md)
+    # A) feature=64 instead of 2048 - a 64x64 covariance is far better estimated from
+    #    the few dozen samples available here than a 2048x2048 one
     fid = FrechetInceptionDistance(feature=64, normalize=False).to(DEVICE)
     warmup_gpu(model, num_runs=5)
 
@@ -142,7 +143,8 @@ def main():
             denoising_strength=STRENGTH,
             num_steps=NUM_STEPS,
             contrastive_scale=SCALE,
-            contrast=1.0,  # bugfix: reálné obrázky kontrast nedostávají, default 1.2 zkresloval FID
+            contrast=1.0,  # bugfix: the real images get no contrast boost, so the 1.2
+                           # default was skewing the FID
         )
 
         fake_images_fid = prepare_images_for_fid(edited_img)

@@ -180,7 +180,7 @@ TALL_MIN_HEIGHT = 48
 TALL_BATCH_FRACTION = 0.4
 
 def set_seed(seed):
-    """Zajistí reprodukovatelnost napříč PyTorch i Pythonem."""
+    """Make runs reproducible across both PyTorch and Python."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
@@ -887,7 +887,7 @@ def main():
                 # up yet, not necessarily overfitting. cond= is how much the model USES its
                 # waviness / pH conditioning (see evaluate) - watch it keep rising long after
                 # the val loss has gone flat.
-                print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f} "
+                print(f"Step: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f} "
                       f"| Val Loss (EMA): {val_loss:.4f} | cond GEOM {shape_gap:+.5f} "
                       f"wav {wav_gap:+.5f} ripple {ripple_gap:+.5f} pH {ph_gap:+.5f}")
 
@@ -915,13 +915,13 @@ def main():
                 epochs_without_improvement = 0 if improved else epochs_without_improvement + 1
 
                 if epochs_without_improvement >= PATIENCE:
-                    print(f"Early stopping aktivován na kroku {step} (val loss ani conditioning "
-                          f"se nezlepšily {PATIENCE}x za sebou). Trénink ukončen.")
+                    print(f"Early stopping triggered at step {step} (neither val loss nor "
+                          f"conditioning improved {PATIENCE} evals in a row). Training ended.")
                     stop_training = True
                     break
 
             elif step % 100 == 0:
-                print(f"Krok: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f}")
+                print(f"Step: {step:06d}/{ITERATIONS} | Train Loss (live): {train_loss_value:.4f}")
 
             step += 1
 

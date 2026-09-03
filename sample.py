@@ -65,7 +65,7 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
         else:
             raise ValueError(f"Unknown solver: {solver!r} (expected 'euler' or 'heun')")
 
-    # Denormalizace [-1, 1] → [0, 1]
+    # Denormalize [-1, 1] -> [0, 1]
     return (x.clamp(-1, 1) + 1) / 2
 
 def main():
@@ -89,7 +89,7 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.checkpoint):
-        print(f"Checkpoint {args.checkpoint} nenalezen!")
+        print(f"Checkpoint {args.checkpoint} not found!")
         return
 
     model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
@@ -98,7 +98,7 @@ def main():
     os.makedirs("outputs", exist_ok=True)
 
     for ph in args.pH:
-        print(f"Generuji vzorky pro pH = {ph} ... ({describe_pH(ph, geometry_mode=args.geometry_mode)})")
+        print(f"Generating samples for pH = {ph} ... ({describe_pH(ph, geometry_mode=args.geometry_mode)})")
         samples = sample(model, pH_query=ph, num_samples=args.num_samples,
                          num_steps=args.num_steps, cfg_scale=args.cfg_scale, seed=args.seed,
                          geometry_mode=args.geometry_mode,
@@ -106,7 +106,7 @@ def main():
 
         save_path = f"outputs/sample_pH_{ph}.png"
         vutils.save_image(samples, save_path, nrow=4)
-        print(f"Uloženo do: {save_path}")
+        print(f"Saved to: {save_path}")
 
 if __name__ == "__main__":
     main()

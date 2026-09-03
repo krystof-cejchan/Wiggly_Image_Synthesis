@@ -1,14 +1,14 @@
 """
-DINOv2 feature extractor (bod C z DOPORUCENI_METRIKY.md).
+DINOv2 feature extractor.
 
-Wrapper, který lze předat jako `feature=` do torchmetrics
-FrechetInceptionDistance / KernelInceptionDistance místo ImageNet-Inceptionu.
-DINOv2 je self-supervised ViT (Meta AI) a jeho features se na out-of-distribution
-data (mikroskopie) přenášejí líp než ImageNet-supervised Inception.
+A wrapper that can be passed as `feature=` to torchmetrics'
+FrechetInceptionDistance / KernelInceptionDistance in place of ImageNet-Inception.
+DINOv2 is a self-supervised ViT (Meta AI), and its features transfer to
+out-of-distribution data (microscopy) better than ImageNet-supervised Inception does.
 
-Očekává float obrázky v [0, 1], tvar (N, 1 nebo 3, H, W). Vrací (N, 384).
+Expects float images in [0, 1], shape (N, 1 or 3, H, W). Returns (N, 384).
 
-Pozn.: model se stahuje přes torch.hub (nutný internet + první stažení vah).
+Note: the model is downloaded via torch.hub (needs internet on first run to fetch weights).
 """
 import torch
 import torch.nn as nn
@@ -32,27 +32,27 @@ class DinoV2Features(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        # img_size musí být dělitelné patch_size (14). 224 / 14 = 16.
+        # img_size must be divisible by patch_size (14). 224 / 14 = 16.
         self.img_size = img_size
-        # torchmetrics si dimenzi zjistí z výstupu; num_features držíme pro jistotu.
+        # torchmetrics infers the dimension from the output; num_features is kept just in case.
         self.num_features = getattr(self.backbone, "embed_dim", 384)
 
-        # DINOv2 byl trénován s ImageNet normalizací.
+        # DINOv2 was trained with ImageNet normalization.
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Defenzivně: přijmi i uint8 [0,255].
+        # Defensively: accept uint8 [0,255] too.
         if x.dtype == torch.uint8:
             x = x.float() / 255.0
         x = x.float()
 
-        # šedotón -> RGB (DINOv2 čeká 3 kanály)
+        # greyscale -> RGB (DINOv2 expects 3 channels)
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
 
-        # resize na čtverec dělitelný patch_size + ImageNet normalizace
+        # resize to a square divisible by patch_size + ImageNet normalization
         x = F.interpolate(x, size=(self.img_size, self.img_size),
                           mode="bilinear", align_corners=False)
         x = (x - self.mean) / self.std
