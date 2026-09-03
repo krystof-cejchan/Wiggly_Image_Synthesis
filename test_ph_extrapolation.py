@@ -22,10 +22,10 @@ import torch
 from PIL import Image
 
 import ph_control
-from config import DEVICE, PH_MAX, PH_MIN
+from config import DEVICE, PH_MAX, PH_MIN, CHECKPOINT_PATH
 from img2img import load_and_preprocess_image
 from ph_warp import edit_to_pH
-from model import ConditionalUNet
+from model import from_state_dict
 from waviness import waviness
 
 DATA_DIR = "data/cropped/cropped_output"
@@ -55,7 +55,7 @@ def pick_sources(data_dir, count, min_w=220, min_h=32):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--checkpoint", default="checkpoints/cfm_best_ema.pt")
+    ap.add_argument("--checkpoint", default=CHECKPOINT_PATH)
     ap.add_argument("--pH", type=float, nargs="+",
                     default=[3.0, 4.4, 5.8, 7.3, 8.8, 10.3, 11.8, 13.0])
     ap.add_argument("--sources", type=int, default=3)
@@ -66,17 +66,19 @@ def main():
     ap.add_argument("--contrast", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", default="outputs_img2img/ph_range")
+    ap.add_argument("--geometry_mode", default="auto", choices=["auto", "warp", "native"],
+                    help="Which out-of-range mechanism to exercise - see ph_warp.edit_to_pH. "
+                         "'native' needs a waviness-conditioned checkpoint.")
     args = ap.parse_args()
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
     os.makedirs(args.out_dir, exist_ok=True)
 
     sources = pick_sources(DATA_DIR, args.sources)
     print(f"{len(sources)} sources x {len(args.pH)} pH values\n")
     for ph in args.pH:
-        print(" ", ph_control.describe(ph))
+        print(" ", ph_control.describe(ph, geometry_mode=args.geometry_mode))
     print()
 
     per_ph = {ph: [] for ph in args.pH}
@@ -91,7 +93,8 @@ def main():
                                    target_pH=ph, denoising_strength=args.strength,
                                    num_steps=args.num_steps,
                                    contrastive_scale=args.contrastive_scale,
-                                   seed=args.seed, contrast=args.contrast, solver="heun")
+                                   seed=args.seed, contrast=args.contrast, solver="heun",
+                                   geometry_mode=args.geometry_mode)
             # a warp makes the image taller, so crop to whatever came back
             img = out[0, 0, :, :w].cpu()
             value = waviness(out * 2 - 1)

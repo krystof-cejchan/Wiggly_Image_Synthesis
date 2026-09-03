@@ -6,10 +6,21 @@ from torch.utils.data import Dataset
 import torchvision.transforms.v2 as T
 
 class MicrotubuleDataset(Dataset):
-    def __init__(self, root_dir, is_train=True, val_split_ratio=0.2):
+    def __init__(self, root_dir, is_train=True, val_split_ratio=0.2, min_height=0):
+        """min_height drops sources shorter than this many pixels. Very short crops are a
+        fibre with almost no background around it: they carry little signal, trace
+        unreliably, and - because framing.py now grows short crops with synthesised
+        background instead of mirroring them - they are the samples that would need more
+        synthetic rows than they have real ones to donate grain from."""
         self.root_dir = root_dir
         self.samples = []
-        
+
+        self.base_transform = T.Compose([
+            T.ToImage(),
+            T.ToDtype(torch.float32, scale=True),
+            T.Normalize(mean=[0.5], std=[0.5]),
+        ])
+
         for ph_folder in os.listdir(root_dir):
             ph_dir = os.path.join(root_dir, ph_folder)
             if os.path.isdir(ph_dir):
@@ -17,31 +28,29 @@ class MicrotubuleDataset(Dataset):
                     ph_val = float(ph_folder)
                     all_images = [img for img in os.listdir(ph_dir) if img.endswith('.png')]
                     all_images.sort()
-                    
+
                     for img_name in all_images:
+                        if min_height and Image.open(os.path.join(ph_dir, img_name)).size[1] < min_height:
+                            continue
                         base_name = img_name.split('_crop')[0]
-                        
+
                         hash_hex = hashlib.md5(base_name.encode('utf-8')).hexdigest()
                         hash_val = int(hash_hex, 16) % 100
-                        
+
                         # val/train split based on hash value
                         is_val_sample = hash_val < (val_split_ratio * 100)
-                        
+
                         if is_train and not is_val_sample:
-                            self.samples.append((os.path.join(ph_dir, img_name), ph_val))
+                            img_path = os.path.join(ph_dir, img_name)
+                            self.samples.append((img_path, ph_val))
                         elif not is_train and is_val_sample:
-                            self.samples.append((os.path.join(ph_dir, img_name), ph_val))
-                            
+                            img_path = os.path.join(ph_dir, img_name)
+                            self.samples.append((img_path, ph_val))
+
                 except ValueError:
                     continue
 
         self.is_train = is_train
-        
-        self.base_transform = T.Compose([
-            T.ToImage(),
-            T.ToDtype(torch.float32, scale=True),
-            T.Normalize(mean=[0.5], std=[0.5]),
-        ])
 
     def __len__(self):
         return len(self.samples)

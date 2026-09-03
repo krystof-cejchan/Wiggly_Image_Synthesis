@@ -33,10 +33,70 @@ class ScalarEmbedding(nn.Module):
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim),
         )
-    
+
     def forward(self, x):
         # Map scalar -> high-dimensional embedding used for FiLM
         return self.mlp(self.fourier(x))
+
+class PosLinear(nn.Linear):
+    """A Linear layer whose weights are constrained positive via softplus, so composed with
+    a monotone-increasing activation it stays monotone-increasing end to end.
+
+    Runje & Shankaranarayana's "Constrained Monotonic Neural Networks" build the general
+    multivariate case (splitting activations into convex/concave halves) because with more
+    than one input, monotonicity in each input separately still allows sign choices that
+    interact. WavinessEmbedding only ever has a single scalar input, so that machinery isn't
+    needed - but EVERY layer must still be sign-constrained, including the first: leaving
+    even one layer unconstrained lets its hidden units diverge in direction (some increasing
+    in x, some decreasing), and a later PosLinear layer combines them with positive
+    coefficients regardless of that per-unit direction, which is not guaranteed monotonic
+    (verified directly - it produced a U-shaped response). All-positive end to end is what
+    actually guarantees every output dimension is non-decreasing in the input.
+
+    The all-positive constraint has a second consequence that isn't optional to handle: an
+    ordinary Linear layer's output stays roughly bounded regardless of width because its
+    positive- and negative-weighted terms cancel (central-limit behaviour); a sum of
+    strictly-positive weights times strictly-positive activations (Softplus's output is
+    always positive) CANNOT cancel, so the sum grows linearly with fan-in instead of
+    staying flat. Measured directly on a trained model: this stacked 3 deep (1->64->64->256)
+    into a final embedding with norm ~10000-16000, over 1000x pH_embed's ~7-8 - large enough
+    to dominate and likely saturate the shared FiLM pathway regardless of the actual value
+    requested, which plausibly explains near-zero waviness sensitivity surviving every
+    labeling/calibration fix so far. Dividing by fan-in (in_features) here cancels that
+    linear growth directly - it's just a positive constant, so it changes nothing about
+    monotonicity, only the scale.
+    """
+    def forward(self, x):
+        return F.linear(x, F.softplus(self.weight) / self.weight.shape[1], self.bias)
+
+class WavinessEmbedding(nn.Module):
+    """Embeds a continuous, physically-measured waviness value - NOT periodic like
+    FourierFeatures, deliberately. Fourier features alias outside the range they were
+    trained on (see ph_control.py's docstring for the measured example), which is fine for
+    pH's texture/chemistry signal but was exactly wrong for the one input this project
+    actually needs to extrapolate. A monotonic pathway is the opposite failure mode by
+    construction: nothing in it can wrap around and start resembling a value from the other
+    end of the range.
+    """
+    def __init__(self, emb_dim=256, hidden=64):
+        super().__init__()
+        # Every layer (including the first) must be PosLinear, not just the later ones: with
+        # an unconstrained first layer, different hidden units end up increasing or
+        # decreasing in x depending on their weight's random sign, and a PosLinear layer
+        # combines them with positive coefficients regardless - a positive-weighted mix of
+        # oppositely-moving monotone functions is not itself monotone (confirmed by direct
+        # test: it produced a U-shaped, non-monotonic response). All-positive end to end
+        # guarantees every output dimension is non-decreasing in the input, full stop.
+        self.net = nn.Sequential(
+            PosLinear(1, hidden),
+            nn.Softplus(),
+            PosLinear(hidden, hidden),
+            nn.Softplus(),
+            PosLinear(hidden, emb_dim),
+        )
+
+    def forward(self, w):
+        return self.net(w.unsqueeze(-1))
 
 class FiLMResBlock(nn.Module):        
     def __init__(self, in_ch, out_ch, emb_dim, num_groups=32, dropout=0.1):
@@ -203,12 +263,49 @@ class ConditionalUNet(nn.Module):
         out_channels=1, 
         base_channels=64,              
         channel_mults=(1, 2, 4, 8, 8), # 5 stages -> 128 to 64, 32, 16, 8, 8 (Bottleneck at 8x8)
-        num_res_blocks=2, 
-        emb_dim=256, 
-        num_heads=4
+        num_res_blocks=2,
+        emb_dim=256,
+        num_heads=4,
+        waviness_mean=0.0,
+        waviness_std=1.0,
+        log_period_mean=0.0,
+        log_period_std=1.0,
+        period_conditioned=False,
+        ripple_mean=0.0,
+        ripple_std=1.0,
+        ripple_conditioned=True,
     ):
         super().__init__()
-        
+
+        # in_channels == 2 means the network is SOURCE-CONDITIONED: the second channel carries
+        # the image being edited, clean and undamaged, at every step of the trajectory. That is
+        # what removes img2img's strength knob. With in_channels == 1 the model can only turn
+        # noise into an image, so editing has to be faked by stirring noise into the source
+        # (SDEdit) - and that one knob then controls both how much texture is redrawn AND how
+        # far the geometry may move, which are opposite requirements when the job is to
+        # displace a 3px filament by 15px while keeping it continuous. See train.py's
+        # _make_pair for how the supervision is built.
+        # in_channels == 3 adds the GEOMETRY channel: a soft ridge rendered along the
+        # centreline the filament is supposed to end up on (waviness.centreline_map). This
+        # exists because waviness and ripple are statistics, not a shape - infinitely many
+        # curves share an rms and a ripple share, so a model given only those has to average
+        # over a phase it was never told, and the average of many possible filament
+        # positions is a smear. Measured on the 2-channel checkpoint: 0.35-0.39 fibre depth
+        # when the filament has to move, against 0.86 for a real crop and 0.98 for the same
+        # model asked to leave the filament where the source channel already shows it. The
+        # geometry channel makes a NEW position known in that same unambiguous way.
+        #
+        # It is also what makes pH extrapolation work. With the shape supplied as pixels the
+        # pH scalar never has to leave [PH_MIN, PH_MAX], where its Fourier embedding is
+        # valid - out of range that embedding aliases, and pH 11.8 sits exactly as close to
+        # 8.8 as 5.8 does. The extrapolation moves onto the geometry axis instead, and
+        # train.py's warp augmentation already populates that axis to WARP_AUG_MAX_WAVINESS
+        # (26px) - far past the 6.5px a real pH 8.8 crop has, and past the ~13px a pH 14.8
+        # request asks for. So an out-of-range pH becomes an IN-distribution geometry.
+        self.in_channels = in_channels
+        self.source_conditioned = in_channels > 1
+        self.geometry_conditioned = in_channels > 2
+
         self.t_embed = ScalarEmbedding(emb_dim)
         # Lower frequency range than t_embed: t is sampled densely and continuously
         # over [0,1] during training, but pH only ever takes one of 7 discrete,
@@ -219,11 +316,65 @@ class ConditionalUNet(nn.Module):
         # not just the widest one, with nothing in training to constrain it there.
         self.pH_embed = ScalarEmbedding(emb_dim, num_freqs=16, max_freq=2.0)
         self.null_pH_emb = nn.Parameter(torch.zeros(emb_dim))
-        
-        # mlp projections for time and pH embeddings to produce FiLM parameters
+
+        # Continuous, causal geometry signal, disentangled from pH's texture/chemistry
+        # role - see WavinessEmbedding. Raw (pixel-unit) waviness is normalized HERE via
+        # buffers rather than by the caller (unlike pH's normalize_pH, which every caller
+        # applies externally): these constants are fit to one specific training run, and
+        # ph_calibration.json already shows what happens when a checkpoint-specific
+        # constant lives in a sidecar file instead of the checkpoint - it silently goes
+        # stale after a retrain. Buffers travel with state_dict(), so there's nothing to
+        # forget to re-run.
+        self.register_buffer("waviness_mean", torch.tensor(float(waviness_mean)))
+        self.register_buffer("waviness_std", torch.tensor(float(waviness_std)))
+        self.waviness_embed = WavinessEmbedding(emb_dim)
+        self.null_waviness_emb = nn.Parameter(torch.zeros(emb_dim))
+
+        # SECOND geometry channel: how much of the excursion is FINE undulation, as an rms
+        # in pixels over waviness.RIPPLE_MIN/MAX_WAVELENGTH (24-96px). Waviness alone is
+        # degenerate - a wave of amplitude A scores A/sqrt(2) whether it makes one arc across
+        # the crop or ten - while the bending cost goes as A/L, so a model told only the rms
+        # draws the cheapest thing that satisfies it: one long arc. Measured on the
+        # period-conditioned checkpoint, a pH 5.8->8.8 edit put 8.60px of centreline rms into
+        # the 96-192px band where real crops have 2.75, and 0.73px into 24-48px where real
+        # crops have 2.83 - one huge wave in place of many small ones. Conditioning on the
+        # total AND the ripple pins that balance, since whatever is not ripple is left over in
+        # quadrature.
+        #
+        # This REPLACES the earlier undulation-period channel, which is retained below only so
+        # checkpoints trained with it still load. Period was a spectral peak - a single bin,
+        # carrying no magnitude - and it never learned to matter: sweeping a requested period
+        # across its whole 50-400px range moved the trained velocity field by 0.05-0.15%,
+        # against 1-5.7% for the waviness channel, and requesting 50px vs 240px produced
+        # numerically identical images. An rms in a fixed band is a magnitude in the same
+        # physical units as the waviness label that does work, and (unlike a peak) it is
+        # something the warp augmentation can be made to vary independently - see train.py's
+        # broadband_displacement, without which this channel would be just as degenerate.
+        self.ripple_conditioned = ripple_conditioned
+        if ripple_conditioned:
+            self.register_buffer("ripple_mean", torch.tensor(float(ripple_mean)))
+            self.register_buffer("ripple_std", torch.tensor(float(ripple_std)))
+            self.ripple_embed = WavinessEmbedding(emb_dim)
+            self.null_ripple_emb = nn.Parameter(torch.zeros(emb_dim))
+
+        # Legacy: the undulation-period channel. Only constructed for checkpoints that were
+        # trained with it (from_state_dict detects the buffers); new runs use ripple instead.
+        self.period_conditioned = period_conditioned
+        if period_conditioned:
+            self.register_buffer("log_period_mean", torch.tensor(float(log_period_mean)))
+            self.register_buffer("log_period_std", torch.tensor(float(log_period_std)))
+            self.period_embed = WavinessEmbedding(emb_dim)
+            self.null_period_emb = nn.Parameter(torch.zeros(emb_dim))
+
+        # mlp projections for time, pH and waviness embeddings to produce FiLM parameters
         self.t_proj = nn.Linear(emb_dim, emb_dim)
         self.pH_proj = nn.Linear(emb_dim, emb_dim)
-        
+        self.waviness_proj = nn.Linear(emb_dim, emb_dim)
+        if ripple_conditioned:
+            self.ripple_proj = nn.Linear(emb_dim, emb_dim)
+        if period_conditioned:
+            self.period_proj = nn.Linear(emb_dim, emb_dim)
+
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         
         self.down_stages = nn.ModuleList()
@@ -253,18 +404,59 @@ class ConditionalUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
     
-    def forward(self, x, t, pH):
+    def _gated(self, raw, mean, std, embed, null_emb):
+        """Normalise a raw scalar conditioning value and embed it, routing NaN to the learned
+        null embedding. Shared by the waviness and period channels, which differ only in
+        their constants - both are normalised HERE via buffers rather than by the caller, so
+        the constants travel inside the checkpoint and cannot go stale in a sidecar file."""
+        is_null = torch.isnan(raw)
+        normed = (raw - mean) / std.clamp(min=1e-6)
+        safe = torch.where(is_null, torch.zeros_like(normed), normed)
+        real = embed(safe)
+        return torch.where(is_null.unsqueeze(-1), null_emb.expand_as(real), real)
+
+    def forward(self, x, t, pH, waviness=None, source=None, period=None, ripple=None,
+                geometry=None):
         """
         Forward pass for conditional U-Net.
 
         Args:
-            x: image tensor (B, C_in, H, W)
+            x: image tensor (B, 1, H, W) - the noisy state being integrated
             t: scalar tensor for time/step (B,)
             pH: scalar tensor for conditional pH (B,) or NaN for null condition
+            waviness: scalar tensor for conditional RAW (pixel-unit, not pre-normalized)
+                waviness (B,), NaN for null condition, or None to mean "all null" - the
+                default keeps every call site that predates this argument (e.g. the
+                embedding-space extrapolation path in ph_control.py) working unchanged,
+                falling back to whatever geometry signal pH's own channel carries alone.
+            source: the image being edited (B, 1, H, W), for a source-conditioned model
+                (in_channels == 2). None means "no source", encoded as an all-zero channel -
+                train.py drops the source at rate SOURCE_DROPOUT so that encoding is trained
+                rather than merely tolerated, which is what keeps sample.py's from-noise
+                generation working on the same checkpoint. Ignored by a 1-channel model.
+            ripple: scalar tensor for the RAW (pixel-unit) ripple rms (B,) - how much of the
+                requested excursion should be fine undulation rather than one long arc. NaN
+                for null, None for "all null". Ignored by a checkpoint without the channel,
+                so it is always safe to pass.
+            period: legacy undulation-period channel, only present on checkpoints trained
+                before `ripple` replaced it. Ignored otherwise.
+            geometry: (B, 1, H, W) ridge marking where the filament should end up, from
+                waviness.centreline_map, for a geometry-conditioned model (in_channels == 3).
+                None means "no geometry requested", encoded as an all-zero channel and
+                trained at rate GEOMETRY_DROPOUT so the model still works without it (which
+                is what keeps sample.py's from-noise generation alive on the same
+                checkpoint). Ignored by a checkpoint without the channel, so it is always
+                safe to pass. Unlike `waviness`/`ripple`, this says exactly WHERE the fibre
+                goes, which is why the model can render it sharply instead of hedging.
 
         Returns:
             output tensor (B, C_out, H, W)
         """
+        if self.source_conditioned:
+            x = torch.cat([x, torch.zeros_like(x) if source is None else source], dim=1)
+        if self.geometry_conditioned:
+            geom = torch.zeros_like(x[:, :1]) if geometry is None else geometry
+            x = torch.cat([x, geom], dim=1)
         # embed time and pH scalars
         t_emb = self.t_embed(t)
 
@@ -278,8 +470,28 @@ class ConditionalUNet(nn.Module):
             pH_emb_real,
         )
 
+        if waviness is None:
+            waviness = torch.full_like(pH, float("nan"))
+        wav_emb = self._gated(waviness, self.waviness_mean, self.waviness_std,
+                              self.waviness_embed, self.null_waviness_emb)
+
         # The merged embedding is then used to modulate the feature maps in the U-Net via FiLM layers.
-        emb = F.silu(self.t_proj(t_emb) + self.pH_proj(pH_emb))
+        emb = self.t_proj(t_emb) + self.pH_proj(pH_emb) + self.waviness_proj(wav_emb)
+        if self.ripple_conditioned:
+            if ripple is None:
+                ripple = torch.full_like(pH, float("nan"))
+            emb = emb + self.ripple_proj(
+                self._gated(ripple, self.ripple_mean, self.ripple_std,
+                            self.ripple_embed, self.null_ripple_emb))
+        if self.period_conditioned:
+            if period is None:
+                period = torch.full_like(pH, float("nan"))
+            # log, matching how the normalisation constants were fitted
+            log_period = torch.log(period.clamp(min=1.0))
+            emb = emb + self.period_proj(
+                self._gated(log_period, self.log_period_mean, self.log_period_std,
+                            self.period_embed, self.null_period_emb))
+        emb = F.silu(emb)
         # input conv
         x = self.conv_in(x)
         all_skips = []
@@ -300,3 +512,40 @@ class ConditionalUNet(nn.Module):
         x = F.silu(self.norm_out(x))
         x = self.conv_out(x)
         return x
+
+def from_state_dict(state_dict, device=None):
+    """Build the ConditionalUNet a checkpoint was saved from, and load it.
+
+    The architecture has changed twice - waviness conditioning added tensors, and source
+    conditioning changed conv_in's input width - so a bare ConditionalUNet() no longer loads
+    every checkpoint in the wild, and the failure is an unhelpful wall of missing keys. Both
+    changes are visible in the state_dict itself, so infer rather than guess:
+
+        conv_in.weight  (64, 1, 3, 3)   ->  from-noise model, editing needs SDEdit
+        conv_in.weight  (64, 2, 3, 3)   ->  source-conditioned, editing is a direct render
+        conv_in.weight  (64, 3, 3, 3)   ->  + geometry channel, the target centreline as pixels
+        waviness_mean present            ->  has the waviness conditioning channel
+        ripple_mean present              ->  also has the fine-undulation (ripple) channel
+        log_period_mean present          ->  has the LEGACY undulation-period channel that
+                                             ripple replaced (see the constructor)
+
+    waviness_mean/std are constructor arguments only because they are registered buffers; the
+    values in the checkpoint immediately overwrite whatever is passed, so the defaults here
+    are irrelevant to the loaded model.
+    """
+    in_channels = state_dict["conv_in.weight"].shape[1]
+    kwargs = {"in_channels": in_channels,
+              "period_conditioned": "log_period_mean" in state_dict,
+              "ripple_conditioned": "ripple_mean" in state_dict}
+    if "waviness_mean" in state_dict:
+        kwargs["waviness_mean"] = float(state_dict["waviness_mean"])
+        kwargs["waviness_std"] = float(state_dict["waviness_std"])
+    if kwargs["ripple_conditioned"]:
+        kwargs["ripple_mean"] = float(state_dict["ripple_mean"])
+        kwargs["ripple_std"] = float(state_dict["ripple_std"])
+    if kwargs["period_conditioned"]:
+        kwargs["log_period_mean"] = float(state_dict["log_period_mean"])
+        kwargs["log_period_std"] = float(state_dict["log_period_std"])
+    model = ConditionalUNet(**kwargs)
+    model.load_state_dict(state_dict)
+    return model if device is None else model.to(device)

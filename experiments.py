@@ -22,7 +22,7 @@ def main():
     combinations = list(itertools.product(TARGET_PHS, STRENGTHS, SCALES))
     total_runs = len(combinations)
     
-    print(f"{total_runs} celkových kombinací.")
+    print(f"{total_runs} combinations in total.")
     
     for i, (target_ph, strength, scale) in enumerate(combinations, 1):
         print("-" * 50)
@@ -47,9 +47,9 @@ def main():
         
         if os.path.exists(original_save_path):
             shutil.move(original_save_path, new_save_path)
-            print(f"Uloženo jako: {new_filename}")
+            print(f"Saved as: {new_filename}")
         else:
-            print(f"Chyba: Výstupní soubor nebyl nalezen ({original_save_path})")
+            print(f"Error: output file not found ({original_save_path})")
 
     print("-" * 50)
 

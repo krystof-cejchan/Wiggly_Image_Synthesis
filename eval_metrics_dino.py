@@ -1,20 +1,20 @@
 """
-Doporučená evaluace img2img překladu pH — spojuje body A + C z
-DOPORUCENI_METRIKY.md:
+The recommended evaluation of img2img pH translation - combines two changes:
 
-  A) primární metrika je nevychýlené KID (FID jen orientačně, při malém n je biased)
-  C) místo ImageNet-Inceptionu se používá DINOv2 backbone (dino_features.py)
+  A) the primary metric is the unbiased KID (FID is orientational only; at small n
+     it is biased)
+  C) a DINOv2 backbone (dino_features.py) is used instead of ImageNet-Inception
 
-Vyhodnocuje se na NATIVNÍM rozměru každého snímku (žádný pevný čtverec/proužek).
-DINOv2 wrapper si obrázek sám přeškáluje na 224x224 bez ohledu na vstupní tvar,
-takže na rozdíl od dřívějšího přístupu (mirror-pad na pevný 64x256 proužek před
-edit_image) není potřeba žádné umělé dorovnávání - to dřív u přeložených snímků
-kombinovalo dvojí padding (jednou zde, jednou uvnitř edit_image's sliding window)
-a kontaminovalo výstup zrcadlenými pixely přes globální self-attention (stejný
-bug, jaký byl opraven v eval_fid_img2img.py).
+Everything is evaluated at each image's NATIVE resolution (no fixed square or strip).
+The DINOv2 wrapper rescales the image to 224x224 itself regardless of input shape, so
+unlike the earlier approach (mirror-padding to a fixed 64x256 strip before edit_image)
+no artificial padding is needed. That padding used to be applied twice to translated
+images (once here, once inside edit_image's sliding window) and contaminated the output
+with mirrored pixels through the global self-attention - the same bug that was fixed in
+eval_fid_img2img.py.
 
-Nutný stažený checkpoint (viz checkpoints/download_trained_model.txt) a internet
-pro první stažení DINOv2 vah.
+Requires a downloaded checkpoint (see checkpoints/download_trained_model.txt) and
+internet access the first time, to fetch the DINOv2 weights.
 """
 import os
 import torch
@@ -22,14 +22,13 @@ from torchmetrics.image.kid import KernelInceptionDistance
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import DEVICE
-from model import ConditionalUNet
+from config import DEVICE, CHECKPOINT_PATH
+from model import from_state_dict
 from dataset import MicrotubuleDataset
 from img2img import edit_image, load_and_preprocess_image
 from dino_features import DinoV2Features
 
 # --- Konfigurace ---
-CHECKPOINT_PATH = "checkpoints/cfm_best_ema.pt"
 DATA_DIR = "data/cropped/cropped_output"
 SOURCE_PH = 5.8
 TARGET_PH = 8.8
@@ -39,7 +38,7 @@ TARGET_PH = 8.8
 # content rather than real structure. Drop them from both the real and fake sets.
 MIN_SIDE = 32
 
-# img2img parametry (shodné s eval_fid_img2img.py, ať jsou výsledky srovnatelné)
+# img2img parameters (identical to eval_fid_img2img.py, so the results are comparable)
 STRENGTH, SCALE, NUM_STEPS = 0.40, 2.0, 250
 
 
@@ -60,7 +59,7 @@ def filter_paths(samples, ph, limit=None):
 
 
 def prepare_for_dino(img_tensor):
-    """DINO wrapper čeká float [0, 1]. Reálné jsou v [-1, 1], falešné už v [0, 1]."""
+    """The DINO wrapper expects float [0, 1]. Real images are in [-1, 1], fakes already in [0, 1]."""
     if img_tensor.min() < 0:
         img_tensor = (img_tensor.clamp(-1, 1) + 1) / 2
     return img_tensor.clamp(0, 1).float()
@@ -69,32 +68,31 @@ def prepare_for_dino(img_tensor):
 @torch.no_grad()
 def main():
     if not os.path.exists(CHECKPOINT_PATH):
-        print(f"Chybí checkpoint {CHECKPOINT_PATH} (viz checkpoints/download_trained_model.txt).")
+        print(f"Missing checkpoint {CHECKPOINT_PATH} (see checkpoints/download_trained_model.txt).")
         return
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model = from_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE), DEVICE)
     model.eval()
 
-    # C) sdílený DINOv2 backbone pro reálné i falešné vzorky
-    print("Načítám DINOv2 backbone (torch.hub, první běh stahuje váhy)...")
+    # C) one shared DINOv2 backbone for both the real and the fake samples
+    print("Loading DINOv2 backbone (torch.hub; the first run downloads the weights)...")
     feature_extractor = DinoV2Features().to(DEVICE).eval()
 
-    # data — stejný počet zdrojových a cílových pro férové srovnání
+    # data - equal numbers of source and target images, for a fair comparison
     dataset = MicrotubuleDataset(DATA_DIR, is_train=False, val_split_ratio=1.0)
     target_paths = filter_paths(dataset.samples, TARGET_PH)
     source_paths = filter_paths(dataset.samples, SOURCE_PH, limit=len(target_paths))
     target_paths = target_paths[:len(source_paths)]
     n = len(target_paths)
-    print(f"Reálných (pH {TARGET_PH}): {n} | zdrojových (pH {SOURCE_PH}): {len(source_paths)}")
+    print(f"Real (pH {TARGET_PH}): {n} | source (pH {SOURCE_PH}): {len(source_paths)}")
     if n < 2:
-        print("Málo vzorků pro výpočet metriky.")
+        print("Too few samples to compute the metric.")
         return
 
-    # A) KID (primární, nevychýlené) + FID (orientačně). Custom feature extraktor
-    #    (DinoV2Features) ignoruje torchmetrics' `normalize` cast úplně - obrázky
-    #    jdou rovnou do DinoV2Features.forward(), které samo čeká float [0,1]
-    #    (viz prepare_for_dino), takže hodnota `normalize` zde je informativní.
+    # A) KID (primary, unbiased) + FID (orientational). The custom feature extractor
+    #    (DinoV2Features) bypasses torchmetrics' `normalize` cast entirely - images go
+    #    straight into DinoV2Features.forward(), which itself expects float [0,1]
+    #    (see prepare_for_dino), so the `normalize` value here is informational only.
     subset = min(n, 50)
     kid = KernelInceptionDistance(feature=feature_extractor, subset_size=subset, normalize=True).to(DEVICE)
     fid = FrechetInceptionDistance(feature=feature_extractor, normalize=True).to(DEVICE)
@@ -102,15 +100,15 @@ def main():
     # NOTE: native resolution, one image at a time - DinoV2Features resizes to
     # 224x224 internally regardless of input shape, so per-image native sizes
     # (including different shapes between real and fake) are fine.
-    for path in tqdm(target_paths, desc="Reálné (target)"):
+    for path in tqdm(target_paths, desc="Real (target)"):
         real_img, _ = load_and_preprocess_image(path)
         real = prepare_for_dino(real_img.to(DEVICE))
         kid.update(real, real=True)
         fid.update(real, real=True)
 
-    # falešné = překlad source -> target, na nativním rozměru (jako skutečné
-    # img2img.py volání), contrast=1.0 aby se shodoval s reálnými snímky
-    for path in tqdm(source_paths, desc="Překlad (source->target)"):
+    # fakes = source -> target translation, at native resolution (just like a real
+    # img2img.py call), with contrast=1.0 so they match the real images
+    for path in tqdm(source_paths, desc="Translation (source->target)"):
         src_img, _ = load_and_preprocess_image(path)
         edited = edit_image(
             model, src_img, source_pH=SOURCE_PH, target_pH=TARGET_PH,
@@ -125,8 +123,8 @@ def main():
     fid_score = fid.compute()
 
     print("=" * 64)
-    print(f"DINOv2  KID (x100): {kid_mean.item() * 100:.4f} +/- {kid_std.item() * 100:.4f}   <- PRIMÁRNÍ")
-    print(f"DINOv2  FID       : {fid_score.item():.4f}   (orientačně; při n={n} je i s DINOv2 biased)")
+    print(f"DINOv2  KID (x100): {kid_mean.item() * 100:.4f} +/- {kid_std.item() * 100:.4f}   <- PRIMARY")
+    print(f"DINOv2  FID       : {fid_score.item():.4f}   (orientational; at n={n} it is biased even with DINOv2)")
     print(f"Real n={n}, Fake n={len(source_paths)} | backbone=DINOv2 | Strength={STRENGTH}, Scale={SCALE}, Steps={NUM_STEPS}")
     print("=" * 64)
 

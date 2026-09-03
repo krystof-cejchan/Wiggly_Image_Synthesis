@@ -6,24 +6,24 @@ import tifffile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# ================= NASTAVENÍ CEST =================
-XML_PATH = 'annotations.xml'       # Cesta k anotačnímu XML souboru
-DATA_DIR = './Data_package1'                # Kořenová složka s daty
-OUTPUT_DIR = './cropped_output'    # Složka pro vyříznuté obrázky
+# ================= PATH SETTINGS ==================
+XML_PATH = 'annotations.xml'       # Path to the annotation XML file
+DATA_DIR = './Data_package1'                # Root folder containing the data
+OUTPUT_DIR = './cropped_output'    # Folder for the cropped images
 
-# ====== ZOBRAZENÍ A VÝBĚR KANÁLŮ ======
-NORMALIZE_OUTPUT = True            # True = obrázky budou projasněné (8-bit)
-CHANNELS_TO_KEEP = [0]             # [0] vyexportuje pouze první frame/kanál. 
+# ====== DISPLAY AND CHANNEL SELECTION ======
+NORMALIZE_OUTPUT = True            # True = images are brightness-stretched (8-bit)
+CHANNELS_TO_KEEP = [0]             # [0] exports only the first frame/channel.
 # ==================================================
 
 def normalize_name(name):
-    """Sjednotí názvy z CVATu (.mp4) a z disku (.tif, nebo bez koncovky)."""
+    """Unify names coming from CVAT (.mp4) and from disk (.tif, or no extension)."""
     name = re.sub(r'\.(mp4|tif|tiff|zip|roi)$', '', name, flags=re.IGNORECASE)
     name = name.replace('.', '_')
     return name.lower()
 
 def parse_cvat_xml(xml_path):
-    """Zpracuje CVAT XML, srovná číslování framů od nuly a vrátí anotace."""
+    """Parse the CVAT XML, re-base frame numbering to zero, and return the annotations."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     
@@ -68,7 +68,7 @@ def parse_cvat_xml(xml_path):
     return annotations
 
 def read_frame(data_source, frame_idx):
-    """Vrátí konkrétní snímek ze seznamu datových zdrojů."""
+    """Return one specific frame from the list of data sources."""
     if data_source is not None and frame_idx < len(data_source):
         frame = data_source[frame_idx]
         if isinstance(frame, str):
@@ -77,7 +77,7 @@ def read_frame(data_source, frame_idx):
     return None
 
 def adjust_contrast(img):
-    """Roztáhne kontrast pro zviditelnění mikroskopických dat."""
+    """Stretch the contrast to make the microscopy data visible."""
     img_float = img.astype(np.float32)
     p1, p99 = np.percentile(img_float, (1, 99))
     
@@ -89,7 +89,7 @@ def adjust_contrast(img):
     return img_norm.astype(np.uint8)
 
 def process_data(data_dir, output_dir, annotations):
-    """Projde složky, spáruje data s anotacemi a vyřízne obdélníky podle pH."""
+    """Walk the folders, match data to annotations, and crop the boxes per pH."""
     data_path = Path(data_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -98,7 +98,7 @@ def process_data(data_dir, output_dir, annotations):
         if not ph_folder.is_dir() or ph_folder.name == 'ROIs':
             continue
             
-        # Vytáhne z názvu složky pouze hodnotu pH (např. z "HEPES 6.8" udělá "6.8")
+        # Extract just the pH value from the folder name (e.g. "HEPES 6.8" -> "6.8")
         ph_match = re.search(r'(\d+\.\d+)', ph_folder.name)
         if ph_match:
             ph_value = ph_match.group(1)

@@ -1,10 +1,10 @@
 wiggly_venv/**
 venv/**
 __pycache__/
-checkpoints/cfm_best_ema.pt
 checkpoints/unused/**
-CLAUDE.md
+#CLAUDE.md
 cfm_best_ema.pt
 eval_fid_img2img.py
 checkpoints/**.pt
 
+checkpoints/cfm_not used.zip

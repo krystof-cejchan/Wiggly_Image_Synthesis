@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
@@ -7,10 +8,14 @@ import torchvision.utils as vutils
 from PIL import Image
 import matplotlib.pyplot as plt
 import torchvision.transforms.v2.functional as TF
-from config import PH_MIN, PH_MAX, DEVICE
-from model import ConditionalUNet
+from config import (PH_MIN, PH_MAX, DEVICE, CHECKPOINT_PATH,
+                    TRAIN_MIN_H, TRAIN_MIN_W, TRAIN_MAX_W)
+from model import from_state_dict
 from ph_control import normalize_pH, velocity_for_pH, describe as describe_pH
-from waviness import box_blur
+from ph_warp import edit_to_pH
+from framing import pad_height_background, mirror_pad_width
+from waviness import (box_blur, waviness as measure_waviness,
+                      wave_period as measure_wave_period, ripple_rms as measure_ripple_rms)
 
 def load_and_preprocess_image(image_path):
     """loads a reference image, converts it to grayscale, and normalizes it to [-1, 1]"""
@@ -26,19 +31,72 @@ def load_and_preprocess_image(image_path):
     img_tensor = transform(image).unsqueeze(0).to(DEVICE)
     return img_tensor, original_size
 
-def create_blending_mask(window_size, device):
-    """create a 2D blending mask using a Hann window for smooth transitions between overlapping patches
+def create_blending_mask(win_h, win_w, device, taper_h=True, taper_w=True):
+    """2D blending mask for overlapping patches, tapered only along axes that actually slide.
 
-    The window is taken from the INTERIOR of a Hann window of length window_size + 2.
-    A plain hann_window(window_size) is exactly 0 at both endpoints, and the canvas border
-    is covered by only one patch, so weight_global there is 0. Dividing by the clamped
-    weight then yields velocity 0, freezing row 0 and column 0 at their initial noise
-    value - the speckled 1px edge that appeared on the left/top of every result. Trimming
-    the endpoints keeps the window strictly positive while staying symmetric.
+    The window is taken from the INTERIOR of a Hann window of length n + 2. A plain
+    hann_window(n) is exactly 0 at both endpoints, and the canvas border is covered by only
+    one patch, so weight_global there is 0; dividing by the clamped weight then yields
+    velocity 0, freezing the outermost row/column at its initial noise value. Trimming the
+    endpoints keeps the window strictly positive while staying symmetric.
+
+    An axis with only one window position needs no taper at all (its factor would cancel in
+    the weighted average anyway) - passing ones keeps that exact rather than relying on the
+    division to undo it.
     """
-    window_1d = torch.hann_window(window_size + 2, periodic=False, device=device)[1:-1]
-    mask_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
-    return mask_2d.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, H, W)
+    def axis(n, taper):
+        if not taper:
+            return torch.ones(n, device=device)
+        return torch.hann_window(n + 2, periodic=False, device=device)[1:-1]
+    mask_2d = axis(win_h, taper_h).unsqueeze(1) * axis(win_w, taper_w).unsqueeze(0)
+    return mask_2d.unsqueeze(0).unsqueeze(0)
+
+
+# How far a crop may be grown vertically, as a multiple of its own height. Matches the cap
+# dynamic_collate_fn applies during training (~2.2x the batch's 25th-percentile source
+# height): past it, more of the frame is synthesised background than real crop, and
+# framing.synth_background has too few donor rows to recycle without visible streaking.
+HEIGHT_PAD_LIMIT = 2.2
+
+
+def frame_height(h):
+    """Canvas height to edit a crop of height `h` in, as a multiple of 16.
+
+    The U-Net needs a multiple of 16 (4 downsampling stages), and the model was only ever
+    shown frames TRAIN_MIN_H..TRAIN_MAX_H tall (config.TRAIN_SIZES), so a shorter crop is grown toward
+    TRAIN_MIN_H with synthesised background - but never by more than HEIGHT_PAD_LIMIT.
+    A crop taller than the trained band keeps its own height; nothing is ever cropped away.
+
+    It is tempting to go further and size the frame to the waviness being ASKED for, since an
+    RMS excursion of r sweeps roughly +-sqrt(2)*r and a frame shorter than that cannot show
+    it. That was tried and is wrong: padding this dataset's 55px crop out to 96px so an 11px
+    request would fit gave the model a mostly-empty frame and it filled the new room with a
+    SECOND fibre (measured waviness 15.2px, but of a stacked pair, not one wavier filament),
+    on top of the vertical streaking the deep background synthesis leaves. The native path is
+    therefore bounded by the crop's own height, roughly (h/2 - fibre half-thickness)/sqrt(2),
+    ~18px of RMS excursion for a 64px frame. Growing the frame to get past that is
+    ph_warp.py's warp path (`extend_frame`), which can do it safely because it moves pixels
+    instead of asking the model to generate into the new rows.
+    """
+    natural = int(math.ceil(h / 16) * 16)
+    want = min(max(h, TRAIN_MIN_H), HEIGHT_PAD_LIMIT * h)
+    return max(natural, int(want // 16) * 16)
+
+
+def plan_window_starts(total_w, window_w, stride):
+    """Left edges of the sliding windows, spread evenly across the canvas.
+
+    `stride` decides only HOW MANY windows there are; where they sit follows from the canvas,
+    with the last one flush against the right edge. The old version stepped by a fixed stride
+    and then mirror-padded the canvas until the arithmetic came out even - for a 478px crop
+    that was ~100px (20%) of reflected fibre, which every window near the right edge then
+    spent part of its receptive field on.
+    """
+    if total_w <= window_w:
+        return [0]
+    count = math.ceil((total_w - window_w) / stride) + 1
+    span = total_w - window_w
+    return [round(i * span / (count - 1)) for i in range(count)]
 
 
 def apply_contrast(img01, contrast, mode="linear"):
@@ -59,22 +117,6 @@ def apply_contrast(img01, contrast, mode="linear"):
         raise ValueError(f"Unknown contrast mode: {mode!r} (expected 'linear' or 'gamma')")
     mean = img01.mean()
     return ((img01 - mean) * contrast + mean).clamp(0, 1)
-
-def safe_mirror_pad_4d(img_tensor, target_h, target_w):
-    """
-    Pads a 4D tensor (N, C, H, W) to at least target_h and target_w using mirror padding.
-    If the tensor is already larger than the target dimensions, it will be returned unchanged.
-    """
-    # height mirror padding (2nd dimension)
-    while img_tensor.shape[2] < target_h:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[2])], dim=2)
-        
-    # width mirror padding (3rd dimension)
-    while img_tensor.shape[3] < target_w:
-        img_tensor = torch.cat([img_tensor, img_tensor.flip(dims=[3])], dim=3)
-        
-    # Crop to the exact target size if it exceeds
-    return img_tensor[:, :, :target_h, :target_w]
 
 @torch.no_grad()
 def repair_fibre_gaps(ref_image, max_gap=30, min_side=6, max_slope=1.5, blur=3):
@@ -188,12 +230,91 @@ def save_repair_diagnostic(original, repaired, gaps, out_path):
 
 
 @torch.no_grad()
+def measure_frame_waviness(ref_image):
+    """The reference's own waviness, measured in the frames the model will actually see.
+
+    Returns None if no window traces confidently. This is what the native path should feed
+    the CONTRASTIVE pair's source branch: that branch is meant to say "here is what the
+    filament is now", and it can be measured rather than guessed from ph_calibration.json's
+    pH->waviness fit (R^2 ~ 0.09). On the reference this was developed against, the fit says
+    3.46px where the crop actually measures 1.77px - so the fitted value understates the gap
+    the guidance has to close by about a quarter.
+
+    Measured per window and averaged, not on the whole image, because the model is
+    conditioned per frame: a 384px window captures less of a long-wavelength undulation than
+    the full 478px canvas does, so whole-image waviness is a different (larger) number than
+    the one the conditioning is calibrated in.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_waviness(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+@torch.no_grad()
+def measure_frame_period(ref_image):
+    """The reference's own undulation period, measured in the frames the model will see.
+
+    Companion to measure_frame_waviness - the contrastive pair's source branch should state
+    both halves of "what the filament is now", and both are measurable. Returns None when no
+    window yields a period (waviness.wave_period declines to guess one for a filament too
+    straight for it to mean anything), which the caller turns into the fitted value.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_wave_period(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+@torch.no_grad()
+def measure_frame_ripple(ref_image):
+    """The reference's own FINE-undulation rms, in the frames the model will see.
+
+    The ripple companion to measure_frame_waviness, and the source branch of the contrastive
+    pair should state it for the same reason it states the waviness: that branch describes
+    what the filament IS, and both halves of that are measurable rather than guessed. Returns
+    None when no window traces.
+    """
+    _, _, h, w = ref_image.shape
+    frame_h = frame_height(h)
+    framed = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    framed = mirror_pad_width(framed, target_w)
+    win_w = min(target_w, TRAIN_MAX_W)
+    values = [measure_ripple_rms(framed[:, :, :, x:x + win_w])
+              for x in plan_window_starts(target_w, win_w, win_w // 2)]
+    values = [v for v in values if v is not None]
+    return float(sum(values) / len(values)) if values else None
+
+
+@torch.no_grad()
 def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
-               num_steps=100, contrastive_scale=3.0, seed=None, window_size=128, stride=64,
+               num_steps=100, contrastive_scale=3.0, seed=None, window_size=None, stride=None,
                contrast=1.2, solver="heun", contrast_mode="linear", ph_lambda=None,
-               ph_rescale=False):
+               ph_rescale=False, source_waviness=None, target_waviness=None,
+               source_period=None, target_period=None,
+               source_ripple=None, target_ripple=None, geometry=None):
     """
     Edits the reference image to change its pH from source_pH to target_pH using a sliding window approach.
+
+    window_size/stride default to the frame geometry the model was trained on
+    (config.TRAIN_SIZES): one window over the whole crop when it fits inside the trained
+    width band, a TRAIN_MAX_W-wide window slid across it when it does not. Passing them
+    explicitly overrides that and is only useful for reproducing an older run - the previous
+    fixed 128px-wide window sat outside that band and is exactly what stopped the waviness
+    conditioning working (see config.TRAIN_SIZES for the measurement).
 
     solver: "euler" (1st order) or "heun" (2nd order predictor-corrector). Heun evaluates
     the velocity field twice per step (2x model calls) but has O(dt^2) local error instead
@@ -203,23 +324,93 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
     along the acidic->alkaline direction rather than pushing an out-of-range value through
     the periodic embedding, which would alias. ph_lambda forces a specific extrapolation
     strength instead of deriving one from target_pH, and exists for calibrate_ph.py.
+
+    source_waviness/target_waviness, when given, are forwarded to velocity_for_pH and take
+    over from the embedding-space extrapolation above: geometry is driven directly through
+    the model's own waviness conditioning instead (needs a checkpoint trained with it - see
+    model.py's WavinessEmbedding). source_ripple/target_ripple are the second half of that
+    geometry request - HOW MUCH of the excursion is FINE undulation (waviness.ripple_rms,
+    24-96px) rather than one long arc, where waviness says only how far the centreline
+    strays in total. Asking for the total alone is degenerate: one frame-wide arc and ten
+    small waves of the same amplitude score identical rms, the arc is cheaper to draw, and
+    that is exactly what the model produced before this channel existed (8.60px of
+    centreline rms in the 96-192px band against real crops' 2.75, and 0.73px in 24-48px
+    against real crops' 2.83). source_period/target_period drive the LEGACY period channel
+    on a _pair-generation checkpoint and are ignored by a ripple-conditioned one.
+    Both are needed: rms alone is degenerate between one long arc and many short waves, and a
+    model told only the rms produces the arc. ph_warp.edit_to_pH's geometry_mode="native" is what sets
+    these; a plain call here still defaults to today's behaviour unchanged.
+
+    `geometry` supersedes all of the scalars above on an in_channels == 3 checkpoint: it is
+    the target centreline rendered as a full-canvas ridge (waviness.centreline_map), i.e. the
+    actual curve rather than statistics about it, and it is windowed alongside the source. It
+    goes to BOTH contrastive branches deliberately - the pair should differ in pH texture
+    only, so the shape stays pinned by the channel instead of being pushed by
+    contrastive_scale, which would reintroduce the very hedging this channel removes. Must be
+    (1, 1, H, W) matching ref_image before any framing; it is framed here the same way.
     """
     if seed is not None:
         torch.manual_seed(seed)
 
     _, _, h, w = ref_image.shape
 
-    target_h = max(window_size, ((h + stride - 1) // stride) * stride) + stride
-    target_w = max(window_size, ((w + stride - 1) // stride) * stride) + stride
+    # Frame the canvas inside the geometry the model was actually trained on (frame_height).
+    # Height grows with SYNTHESISED BACKGROUND rather than reflection: reflecting to reach a
+    # target height mirror-tiles the fibre - 3.5x over for a 55px crop, back when the height
+    # was padded to fit the window rather than the other way round - and then asks the model
+    # to edit a hall of mirrors. See framing.py.
+    frame_h = frame_height(h)
+    top_offset = (frame_h - h) // 2
+    padded_ref = pad_height_background(ref_image, frame_h, jitter=0.0) if frame_h > h else ref_image
+    # Width: reflection here is safe (it keeps the centreline single-valued - framing.py) and
+    # is now used only to reach the next multiple of 16, or the trained minimum width for a
+    # crop narrower than anything the model has seen.
+    target_w = max(TRAIN_MIN_W, ((w + 15) // 16) * 16)
+    padded_ref = mirror_pad_width(padded_ref, target_w)
+    target_h = padded_ref.shape[2]
 
-    padded_ref = safe_mirror_pad_4d(ref_image, target_h, target_w)
+    # One window over the whole crop whenever it fits the trained width band; a wider crop
+    # slides a trained-width window across it with 50% overlap.
+    win_w = min(target_w, TRAIN_MAX_W if window_size is None else window_size)
+    starts = plan_window_starts(target_w, win_w, win_w // 2 if stride is None else stride)
 
-    t_start = 1.0 - denoising_strength
-    noise = torch.randn_like(padded_ref)
-    x = (1 - t_start) * noise + t_start * padded_ref
+    # A SOURCE-CONDITIONED checkpoint (model.py, in_channels == 2) is trained on the editing
+    # task itself: the reference goes in through its own input channel, clean, at every step.
+    # So the trajectory starts from PURE NOISE and runs the whole way - there is no anchor to
+    # set a level for and `denoising_strength` does not apply. That is the point of it: mixing
+    # the source into the noise (SDEdit, below) made one knob govern both how much texture is
+    # redrawn and how far the geometry may move, and no setting satisfied both - at strength
+    # 0.8 the requested waviness was reached but the fibre was lost in 16% of columns, and at
+    # 0.7 the fibre was perfect at 6px of a 10.7px request. Starting from noise also means the
+    # old straight filament is never present to be half-erased, which is what produced the
+    # gaps and ghosting.
+    # The geometry canvas has to go through the SAME two framing operations the image does,
+    # or the curve stops lining up with the pixels it describes. Height grows with zeros
+    # rather than synthesised background: a blank row means "no fibre requested here", which
+    # is exactly true of rows the request never covered.
+    geometry_canvas = None
+    if geometry is not None and getattr(model, "geometry_conditioned", False):
+        geometry_canvas = geometry
+        if frame_h > geometry_canvas.shape[2]:
+            padded = torch.zeros(1, 1, frame_h, geometry_canvas.shape[3],
+                                 device=geometry_canvas.device)
+            padded[:, :, top_offset:top_offset + geometry_canvas.shape[2], :] = geometry_canvas
+            geometry_canvas = padded
+        geometry_canvas = mirror_pad_width(geometry_canvas, target_w)
+
+    source_canvas = padded_ref if getattr(model, "source_conditioned", False) else None
+    if source_canvas is not None:
+        t_start = 0.0
+        x = torch.randn_like(padded_ref)
+    else:
+        t_start = 1.0 - denoising_strength
+        noise = torch.randn_like(padded_ref)
+        x = (1 - t_start) * noise + t_start * padded_ref
 
     start_step = int(t_start * num_steps)
-    mask = create_blending_mask(window_size, ref_image.device)
+    # one full-height window, sliding horizontally only: no vertical taper needed
+    mask = create_blending_mask(target_h, win_w, ref_image.device, taper_h=False,
+                                taper_w=len(starts) > 1)
 
     def compute_v_dir(x_in, step_idx):
         """Velocity field at (x_in, t=step_idx/num_steps), blended across sliding windows."""
@@ -232,18 +423,27 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
         v_target_global = torch.zeros_like(x_in)
         weight_global = torch.zeros_like(x_in)
 
-        for y in range(0, target_h - window_size + 1, stride):
-            for x_idx in range(0, target_w - window_size + 1, stride):
-                x_patch = x_in[:, :, y:y+window_size, x_idx:x_idx+window_size]
+        for x_idx in starts:
+            x_patch = x_in[:, :, :, x_idx:x_idx+win_w]
+            src_patch = (None if source_canvas is None
+                         else source_canvas[:, :, :, x_idx:x_idx+win_w])
+            # The same curve goes to both branches - see the docstring.
+            geo_patch = (None if geometry_canvas is None
+                         else geometry_canvas[:, :, :, x_idx:x_idx+win_w])
 
-                v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
-                                              rescale=ph_rescale)
-                v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
-                                              rescale=ph_rescale, lam_override=ph_lambda)
+            v_src_patch = velocity_for_pH(model, x_patch, t, source_pH,
+                                          rescale=ph_rescale, waviness=source_waviness,
+                                          source=src_patch, period=source_period,
+                                          ripple=source_ripple, geometry=geo_patch)
+            v_tgt_patch = velocity_for_pH(model, x_patch, t, target_pH,
+                                          rescale=ph_rescale, lam_override=ph_lambda,
+                                          waviness=target_waviness, source=src_patch,
+                                          period=target_period, ripple=target_ripple,
+                                          geometry=geo_patch)
 
-                v_source_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_src_patch * mask
-                v_target_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += v_tgt_patch * mask
-                weight_global[:, :, y:y+window_size, x_idx:x_idx+window_size] += mask
+            v_source_global[:, :, :, x_idx:x_idx+win_w] += v_src_patch * mask
+            v_target_global[:, :, :, x_idx:x_idx+win_w] += v_tgt_patch * mask
+            weight_global[:, :, :, x_idx:x_idx+win_w] += mask
 
         v_source = v_source_global / weight_global.clamp(min=1e-8)
         v_target = v_target_global / weight_global.clamp(min=1e-8)
@@ -263,23 +463,33 @@ def edit_image(model, ref_image, source_pH, target_pH, denoising_strength=0.5,
         else:
             raise ValueError(f"Unknown solver: {solver!r} (expected 'euler' or 'heun')")
 
-    x_cropped = x[:, :, :h, :w]
+    x_cropped = x[:, :, top_offset:top_offset + h, :w]
 
     out = (x_cropped.clamp(-1, 1) + 1) / 2
 
     return apply_contrast(out, contrast, contrast_mode)
 
 def visualize_difference(original_tensor, edited_tensor, original_size, source_pH, target_pH):
-    """Visualizes the difference between the original and edited images."""
+    """Visualizes the difference between the original and edited images.
+
+    An above-range target pH can grow the edited canvas taller than the source (ph_warp
+    extends the frame to fit waviness a thin crop has no room for) - the diff map only
+    makes sense over pixels the two share, so it's taken from a centered crop of the taller
+    image rather than assuming matching shapes.
+    """
     orig_w, orig_h = original_size
     orig_crop = original_tensor[:, :, :orig_h, :orig_w]
-    edit_crop = edited_tensor[:, :, :orig_h, :orig_w]
-    
+    edit_crop = edited_tensor[:, :, :, :orig_w]
+
     orig_img = (orig_crop.squeeze().cpu() + 1) / 2
     edit_img = edit_crop.squeeze().cpu()
-    
-    diff_map = torch.abs(orig_img - edit_img)
-    
+
+    if edit_img.shape[0] == orig_img.shape[0]:
+        diff_map = torch.abs(orig_img - edit_img)
+    else:
+        top = (edit_img.shape[0] - orig_img.shape[0]) // 2
+        diff_map = torch.abs(orig_img - edit_img[top:top + orig_img.shape[0]])
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
     # original
@@ -309,7 +519,7 @@ def main():
                         help=f"Target pH. Values outside the trained range {PH_MIN}-{PH_MAX} "
                              "are reached by extrapolating along the acidic->alkaline "
                              "direction; see ph_control.py")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cfm_best_ema.pt", help="Path to the model checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=CHECKPOINT_PATH, help="Path to the model checkpoint")
     parser.add_argument("--strength", type=float, default=0.65, help="Editing strength [0.0 - 1.0] (corresponds to noise level)")
     parser.add_argument("--contrastive_scale", type=float, default=3.0, help="Contrastive scale for editing")
     parser.add_argument("--num_steps", type=int, default=100, help="Number of steps for editing")
@@ -323,6 +533,33 @@ def main():
                              "default - it modifies the source anchor. Writes a before/after "
                              "diagnostic next to the result.")
     parser.add_argument("--solver", type=str, default="heun", choices=["euler", "heun"], help="ODE solver for the editing trajectory")
+    parser.add_argument("--waviness_mode", type=str, default="relative",
+                        choices=["relative", "absolute"],
+                        help="Whose waviness the target pH sets. 'relative' (default) scales "
+                             "THIS filament's own excursion by the ratio the fitted law "
+                             "predicts between source and target pH - so an X->X edit is the "
+                             "identity and a flat crop stays relatively flat. 'absolute' "
+                             "targets the population average at the requested pH, which "
+                             "discards the individual filament: real crops at one pH span "
+                             "0.69-9.33px around a 4.12px mean, so roughly half of them get "
+                             "BENT even when the request lowers the pH.")
+    parser.add_argument("--geometry_mode", type=str, default="auto",
+                        choices=["auto", "warp", "native"],
+                        help="'auto' (default) follows the checkpoint: a geometry-conditioned "
+                             "one (in_channels==3) gets 'native', anything older gets 'warp'. "
+                             "'native' hands the model the target CURVE as a third input "
+                             "channel and lets it draw every pixel - no pixel warping at all, "
+                             "and pH stays inside its trained range because the shape arrives "
+                             "as geometry rather than as an out-of-range pH. "
+                             "'warp' holds the fibre still while the model "
+                             "re-renders pH texture, then moves REAL PIXELS into the "
+                             "requested shape - a broadband displacement carrying the "
+                             "requested waviness and ripple. Use it: the fibre keeps the "
+                             "source's contrast and continuity because it is the source's "
+                             "own fibre, but the shape is imposed outside the network. On a "
+                             "pre-geometry checkpoint 'native' falls back to driving shape "
+                             "through the waviness/ripple SCALARS, which state how much wave "
+                             "but never where - keep that for comparison only.")
 
     args = parser.parse_args()
     
@@ -334,15 +571,26 @@ def main():
         print(f"Reference image {args.ref_image} not found. Please check the provided path.")
         return
 
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+    model = from_state_dict(torch.load(args.checkpoint, map_location=DEVICE), DEVICE)
     model.eval()
     
     os.makedirs("outputs_img2img", exist_ok=True)
     
     ref_image, original_size = load_and_preprocess_image(args.ref_image)
     print(f"Loaded image with original resolution: {original_size[0]}x{original_size[1]}")
-    print(describe_pH(args.target_pH))
+    if getattr(model, "source_conditioned", False):
+        print(f"Source-conditioned checkpoint: the reference goes in through its own input "
+              f"channel and the trajectory starts from pure noise, so --strength "
+              f"({args.strength:g}) is ignored.")
+    # Resolve "auto" the same way ph_warp.edit_to_pH will, so the description matches the
+    # mechanism that is actually about to run - describing the wrong one is worse than
+    # describing neither (see ph_control.describe).
+    resolved_mode = args.geometry_mode
+    if resolved_mode == "auto":
+        resolved_mode = ("native" if getattr(model, "geometry_conditioned", False)
+                         else "warp")
+    print(describe_pH(args.target_pH, geometry_mode=resolved_mode,
+                      geometry_channel=getattr(model, "geometry_conditioned", False)))
 
     display_ref = ref_image
     if args.repair_gaps:
@@ -357,26 +605,102 @@ def main():
         else:
             print("No repairable fibre gaps detected - anchor left unchanged.")
 
-    edited_img = edit_image(
-        model=model, 
-        ref_image=ref_image, 
-        source_pH=args.source_pH,  
-        target_pH=args.target_pH, 
-        denoising_strength=args.strength, 
+    edited_img, edit_info = edit_to_pH(
+        model=model,
+        ref_image=ref_image,
+        source_pH=args.source_pH,
+        target_pH=args.target_pH,
+        denoising_strength=args.strength,
         num_steps=args.num_steps,
-        contrastive_scale=args.contrastive_scale,         
+        contrastive_scale=args.contrastive_scale,
         seed=args.seed,
         contrast=args.contrast,
         solver=args.solver,
-        contrast_mode=args.contrast_mode
+        contrast_mode=args.contrast_mode,
+        extend_frame=True,
+        geometry_mode=args.geometry_mode,
+        waviness_mode=args.waviness_mode,
     )
+    if edit_info.get("mode") == "warp":
+        if edit_info.get("warped"):
+            grown = edited_img.shape[2] - ref_image.shape[2]
+            achieved = edit_info.get("achieved")
+            detail = f"achieved rms {achieved:.1f}px" if achieved is not None else \
+                     f"applied rms {edit_info.get('applied_rms', 0.0):.1f}px"
+            extra = f", canvas grew {grown}px to fit it" if grown > 0 else ""
+            print(f"Geometric pH warp applied: target waviness {edit_info.get('target', 0.0):.1f}px "
+                  f"({detail}{extra})")
+            # The ripple half of the request. Reported next to the total because the total
+            # alone cannot distinguish one frame-wide arc from many small waves, and telling
+            # them apart is the whole reason the warp is broadband.
+            tgt_r, got_r = edit_info.get("target_ripple"), edit_info.get("achieved_ripple")
+            if tgt_r is not None:
+                got = f" -> {got_r:.1f}px" if got_r is not None else ""
+                print(f"  Fine undulation (24-96px band): {edit_info.get('current_ripple') or 0.0:.1f}px "
+                      f"on the source, {tgt_r:.1f}px requested{got}")
+            if edit_info.get("fit_scale", 1.0) < 0.999:
+                print(f"  Note: source crop limited the warp to "
+                      f"{edit_info['fit_scale'] * 100:.0f}% of the requested displacement.")
+            target_rms = edit_info.get("target") or 0.0
+            if achieved is not None and target_rms and achieved < 0.7 * target_rms:
+                # Not a bug and not a bad seed: a displacement steep enough to reach a very
+                # large request tears the texture under grid_sample, so ph_warp backs the
+                # amplitude off against WARP_MAX_SLOPE. Far above pH 8.8 the fitted law asks
+                # for more excursion than a crop this tall can carry cleanly, and what comes
+                # out is the steepest clean warp rather than the requested one.
+                print(f"  Note: only {achieved / target_rms * 100:.0f}% of the requested "
+                      f"waviness was reachable without over-steepening the warp - the law "
+                      f"asks for more than a {ref_image.shape[2]}px-tall crop can carry.")
+        else:
+            print("No geometric pH warp applied: the fibre could not be confidently traced "
+                  "in this crop, so the result is left at the pH 5.8/8.8 anchor edit.")
+    elif edit_info.get("geometry") == "curve":
+        # The geometry-channel path: the model drew every pixel, following the curve it was
+        # handed. Three numbers matter and they are different things - what the fitted law
+        # asked for, what curve was actually synthesised for it, and what the model then drew.
+        # Reporting the middle one separately is what distinguishes "the plan fell short" from
+        # "the model did not follow the plan".
+        rendered = edit_info.get("rendered")
+        grown = edit_info.get("canvas_grew", 0)
+        extra = f", canvas grew {grown}px to fit it" if grown else ""
+        basis = ("scaled from this crop" if args.waviness_mode == "relative"
+                 else "population average")
+        print(f"Geometry channel: pH {args.target_pH:g} calls for "
+              f"{edit_info.get('target', 0.0):.1f}px of centreline rms ({basis}); "
+              f"curve synthesised at "
+              f"{edit_info.get('achieved') or 0.0:.1f}px"
+              + (f", model drew {rendered:.1f}px" if rendered is not None else "")
+              + extra)
+        r_t, r_g = edit_info.get("target_ripple"), edit_info.get("rendered_ripple")
+        if r_t is not None:
+            print(f"  Fine undulation (24-96px band): {r_t:.1f}px requested"
+                  + (f" -> {r_g:.1f}px drawn" if r_g is not None else ""))
+        planned = edit_info.get("achieved")
+        # The 2px floor keeps this quiet on straightening requests: at a planned 0.5px the
+        # tracer's own noise is larger than the shortfall being complained about (a
+        # dead-straight fibre already measures ~0.7px in the sub-24px band), so a relative
+        # threshold alone cries wolf on every request below the trained range.
+        if rendered is not None and planned and planned > 2.0 and rendered < 0.7 * planned:
+            print("  Note: the model fell well short of the curve it was given - that is a "
+                  "model failure, not a planning one. Re-run with a different --seed, and "
+                  "check the geometry conditioning gap in outputs/training_loss.csv.")
+    elif edit_info.get("mode") == "native":
+        achieved = edit_info.get("achieved")
+        got = f", achieved {achieved:.1f}px" if achieved is not None else ""
+        print(f"Native waviness conditioning applied (SCALAR path - pre-geometry checkpoint): "
+              f"{edit_info.get('source_waviness', 0.0):.1f}px "
+              f"measured on the reference -> {edit_info.get('target_waviness', 0.0):.1f}px requested"
+              f"{got}")
+        if achieved is not None and achieved < 0.6 * edit_info.get("target_waviness", 0.0):
+            print("  Note: well short of the request. The anchored edit varies a lot with the "
+                  "noise draw - re-run with a different --seed before concluding anything.")
 
     # compare against the unrepaired source - the repair is an input-side aid, not a result
     visualize_difference(display_ref, edited_img, original_size, source_pH=args.source_pH, target_pH=args.target_pH)
-    
+
     orig_w, orig_h = original_size
-    edited_crop_for_save = edited_img[:, :, :orig_h, :orig_w]
-    
+    edited_crop_for_save = edited_img[:, :, :, :orig_w]
+
     save_path = f"outputs_img2img/edited_pH_{args.target_pH}_str_{args.strength}.png"
     vutils.save_image(edited_crop_for_save, save_path, nrow=1)
     print(f"Result saved to: {save_path}")

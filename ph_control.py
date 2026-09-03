@@ -40,6 +40,7 @@ to the lambda that reproduces the physically extrapolated waviness. Constants li
 ph_calibration.json so a new checkpoint can be recalibrated without touching this file.
 """
 import json
+import math
 import os
 
 import torch
@@ -55,12 +56,56 @@ CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Fallbacks used only when ph_calibration.json is absent. WAVINESS_* describe the real
 # data; LAMBDA_PER_PX is how much lambda buys one pixel of extra RMS excursion.
+#
+# Two separate waviness fits, at two different scales, because predicted_waviness() and
+# predicted_waviness_native() feed two mechanisms that measure waviness completely
+# differently:
+#   - ph_warp.py's geometric warp compares its target against waviness() measured on the
+#     WHOLE real reference image - waviness_slope/intercept, unchanged, whole-image scale.
+#   - native conditioning (model.py's WavinessEmbedding) is trained on per-crop labels
+#     (train.py's dynamic_collate_fn: a random TRAIN_SIZES crop, flips, jitter) -
+#     native_waviness_slope/intercept, fit the same way, on that same scale.
+# Measured directly, the two scales differ by roughly 1.4x, so feeding a whole-image-scale
+# number to native conditioning systematically undershoots what the model was trained to
+# respond to. The native fit's R^2 (~0.09) is low in absolute terms because an individual
+# small crop is noisy around the pH trend the way any small random window is - but its
+# per-bucket means climb monotonically across the real range (4.2 -> 7.6px from pH 5.8 to
+# 8.8 over n>1000 crops), which is what the slope is actually being fit to.
+#
+# NOTE ON RANGE. The training distribution these feed reaches ~20px of waviness (see
+# train.py's WARP_AUG_MAX_WAVINESS and the frame-height limits above TRAIN_SIZES), so
+# native conditioning has real support up to about pH 16. predicted_waviness_native(20)
+# asks for ~25px, which is past anything the model has seen; above roughly pH 16-17 the
+# geometric warp (geometry_mode="warp") remains the mechanism with actual coverage.
+#
+# Re-run calibrate_ph.py after training a new checkpoint for the current fit of both;
+# these are the same-methodology numbers to fall back on until then.
 _DEFAULTS = {
-    "waviness_slope": 1.093,      # rms_dev = slope*pH + intercept, fitted over 277 crops
+    "waviness_slope": 1.093,        # rms_dev = slope*pH + intercept, whole-image scale
     "waviness_intercept": -3.108,
+    "native_waviness_slope": 1.5258,   # same relationship, per-crop training scale
+    "native_waviness_intercept": -5.4576,
     "lambda_gain": 1.0,           # 1.0 = the natural "range-widths past the anchor" scale
     "max_lambda": 3.0,
+    # Dominant undulation period vs pH. Exponential by default rather than linear: the period
+    # FALLS with pH (measured spectral peak 336px at pH 6.8 down to 136px at 8.8), and a
+    # straight line through falling data reaches zero and then goes negative - this fit
+    # crosses zero at no pH at all. calibrate_ph.py re-selects the form from the data anyway;
+    # these coefficients are ph_warp.py's original log-linear fit, kept as the fallback.
+    "period_law": {"form": "exponential", "coeffs": [-0.2477, 7.142]},
+    # Fine-undulation rms vs pH, per-crop scale, fitted the same way as the native waviness
+    # law over the same windows: ripple = 0.9224*pH - 3.368 (2.14px at pH 5.8 rising to
+    # 4.18px at 8.8). calibrate_ph.py re-fits and re-selects the form; this is the
+    # same-methodology fallback.
+    "ripple_law": {"form": "linear", "coeffs": [0.9224, -3.368]},
 }
+
+# What share of the total excursion is fine undulation, if no ripple law is available at all.
+# Measured per pH bucket over the dataset the share is strikingly flat - 0.66 / 0.58 / 0.50 /
+# 0.72 / 0.68 / 0.64 / 0.61 from pH 5.8 to 8.8 - so a single constant is a sound fallback and
+# an old ph_calibration.json degrades to "keep the real data's average split" rather than to
+# an unconstrained one.
+DEFAULT_RIPPLE_FRACTION = 0.61
 
 
 def _calibration():
@@ -68,6 +113,114 @@ def _calibration():
         with open(CALIBRATION_PATH) as fh:
             return {**_DEFAULTS, **json.load(fh)}
     return dict(_DEFAULTS)
+
+
+# ---------------------------------------------------------------------------------------
+# The pH -> waviness law. Its FUNCTIONAL FORM is chosen from the data rather than assumed,
+# because the choice is unconstrained inside the trained range and dominates everything
+# outside it: linear and exponential fits of the real crops are statistically
+# indistinguishable over 5.8-8.8 (R^2 0.812 vs 0.798 on bucket means) yet differ by 1.67x at
+# pH 12.8 and 6x at pH 20. Assuming one would be picking the answer rather than measuring it.
+#
+# Selection is by HELD-OUT EXTRAPOLATION error, not by in-sample fit: each form is refitted
+# with an end bucket removed and scored on how well it predicts that bucket's mean. That
+# tests the only thing we actually use the law for. Measured on the current dataset:
+#
+#     form           R^2 (all crops)   hold-out 8.8   hold-out 5.8   mean |err|
+#     linear             0.087            0.865          0.880          0.872   <- winner
+#     exponential       -0.041            0.348          1.922          1.135
+#     quadratic          0.087            6.051          2.499          4.275
+#
+# Quadratic fits in-sample as well as linear and extrapolates disastrously, which is the
+# whole reason the criterion is held-out rather than R^2.
+WAVINESS_FORMS = ("linear", "exponential", "quadratic")
+
+# The training distribution reaches WARP_AUG_MAX_WAVINESS (26px, see train.py), so a request
+# past that asks for geometry the model has never been shown. Extrapolated laws are clamped
+# here rather than allowed to run away - an exponential law would ask for 152px at pH 20.
+MAX_SUPPORTED_WAVINESS = 26.0
+
+# Undulation period, in pixels. LEGACY - only the _pair generation of the checkpoint has a
+# period channel, and measured on it that channel turned out to carry no usable response at
+# all (0.05-0.15% velocity change across the whole 50-400px range). predicted_ripple() is
+# what drives the geometry's second axis now.
+MIN_SUPPORTED_PERIOD, MAX_SUPPORTED_PERIOD = 50.0, 400.0
+
+# Fine-undulation rms, in pixels. Bounded below by 0 (a perfectly smooth arc) and above by
+# MAX_SUPPORTED_WAVINESS, since the ripple is a component of the total and cannot exceed it.
+MAX_SUPPORTED_RIPPLE = MAX_SUPPORTED_WAVINESS
+
+
+def _fit_form(form, ph, w):
+    """Least-squares coefficients for one candidate form. numpy is imported lazily so this
+    module stays cheap to import for the inference path, which only ever evaluates."""
+    import numpy as np
+    ph = np.asarray(ph, dtype=float)
+    w = np.asarray(w, dtype=float)
+    if form == "linear":
+        return np.polyfit(ph, w, 1).tolist()
+    if form == "exponential":
+        # fitted in log space, so it can never predict a negative waviness
+        return np.polyfit(ph, np.log(np.clip(w, 1e-3, None)), 1).tolist()
+    if form == "quadratic":
+        return np.polyfit(ph, w, 2).tolist()
+    raise ValueError(f"Unknown waviness law form: {form!r} (expected one of {WAVINESS_FORMS})")
+
+
+def eval_law(law, pH):
+    """Evaluate a stored {"form": ..., "coeffs": [...]} law at one pH."""
+    form, c = law["form"], law["coeffs"]
+    if form == "linear":
+        return c[0] * pH + c[1]
+    if form == "exponential":
+        return math.exp(c[0] * pH + c[1])
+    if form == "quadratic":
+        return c[0] * pH * pH + c[1] * pH + c[2]
+    raise ValueError(f"Unknown waviness law form: {form!r} (expected one of {WAVINESS_FORMS})")
+
+
+def fit_waviness_law(ph, w, forms=WAVINESS_FORMS):
+    """Pick the functional form the data supports, and return (law, diagnostics).
+
+    ph/w are per-measurement (NOT per-bucket) so well-sampled pH levels carry more weight,
+    matching how the old single-form fit worked. Scoring is the mean absolute error on the
+    two end buckets when each is held out of the fit - see this section's header.
+    """
+    import numpy as np
+    ph = np.asarray(ph, dtype=float)
+    w = np.asarray(w, dtype=float)
+    keep = w > 0
+    ph, w = ph[keep], w[keep]
+    buckets = np.unique(ph)
+    means = {float(b): float(w[ph == b].mean()) for b in buckets}
+
+    diagnostics = {}
+    for form in forms:
+        coeffs = _fit_form(form, ph, w)
+        law = {"form": form, "coeffs": coeffs}
+        pred = np.array([eval_law(law, float(p)) for p in ph])
+        r2 = float(1 - ((w - pred) ** 2).sum() / ((w - w.mean()) ** 2).sum())
+        errors = []
+        for held in (float(buckets[-1]), float(buckets[0])):
+            mask = ph != held
+            if len(np.unique(ph[mask])) < 3:      # not enough levels left to refit
+                continue
+            held_law = {"form": form, "coeffs": _fit_form(form, ph[mask], w[mask])}
+            errors.append(abs(eval_law(held_law, held) - means[held]))
+        diagnostics[form] = {"coeffs": coeffs, "r2": r2,
+                             "holdout_error": float(np.mean(errors)) if errors else float("inf")}
+
+    best = min(diagnostics, key=lambda f: diagnostics[f]["holdout_error"])
+    return {"form": best, "coeffs": diagnostics[best]["coeffs"]}, diagnostics
+
+
+def _law(cal, key, legacy_slope, legacy_intercept):
+    """The stored law, falling back to the pre-law slope/intercept pair for older
+    ph_calibration.json files (and, through _DEFAULTS, to the hardcoded constants)."""
+    law = cal.get(key)
+    if isinstance(law, dict) and "form" in law:
+        return law
+    return {"form": "linear", "coeffs": [cal[legacy_slope], cal[legacy_intercept]]}
 
 
 def normalize_pH(pH):
@@ -78,13 +231,71 @@ def normalize_pH(pH):
 
 def predicted_waviness(pH):
     """RMS centreline excursion in pixels that a real filament at this pH would have,
-    from the linear fit over the measured dataset, continued past the ends.
+    from the fitted pH->waviness law over the measured dataset, continued past the ends.
+    The law's functional form is chosen from the data - see WAVINESS_FORMS.
+
+    Whole-image scale - use this for ph_warp.py's geometric warp, which measures its
+    `current` waviness the same way. For the model's native waviness conditioning, use
+    predicted_waviness_native() instead; the two are NOT interchangeable, see _DEFAULTS.
 
     Floored at 0.5px: the straight-line fit crosses zero near pH 2.8 and would go negative
     below that, but even a perfectly straight filament traces with some excursion.
     """
     cal = _calibration()
-    return max(0.5, cal["waviness_slope"] * pH + cal["waviness_intercept"])
+    law = _law(cal, "waviness_law", "waviness_slope", "waviness_intercept")
+    return min(MAX_SUPPORTED_WAVINESS, max(0.5, eval_law(law, pH)))
+
+
+def predicted_waviness_native(pH):
+    """Same relationship as predicted_waviness(), fit on the per-crop training scale
+    instead of the whole-image one - see _DEFAULTS for why the two must stay separate.
+    This is the one to feed model.py's WavinessEmbedding (via velocity_for_pH's/
+    edit_image's `waviness` argument); predicted_waviness() would systematically
+    undershoot what the model was actually trained to respond to.
+    """
+    cal = _calibration()
+    law = _law(cal, "native_waviness_law", "native_waviness_slope", "native_waviness_intercept")
+    return min(MAX_SUPPORTED_WAVINESS, max(0.5, eval_law(law, pH)))
+
+
+def predicted_period(pH):
+    """Dominant undulation period in pixels that a real filament at this pH would have.
+
+    The companion to predicted_waviness_native: waviness says how FAR the centreline strays,
+    this says how OFTEN it turns. Both are needed because rms alone is degenerate - one arc
+    across the crop and ten waves of the same amplitude score identically - and a model given
+    only the rms draws the cheapest option, which is the single arc.
+
+    Clamped to the range the augmentation actually populates; outside it the model has been
+    shown no geometry, and above the editing frame's own width a "period" is just an arc.
+    """
+    cal = _calibration()
+    law = cal.get("period_law", _DEFAULTS["period_law"])
+    return min(MAX_SUPPORTED_PERIOD, max(MIN_SUPPORTED_PERIOD, eval_law(law, pH)))
+
+
+def predicted_ripple(pH):
+    """How much of the excursion should be FINE undulation (waviness.ripple_rms, 24-96px).
+
+    The second half of the geometry request, and the half that decides whether the result
+    looks like a real filament or like one big S-curve. Measured over the dataset the ripple
+    rms rises with pH much as the total does - 2.14px at pH 5.8 to 4.18px at pH 8.8 - so the
+    ratio stays near 0.6 throughout and asking for the total alone leaves that split
+    completely unconstrained. It is exactly that unconstrained split that the
+    period-conditioned checkpoint got wrong: for a pH 8.8 request it produced 8.60px of
+    centreline rms in the 96-192px band against real crops' 2.75, and 0.73px in 24-48px
+    against real crops' 2.83.
+
+    Falls back to the ratio implied by _DEFAULTS when ph_calibration.json predates this law,
+    so an old calibration file degrades to "keep the real data's average split" rather than
+    to nothing.
+    """
+    cal = _calibration()
+    law = cal.get("ripple_law")
+    if law is None:
+        return min(MAX_SUPPORTED_RIPPLE,
+                   max(0.0, DEFAULT_RIPPLE_FRACTION * predicted_waviness_native(pH)))
+    return min(MAX_SUPPORTED_RIPPLE, max(0.0, eval_law(law, pH)))
 
 
 def ph_to_lambda(pH_query):
@@ -109,11 +320,11 @@ def ph_to_lambda(pH_query):
     return float(max(-limit, min(limit, lam)))
 
 
-def anchor_velocities(model, x, t):
+def anchor_velocities(model, x, t, source=None):
     """The velocity fields at the two ends of the trained range."""
     lo = torch.full((x.shape[0],), normalize_pH(PH_ANCHOR_LO), device=x.device)
     hi = torch.full((x.shape[0],), normalize_pH(PH_ANCHOR_HI), device=x.device)
-    return model(x, t, lo), model(x, t, hi)
+    return model(x, t, lo, source=source), model(x, t, hi, source=source)
 
 
 def extrapolate(v_lo, v_hi, lam, rescale=True):
@@ -132,33 +343,105 @@ def extrapolate(v_lo, v_hi, lam, rescale=True):
     return v
 
 
-def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None):
+def velocity_for_pH(model, x, t, pH_query, rescale=True, lam_override=None, waviness=None,
+                    source=None, period=None, ripple=None, geometry=None):
     """Velocity field at any pH, extrapolating beyond the trained range when needed.
 
     Inside [5.8, 8.8] this is a single ordinary conditional model call and behaves exactly
-    as before. Outside, it costs two calls and blends them.
+    as before. Outside, it costs two calls and blends them (embedding-space extrapolation) -
+    UNLESS `waviness` is given, which takes over instead: pH is pinned to the nearest
+    trained anchor (texture/chemistry fidelity) and the requested geometry goes straight
+    into the model's own waviness conditioning (see model.py's WavinessEmbedding), which -
+    unlike this function's embedding-space extrapolation - has no periodic component to
+    alias and was built specifically to extrapolate past its training range without
+    wrapping. Requires a checkpoint trained with the waviness-conditioned ConditionalUNet;
+    a checkpoint predating that silently ignores `waviness` via forward()'s default (None),
+    so this argument is always safe to pass, it just does nothing on an old checkpoint.
+
+    `source` is the image being edited, for a source-conditioned checkpoint (model.py's
+    in_channels == 2). A 1-channel model ignores it, so it is always safe to pass too. So are
+    `ripple` (the fine-undulation half of the geometry request) and `period` (the legacy
+    channel it replaced): a checkpoint without either simply drops it.
+
+    `geometry` is the target centreline rendered as pixels (waviness.centreline_map), for an
+    in_channels == 3 checkpoint. When it is supplied the pH anchoring above matters more,
+    not less: the whole point is that the SHAPE arrives as pixels, so pH never has to leave
+    the range its Fourier embedding is valid over. Passing `geometry` therefore also pins pH
+    to the nearest anchor, exactly as `waviness` does, and for the same reason.
     """
+    if geometry is not None and waviness is None:
+        # geometry alone is a complete request - pin pH to its anchor and hand the curve over
+        anchor = min(max(pH_query, PH_MIN), PH_MAX)
+        ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
+        rip = (None if ripple is None
+               else torch.full((x.shape[0],), float(ripple), device=x.device))
+        return model(x, t, ph, None, source=source, ripple=rip, geometry=geometry)
+    if waviness is not None:
+        anchor = min(max(pH_query, PH_MIN), PH_MAX)
+        ph = torch.full((x.shape[0],), normalize_pH(anchor), device=x.device)
+        wav = torch.full((x.shape[0],), float(waviness), device=x.device)
+        per = (None if period is None
+               else torch.full((x.shape[0],), float(period), device=x.device))
+        rip = (None if ripple is None
+               else torch.full((x.shape[0],), float(ripple), device=x.device))
+        return model(x, t, ph, wav, source=source, period=per, ripple=rip,
+                     geometry=geometry)
     lam = ph_to_lambda(pH_query) if lam_override is None else lam_override
     if lam == 0.0:
         ph = torch.full((x.shape[0],), normalize_pH(pH_query), device=x.device)
-        return model(x, t, ph)
-    v_lo, v_hi = anchor_velocities(model, x, t)
+        return model(x, t, ph, source=source)
+    v_lo, v_hi = anchor_velocities(model, x, t, source=source)
     return extrapolate(v_lo, v_hi, lam, rescale=rescale)
 
 
-def describe(pH_query):
+def describe(pH_query, geometry_mode="warp", geometry_channel=False):
     """One-line summary for CLI output, so an extrapolated request is never silent.
 
-    Which mechanism applies depends on the direction, because they were measured to work
-    asymmetrically - see ph_warp.py for the numbers behind that split.
+    geometry_mode must match whatever the caller is actually about to run (img2img.py's and
+    sample.py's own --geometry_mode) - this function has no way to know which mechanism was
+    selected otherwise, and describing the wrong one is worse than describing neither. Which
+    mechanism applies inside "warp"/"embedding" mode depends on the direction, because those
+    were measured to work asymmetrically - see ph_warp.py for the numbers behind that split.
+    "native" is symmetric across direction (it's the same conditioning pathway either way)
+    and its response has been measured monotonic in the request; it has real training
+    support to about pH 16 (see _DEFAULTS), above which "warp" is the mechanism with
+    actual data behind it.
+
+    Note that "warp" no longer means "velocity extrapolation below 5.8": editing clamps to
+    the nearest anchor and reshapes pixels in BOTH directions, because velocity
+    extrapolation is smothered by the img2img anchor going acidic and points the wrong way
+    going alkaline. sample.py, which has no anchor, is the one caller for which the acidic
+    velocity path is real - and it passes geometry_mode="native"/its own flag, not this
+    branch. See ph_warp.edit_to_pH.
     """
     if PH_ANCHOR_LO <= pH_query <= PH_ANCHOR_HI:
+        if geometry_mode == "native" and geometry_channel:
+            return (f"pH {pH_query:g} is inside the trained range - direct conditioning for "
+                    f"texture, and the shape handed to the model as a curve to draw")
+        if geometry_mode == "warp":
+            return (f"pH {pH_query:g} is inside the trained range - direct conditioning for "
+                    f"texture, geometric warp for shape")
         return f"pH {pH_query:g} is inside the trained range - direct conditioning"
-    if pH_query < PH_ANCHOR_LO:
-        return (f"pH {pH_query:g} is BELOW the trained range [{PH_ANCHOR_LO:g}, "
-                f"{PH_ANCHOR_HI:g}] - extrapolating the velocity field past the acidic "
-                f"anchor with lambda={ph_to_lambda(pH_query):.2f} (straighter)")
-    return (f"pH {pH_query:g} is ABOVE the trained range [{PH_ANCHOR_LO:g}, "
-            f"{PH_ANCHOR_HI:g}] - conditioning at pH {PH_ANCHOR_HI:g}, then imposing "
+    direction = "BELOW" if pH_query < PH_ANCHOR_LO else "ABOVE"
+    if geometry_mode == "native" and geometry_channel:
+        # The geometry-channel checkpoint. Nothing is imposed on pixels and nothing is
+        # extrapolated through the pH embedding: pH is pinned to its anchor for texture and
+        # the shape is handed over as a rendered curve, which lands the request on the
+        # geometry axis where the augmentation has real training support.
+        return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+                f"{PH_ANCHOR_HI:g}] - pH pinned to {min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI):g} "
+                f"for texture, and the shape handed to the model as a CURVE for it to draw "
+                f"(no pixel warping); the requested rms is printed below")
+    if geometry_mode == "native":
+        anchor = min(max(pH_query, PH_ANCHOR_LO), PH_ANCHOR_HI)
+        return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+                f"{PH_ANCHOR_HI:g}] - NATIVE waviness conditioning: anchoring pH at "
+                f"{anchor:g}, targeting {predicted_waviness_native(pH_query):.1f}px "
+                f"directly through the model's own conditioning")
+    anchor = PH_ANCHOR_LO if pH_query < PH_ANCHOR_LO else PH_ANCHOR_HI
+    how = "straightening" if pH_query < PH_ANCHOR_LO else "imposing"
+    return (f"pH {pH_query:g} is {direction} the trained range [{PH_ANCHOR_LO:g}, "
+            f"{PH_ANCHOR_HI:g}] - conditioning at pH {anchor:g}, then {how} "
             f"waviness {predicted_waviness(pH_query):.1f}px geometrically "
-            f"(velocity extrapolation does not work in this direction)")
+            f"(the model does not extrapolate pH usefully in either direction under an "
+            f"img2img anchor)")

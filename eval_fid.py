@@ -3,8 +3,8 @@ import torch
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
 
-from config import DEVICE
-from model import ConditionalUNet
+from config import DEVICE, CHECKPOINT_PATH
+from model import from_state_dict
 from dataset import MicrotubuleDataset
 from sample import sample, normalize_pH  # normalize_pH is used by the model inputs
 from img2img import load_and_preprocess_image
@@ -48,14 +48,14 @@ def warmup_gpu(model, num_runs=5):
     """Run a few warm-up passes so the GPU settles before timed operations."""
     print(f"Running {num_runs} warm-up iterations...")
     model.eval()
-    dummy_x = torch.randn(2, 1, 128, 128, device=DEVICE)
+    dummy_x = torch.randn(2, 1, 64, 256, device=DEVICE)  # a trained frame size, see config.TRAIN_SIZES
     dummy_t = torch.rand(2, device=DEVICE)
     dummy_ph = normalize_pH(torch.tensor([7.0, 7.0])).to(DEVICE)
     
     with torch.no_grad():
         for _ in range(num_runs):
             _ = model(dummy_x, dummy_t, dummy_ph)
-    # bugfix: na stroji bez CUDA (Mac/CPU) by holé synchronize() spadlo
+    # bugfix: on a machine without CUDA (Mac/CPU) a bare synchronize() would crash
     if "cuda" in DEVICE:
         torch.cuda.synchronize()
     print("Hardware warmed up and ready.")
@@ -63,7 +63,6 @@ def warmup_gpu(model, num_runs=5):
 @torch.no_grad()
 def main():
     # 1. Configuration
-    CHECKPOINT_PATH = "./checkpoints/cfm_best_ema.pt"
     DATA_DIR = "./data/cropped/cropped_output"
     TARGET_PH = 8.8  # pH value to evaluate
     BATCH_SIZE = 16
@@ -74,14 +73,13 @@ def main():
         return
 
     # Initialize model
-    model = ConditionalUNet().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model = from_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE), DEVICE)
     model.eval()
 
     # Initialize FID metric
-    # A) feature=64 místo 2048: kovarianci 64x64 jde z desítek vzorků odhadnout
-    #    řádově lépe než 2048x2048. FID i tak zůstává při malém n biased -> ber
-    #    ho relativně, primární metrika je KID (viz DOPORUCENI_METRIKY.md).
+    # A) feature=64 instead of 2048: a 64x64 covariance can be estimated from a few
+    #    dozen samples orders of magnitude better than a 2048x2048 one. FID stays biased
+    #    at small n regardless -> read it only relatively; the primary metric is KID.
     fid = FrechetInceptionDistance(feature=64, normalize=False).to(DEVICE)
 
     # Warm up the model and GPU before we start collecting stats
@@ -102,10 +100,10 @@ def main():
 
     # NOTE: evaluated at NATIVE resolution, one image at a time - not squashed
     # through train.py's val_collate_fn. Real crops are thin strips (median
-    # ~40px tall), so mirror-padding them up to a 128x128 square meant most of
+    # ~40px tall), so mirror-padding them up to a square meant most of
     # each "real" sample was an exact mirrored duplicate of itself, an artifact
-    # the synthetic samples below (generated natively at 128x128, no padding)
-    # never have. FID's built-in Inception extractor resizes every update()
+    # the synthetic samples below (generated natively at sample()'s own 64x256,
+    # a trained frame size, with no padding) never have. FID's built-in Inception extractor resizes every update()
     # call to 299x299 internally regardless of input shape, so per-image native
     # sizes here are fine even though the synthetic batch below is fixed-size.
     for path in tqdm(real_paths, desc="Real data"):
