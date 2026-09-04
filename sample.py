@@ -9,7 +9,7 @@ from ph_control import normalize_pH, velocity_for_pH, predicted_waviness_native,
 @torch.no_grad()
 def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=None,
            solver="heun", guidance_rescale=0.7, geometry_mode="embedding",
-           height=64, width=256):
+           height=64, width=256, on_step=None):
     """Generate samples at any pH.
 
     geometry_mode="embedding" (default): pH_query may lie outside the trained range;
@@ -23,6 +23,11 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
     request in this free-generation setting (there is no reference-image anchor here for it to
     fight, unlike img2img editing). Training support reaches about pH 16.
     Classifier-free guidance applies on top of either mode, unchanged.
+
+    on_step: optional callback on_step(step_index, x) invoked after every integration
+    step with the CURRENT state, still in [-1, 1] and still on DEVICE. Purely an
+    observer - it must not modify x, and the trajectory is identical whether it is
+    passed or not. Used by make_readme_assets.py to film the noise->image trajectory.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -64,6 +69,9 @@ def sample(model, pH_query, num_samples=1, num_steps=1000, cfg_scale=2.0, seed=N
             x = x + 0.5 * (v1 + v2) * dt
         else:
             raise ValueError(f"Unknown solver: {solver!r} (expected 'euler' or 'heun')")
+
+        if on_step is not None:
+            on_step(i + 1, x)
 
     # Denormalize [-1, 1] -> [0, 1]
     return (x.clamp(-1, 1) + 1) / 2
