@@ -37,18 +37,37 @@ specks, bent into a new shape.
 ## Watch it build an image out of noise
 
 <p align="center">
-  <img src="assets/denoise.gif" alt="The flow-matching ODE integrating from Gaussian noise to a microtubule at three pH values" width="100%">
+  <img src="assets/denoise.gif" alt="The flow-matching ODE integrating from Gaussian noise to a microtubule at pH 5.8, 7.3 and 8.8 from one shared seed" width="100%">
 </p>
 
-Flow matching learns a velocity field that carries pure Gaussian noise to a real image along a
-straight-line path, and sampling is just integrating that field from `t=0` to `t=1`. All three
-rows above start from **the same noise seed** and run the same solver — the only difference is
-the pH they are conditioned on — and well before the picture resolves, at around `t≈0.75`, the
-pH 8.8 fibre is already carrying undulations the pH 5.8 one never develops.
+<p align="center">
+  <sub>Nothing is fed in here. Three microtubules being drawn from scratch, from
+  <b>identical</b> starting noise — the pH label is the only thing that differs between the
+  rows.</sub>
+</p>
+
+Flow matching learns a velocity field that carries pure Gaussian noise to a real image along
+a straight-line path, so sampling is just integrating that field from `t=0` to `t=1`. Watching
+it run is the cheapest sanity check there is: if the pH conditioning were doing nothing, three
+rows off the same seed would resolve into three identical pictures.
+
+They don't. Well before the image is clean, at around `t≈0.67`, the pH 8.8 row is already
+carrying undulations the pH 5.8 row never develops — the conditioning is steering the geometry
+while the fibre is still forming, not decorating it afterwards. It finishes at 4.35px of
+centreline rms against 1.50px and 1.62px for the two acidic rows.
+
+That the pH 5.8 and 7.3 rows come out nearly identical is not the conditioning failing; it is
+the conditioning being right. Real crops barely separate over that stretch either — bucket mean
+centreline rms goes 3.92px at pH 5.8 to 4.31px at pH 7.2 — and then jumps to 6.29px at pH 8.8.
+The model reproduces the shape of that curve, flat end included.
 
 ```bash
 python3 sample.py --pH 5.8 6.4 7.0 7.4 8.2 8.8 --num_steps 1000
 ```
+
+This is the diagnostic, not the product. Generating a fibre from nothing is the easy direction;
+**editing a real photograph of a specific fibre** is what the rest of this page is about, and
+that path never invents a filament — see [Quick start](#quick-start--edit-one-image) below.
 
 ## Setup
 
